@@ -577,7 +577,7 @@ func handleAIRequest(ctx context.Context, w http.ResponseWriter, r *http.Request
 		if priceInfo := payment.GetExpectedPrice(); priceInfo != nil && priceInfo.GetPixelsPerUnit() != 0 {
 			pricePerAIUnit = float64(priceInfo.GetPricePerUnit()) / float64(priceInfo.GetPixelsPerUnit())
 		}
-
+		//TODO: possible place to put the Worker ETH? need access to outPixels, fees, price for worker
 		monitor.AIJobProcessed(ctx, pipeline, modelID, monitor.AIJobInfo{LatencyScore: latencyScore, PricePerUnit: pricePerAIUnit})
 	}
 

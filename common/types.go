@@ -15,6 +15,8 @@ import (
 type RemoteTranscoderInfo struct {
 	Address  string
 	Capacity int
+	// Pools
+	EthereumAddress ethcommon.Address
 }
 
 type StreamInfo struct {

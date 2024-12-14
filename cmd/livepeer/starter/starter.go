@@ -501,6 +501,12 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 		glog.Errorf("Error opening DB: %v", err)
 		return
 	}
+	//Pools - signal orchestrator was restarted
+	glog.Infof("Writing reset flag to connection records")
+	err = dbh.CreateEventLog("orchestrator-reset", "nodeType", "ai", "event_time", time.Now().Unix())
+	if err != nil {
+		glog.Error("Error writing orchestrator reset log=", err)
+	}
 	defer dbh.Close()
 
 	n, err := core.NewLivepeerNode(nil, *cfg.Datadir, dbh)
@@ -1642,13 +1648,24 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 		if len(orchURLs) <= 0 {
 			glog.Exit("Missing -orchAddr")
 		}
+		// Pools - validate the orch URL
+		orchUri := ""
+		if len(orchURLs) > 0 {
+			orchUri = orchURLs[0].Host
+		}
+
+		// Pools - Add ETH Address to Remote Node
+		if *cfg.EthAcctAddr == "" {
+			glog.Fatal("Starting a pool-based clients require an ethereum address, use '-ethAcctAddr'")
+		}
+		ethAddr := ethcommon.HexToAddress(*cfg.EthAcctAddr)
 
 		if n.NodeType == core.TranscoderNode {
-			go server.RunTranscoder(n, orchURLs[0].Host, core.MaxSessions, transcoderCaps)
+			go server.RunTranscoder(n, orchUri, core.MaxSessions, transcoderCaps, ethAddr)
 		}
 
 		if n.NodeType == core.AIWorkerNode {
-			go server.RunAIWorker(n, orchURLs[0].Host, n.Capabilities.ToNetCapabilities())
+			go server.RunAIWorker(n, orchUri, n.Capabilities.ToNetCapabilities(), ethAddr)
 		}
 	}
 

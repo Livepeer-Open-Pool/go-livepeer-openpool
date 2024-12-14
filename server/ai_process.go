@@ -237,16 +237,21 @@ func submitTextToImage(ctx context.Context, params aiRequestParams, sess *AISess
 	if balUpdate != nil {
 		balUpdate.Status = ReceivedChange
 	}
-
-	if monitor.Enabled {
-		var pricePerAIUnit float64
-		if priceInfo := sess.OrchestratorInfo.GetPriceInfo(); priceInfo != nil && priceInfo.PixelsPerUnit != 0 {
-			pricePerAIUnit = float64(priceInfo.PricePerUnit) / float64(priceInfo.PixelsPerUnit)
-		}
-
-		monitor.AIRequestFinished(ctx, "text-to-image", *req.ModelId, monitor.AIJobInfo{LatencyScore: sess.LatencyScore, PricePerUnit: pricePerAIUnit}, sess.OrchestratorInfo)
+	var pricePerAIUnit float64
+	if priceInfo := sess.OrchestratorInfo.GetPriceInfo(); priceInfo != nil && priceInfo.PixelsPerUnit != 0 {
+		pricePerAIUnit = float64(priceInfo.PricePerUnit) / float64(priceInfo.PixelsPerUnit)
 	}
 
+	if monitor.Enabled {
+		monitor.AIRequestFinished(ctx, "text-to-image", *req.ModelId, monitor.AIJobInfo{LatencyScore: sess.LatencyScore, PricePerUnit: pricePerAIUnit}, sess.OrchestratorInfo)
+	}
+	//no db available>>>>
+	//err := CreateEventLog("worker-connected", "ethAddress", ethAddrStr, "connection", from, "nodeType", "ai", "event_time", time.Now().Unix())
+	//if err != nil {
+	//	glog.Error("Error writing aiworker connection log=", err)
+	//}
+
+	clog.Infof(ctx, "Pool Record Work: text-to-image aiComputeUnits %s pricePerAIUnit %d ethAddress %s", outPixels, pricePerAIUnit, ctx.Value("ethAddress"))
 	return resp.JSON200, nil
 }
 
@@ -391,16 +396,15 @@ func submitImageToImage(ctx context.Context, params aiRequestParams, sess *AISes
 	if balUpdate != nil {
 		balUpdate.Status = ReceivedChange
 	}
-
-	if monitor.Enabled {
-		var pricePerAIUnit float64
-		if priceInfo := sess.OrchestratorInfo.GetPriceInfo(); priceInfo != nil && priceInfo.PixelsPerUnit != 0 {
-			pricePerAIUnit = float64(priceInfo.PricePerUnit) / float64(priceInfo.PixelsPerUnit)
-		}
-
-		monitor.AIRequestFinished(ctx, "image-to-image", *req.ModelId, monitor.AIJobInfo{LatencyScore: sess.LatencyScore, PricePerUnit: pricePerAIUnit}, sess.OrchestratorInfo)
+	var pricePerAIUnit float64
+	if priceInfo := sess.OrchestratorInfo.GetPriceInfo(); priceInfo != nil && priceInfo.PixelsPerUnit != 0 {
+		pricePerAIUnit = float64(priceInfo.PricePerUnit) / float64(priceInfo.PixelsPerUnit)
 	}
 
+	if monitor.Enabled {
+		monitor.AIRequestFinished(ctx, "image-to-image", *req.ModelId, monitor.AIJobInfo{LatencyScore: sess.LatencyScore, PricePerUnit: pricePerAIUnit}, sess.OrchestratorInfo)
+	}
+	clog.Infof(ctx, "Pool Record Work: image-to-image aiComputeUnits %s pricePerAIUnit %d", outPixels, pricePerAIUnit)
 	return resp.JSON200, nil
 }
 
@@ -535,16 +539,14 @@ func submitImageToVideo(ctx context.Context, params aiRequestParams, sess *AISes
 
 	// TODO: Refine this rough estimate in future iterations
 	sess.LatencyScore = CalculateImageToVideoLatencyScore(took, req, outPixels)
-
+	var pricePerAIUnit float64
+	if priceInfo := sess.OrchestratorInfo.GetPriceInfo(); priceInfo != nil && priceInfo.PixelsPerUnit != 0 {
+		pricePerAIUnit = float64(priceInfo.PricePerUnit) / float64(priceInfo.PixelsPerUnit)
+	}
 	if monitor.Enabled {
-		var pricePerAIUnit float64
-		if priceInfo := sess.OrchestratorInfo.GetPriceInfo(); priceInfo != nil && priceInfo.PixelsPerUnit != 0 {
-			pricePerAIUnit = float64(priceInfo.PricePerUnit) / float64(priceInfo.PixelsPerUnit)
-		}
-
 		monitor.AIRequestFinished(ctx, "image-to-video", *req.ModelId, monitor.AIJobInfo{LatencyScore: sess.LatencyScore, PricePerUnit: pricePerAIUnit}, sess.OrchestratorInfo)
 	}
-
+	clog.Infof(ctx, "Pool Record Work: image-to-video aiComputeUnits %s pricePerAIUnit %d", outPixels, pricePerAIUnit)
 	return &res, nil
 }
 
@@ -674,15 +676,16 @@ func submitUpscale(ctx context.Context, params aiRequestParams, sess *AISession,
 
 	// TODO: Refine this rough estimate in future iterations
 	sess.LatencyScore = CalculateUpscaleLatencyScore(took, req, outPixels)
+	var pricePerAIUnit float64
+	if priceInfo := sess.OrchestratorInfo.GetPriceInfo(); priceInfo != nil && priceInfo.PixelsPerUnit != 0 {
+		pricePerAIUnit = float64(priceInfo.PricePerUnit) / float64(priceInfo.PixelsPerUnit)
+	}
 
 	if monitor.Enabled {
-		var pricePerAIUnit float64
-		if priceInfo := sess.OrchestratorInfo.GetPriceInfo(); priceInfo != nil && priceInfo.PixelsPerUnit != 0 {
-			pricePerAIUnit = float64(priceInfo.PricePerUnit) / float64(priceInfo.PixelsPerUnit)
-		}
 
 		monitor.AIRequestFinished(ctx, "upscale", *req.ModelId, monitor.AIJobInfo{LatencyScore: sess.LatencyScore, PricePerUnit: pricePerAIUnit}, sess.OrchestratorInfo)
 	}
+	clog.Infof(ctx, "Pool Record Work: text-to-speech aiComputeUnits %s pricePerAIUnit %d", outPixels, pricePerAIUnit)
 
 	return resp.JSON200, nil
 }
@@ -772,16 +775,14 @@ func submitSegmentAnything2(ctx context.Context, params aiRequestParams, sess *A
 
 	// TODO: Refine this rough estimate in future iterations
 	sess.LatencyScore = CalculateSegmentAnything2LatencyScore(took, outPixels)
-
+	var pricePerAIUnit float64
+	if priceInfo := sess.OrchestratorInfo.GetPriceInfo(); priceInfo != nil && priceInfo.PixelsPerUnit != 0 {
+		pricePerAIUnit = float64(priceInfo.PricePerUnit) / float64(priceInfo.PixelsPerUnit)
+	}
 	if monitor.Enabled {
-		var pricePerAIUnit float64
-		if priceInfo := sess.OrchestratorInfo.GetPriceInfo(); priceInfo != nil && priceInfo.PixelsPerUnit != 0 {
-			pricePerAIUnit = float64(priceInfo.PricePerUnit) / float64(priceInfo.PixelsPerUnit)
-		}
-
 		monitor.AIRequestFinished(ctx, "segment-anything-2", *req.ModelId, monitor.AIJobInfo{LatencyScore: sess.LatencyScore, PricePerUnit: pricePerAIUnit}, sess.OrchestratorInfo)
 	}
-
+	clog.Infof(ctx, "Pool Record Work: segment-anything-2 aiComputeUnits %s pricePerAIUnit %d", outPixels, pricePerAIUnit)
 	return resp.JSON200, nil
 }
 
@@ -880,13 +881,12 @@ func submitTextToSpeech(ctx context.Context, params aiRequestParams, sess *AISes
 
 	// TODO: Refine this rough estimate in future iterations
 	sess.LatencyScore = CalculateSegmentAnything2LatencyScore(took, inCharacters)
+	var pricePerAIUnit float64
+	if priceInfo := sess.OrchestratorInfo.GetPriceInfo(); priceInfo != nil && priceInfo.PixelsPerUnit != 0 {
+		pricePerAIUnit = float64(priceInfo.PricePerUnit) / float64(priceInfo.PixelsPerUnit)
+	}
 
 	if monitor.Enabled {
-		var pricePerAIUnit float64
-		if priceInfo := sess.OrchestratorInfo.GetPriceInfo(); priceInfo != nil && priceInfo.PixelsPerUnit != 0 {
-			pricePerAIUnit = float64(priceInfo.PricePerUnit) / float64(priceInfo.PixelsPerUnit)
-		}
-
 		monitor.AIRequestFinished(ctx, "text-to-speech", *req.ModelId, monitor.AIJobInfo{LatencyScore: sess.LatencyScore, PricePerUnit: pricePerAIUnit}, sess.OrchestratorInfo)
 	}
 
@@ -897,6 +897,7 @@ func submitTextToSpeech(ctx context.Context, params aiRequestParams, sess *AISes
 		}
 		return nil, err
 	}
+	clog.Infof(ctx, "Pool Record Work: text-to-speech aiComputeUnits %s pricePerAIUnit %d", inCharacters, pricePerAIUnit)
 
 	return &res, nil
 }
@@ -958,7 +959,8 @@ func submitAudioToText(ctx context.Context, params aiRequestParams, sess *AISess
 	}
 
 	clog.V(common.VERBOSE).Infof(ctx, "Submitting audio-to-text media with duration: %d seconds", durationSeconds)
-	setHeaders, balUpdate, err := prepareAIPayment(ctx, sess, durationSeconds*1000)
+	outPixels := durationSeconds * 1000
+	setHeaders, balUpdate, err := prepareAIPayment(ctx, sess, outPixels)
 	if err != nil {
 		if monitor.Enabled {
 			monitor.AIRequestError(err.Error(), "audio-to-text", *req.ModelId, sess.OrchestratorInfo)
@@ -1005,13 +1007,13 @@ func submitAudioToText(ctx context.Context, params aiRequestParams, sess *AISess
 
 	// TODO: Refine this rough estimate in future iterations
 	sess.LatencyScore = CalculateAudioToTextLatencyScore(took, durationSeconds)
+	var pricePerAIUnit float64
+	if priceInfo := sess.OrchestratorInfo.GetPriceInfo(); priceInfo != nil && priceInfo.PixelsPerUnit != 0 {
+		pricePerAIUnit = float64(priceInfo.PricePerUnit) / float64(priceInfo.PixelsPerUnit)
+	}
+	clog.Infof(ctx, "Pool Record Work: audio-to-text aiComputeUnits %s pricePerAIUnit %d", outPixels, pricePerAIUnit)
 
 	if monitor.Enabled {
-		var pricePerAIUnit float64
-		if priceInfo := sess.OrchestratorInfo.GetPriceInfo(); priceInfo != nil && priceInfo.PixelsPerUnit != 0 {
-			pricePerAIUnit = float64(priceInfo.PricePerUnit) / float64(priceInfo.PixelsPerUnit)
-		}
-
 		monitor.AIRequestFinished(ctx, "audio-to-text", *req.ModelId, monitor.AIJobInfo{LatencyScore: sess.LatencyScore, PricePerUnit: pricePerAIUnit}, sess.OrchestratorInfo)
 	}
 
@@ -1139,7 +1141,8 @@ func submitLLM(ctx context.Context, params aiRequestParams, sess *AISession, req
 		req.MaxTokens = new(int)
 		*req.MaxTokens = 256
 	}
-	setHeaders, balUpdate, err := prepareAIPayment(ctx, sess, int64(*req.MaxTokens))
+	outPixels := int64(*req.MaxTokens)
+	setHeaders, balUpdate, err := prepareAIPayment(ctx, sess, outPixels)
 	if err != nil {
 		if monitor.Enabled {
 			monitor.AIRequestError(err.Error(), "llm", *req.ModelId, sess.OrchestratorInfo)
@@ -1161,11 +1164,15 @@ func submitLLM(ctx context.Context, params aiRequestParams, sess *AISession, req
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode, string(body))
 	}
+	var pricePerAIUnit float64
+	if priceInfo := sess.OrchestratorInfo.GetPriceInfo(); priceInfo != nil && priceInfo.PixelsPerUnit != 0 {
+		pricePerAIUnit = float64(priceInfo.PricePerUnit) / float64(priceInfo.PixelsPerUnit)
+	}
+	clog.Infof(ctx, "Pool Record Work: llm aiComputeUnits %s pricePerAIUnit %d", outPixels, pricePerAIUnit)
 
 	if req.Stream != nil && *req.Stream {
 		return handleSSEStream(ctx, resp.Body, sess, req, start)
 	}
-
 	return handleNonStreamingResponse(ctx, resp.Body, sess, req, start)
 }
 
@@ -1319,15 +1326,15 @@ func submitImageToText(ctx context.Context, params aiRequestParams, sess *AISess
 	if balUpdate != nil {
 		balUpdate.Status = ReceivedChange
 	}
+	var pricePerAIUnit float64
+	if priceInfo := sess.OrchestratorInfo.GetPriceInfo(); priceInfo != nil && priceInfo.PixelsPerUnit != 0 {
+		pricePerAIUnit = float64(priceInfo.PricePerUnit) / float64(priceInfo.PixelsPerUnit)
+	}
 
 	if monitor.Enabled {
-		var pricePerAIUnit float64
-		if priceInfo := sess.OrchestratorInfo.GetPriceInfo(); priceInfo != nil && priceInfo.PixelsPerUnit != 0 {
-			pricePerAIUnit = float64(priceInfo.PricePerUnit) / float64(priceInfo.PixelsPerUnit)
-		}
-
 		monitor.AIRequestFinished(ctx, "image-to-text", *req.ModelId, monitor.AIJobInfo{LatencyScore: sess.LatencyScore, PricePerUnit: pricePerAIUnit}, sess.OrchestratorInfo)
 	}
+	clog.Infof(ctx, "Pool Record Work: image-to-text aiComputeUnits %s pricePerAIUnit %d ethAddress %s", inPixels, pricePerAIUnit, ctx.Value("ethAddress"))
 
 	return resp.JSON200, nil
 }

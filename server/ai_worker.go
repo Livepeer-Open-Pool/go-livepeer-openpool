@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	ethcommon "github.com/ethereum/go-ethereum/common"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -49,22 +50,33 @@ func (h *lphttp) RegisterAIWorker(req *net.RegisterAIWorkerRequest, stream net.A
 	if req.Capabilities == nil {
 		req.Capabilities = core.NewCapabilities(core.DefaultCapabilities(), nil).ToNetCapabilities()
 	}
+
+	// Pools
+	if req.EthereumAddress == nil {
+		glog.Errorf("ETH Address is required to connect")
+		return errors.New("ETH Address is required to connect")
+	}
+	ethAddress := ethcommon.BytesToAddress(req.EthereumAddress)
+	glog.Infof("Got a VALID RegisterAIWorker request from aiworker=%s  ethAddress=%s", from, ethAddress.String())
+
 	// blocks until stream is finished
-	h.orchestrator.ServeAIWorker(stream, req.Capabilities)
+	h.orchestrator.ServeAIWorker(stream, req.Capabilities, ethAddress)
 	return nil
 }
 
+// Pools
 // Standalone AIWorker
 
 // RunAIWorker is main routing of standalone aiworker
 // Exiting it will terminate executable
-func RunAIWorker(n *core.LivepeerNode, orchAddr string, caps *net.Capabilities) {
+func RunAIWorker(n *core.LivepeerNode, orchAddr string, caps *net.Capabilities, ethereumAddr ethcommon.Address) {
 	expb := backoff.NewExponentialBackOff()
 	expb.MaxInterval = time.Minute
 	expb.MaxElapsedTime = 0
 	backoff.Retry(func() error {
-		glog.Info("Registering AI worker to ", orchAddr)
-		err := runAIWorker(n, orchAddr, caps)
+		// Pools
+		glog.Info("Registering AI worker to ", orchAddr, ethereumAddr.String())
+		err := runAIWorker(n, orchAddr, caps, ethereumAddr)
 		glog.Info("Unregistering AI worker: ", err)
 		if _, fatal := err.(core.RemoteAIWorkerFatalError); fatal {
 			glog.Info("Terminating AI Worker because of ", err)
@@ -92,12 +104,13 @@ func checkAIWorkerError(err error) error {
 	return err
 }
 
-func runAIWorker(n *core.LivepeerNode, orchAddr string, caps *net.Capabilities) error {
+// Pools
+func runAIWorker(n *core.LivepeerNode, orchAddr string, caps *net.Capabilities, ethereumAddr ethcommon.Address) error {
 	tlsConfig := &tls.Config{InsecureSkipVerify: true}
 	conn, err := grpc.Dial(orchAddr,
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
 	if err != nil {
-		glog.Error("Did not connect AI worker to orchesrator: ", err)
+		glog.Error("Did not connect AI worker to orchestrator: ", err)
 		return err
 	}
 	defer conn.Close()
@@ -107,7 +120,7 @@ func runAIWorker(n *core.LivepeerNode, orchAddr string, caps *net.Capabilities) 
 	ctx, cancel := context.WithCancel(ctx)
 	// Silence linter
 	defer cancel()
-	r, err := c.RegisterAIWorker(ctx, &net.RegisterAIWorkerRequest{Secret: n.OrchSecret, Capabilities: caps})
+	r, err := c.RegisterAIWorker(ctx, &net.RegisterAIWorkerRequest{Secret: n.OrchSecret, Capabilities: caps, EthereumAddress: ethereumAddr.Bytes()})
 	if err := checkAIWorkerError(err); err != nil {
 		glog.Error("Could not register aiworker to orchestrator ", err)
 		return err
@@ -138,7 +151,7 @@ func runAIWorker(n *core.LivepeerNode, orchAddr string, caps *net.Capabilities) 
 		}
 		wg.Add(1)
 		go func() {
-			runAIJob(n, orchAddr, httpc, notify)
+			runAIJob(n, orchAddr, httpc, notify, ethereumAddr)
 			wg.Done()
 		}()
 	}
@@ -149,11 +162,13 @@ type AIJobRequestData struct {
 	Request  json.RawMessage `json:"request"`
 }
 
-func runAIJob(n *core.LivepeerNode, orchAddr string, httpc *http.Client, notify *net.NotifyAIJob) {
+func runAIJob(n *core.LivepeerNode, orchAddr string, httpc *http.Client, notify *net.NotifyAIJob, ethAddress ethcommon.Address) {
 	var contentType string
 	var body bytes.Buffer
 
 	ctx := clog.AddVal(context.Background(), "taskId", strconv.FormatInt(notify.TaskId, 10))
+	ctx = clog.AddVal(ctx, "ethAddress", ethAddress.String())
+
 	clog.Infof(ctx, "Received AI job, validating request")
 
 	var processFn func(context.Context) (interface{}, error)
@@ -503,6 +518,8 @@ func sendAIResult(ctx context.Context, n *core.LivepeerNode, orchAddr string, pi
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("TaskId", taskId)
 	req.Header.Set("Pipeline", pipeline)
+
+	//TODO: possible place to put the Worker ETH? need access to outPixels, fees, price for worker
 
 	// TODO consider adding additional information in response header from the addlData field (e.g. transcoding includes Pixels)
 

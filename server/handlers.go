@@ -1634,3 +1634,89 @@ func mustHaveDb(db interface{}, h http.Handler) http.Handler {
 		h.ServeHTTP(w, r)
 	})
 }
+
+// Pools
+func poolEventsHandler(db *common.DB) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lastCheckTime, err := parseLastCheckTime(r)
+		if err != nil {
+			http.Error(w, "Invalid lastCheckTime format. Use RFC3339 format.", http.StatusBadRequest)
+			return
+		}
+
+		events, err := db.FindPoolEvents(lastCheckTime)
+		if err != nil {
+			respond500(w, "could not get pool events. err: "+err.Error())
+			return
+		}
+		respondJson(w, events)
+	})
+}
+
+//// poolActiveWorkerHandler returns a list of active pool workers
+//func poolActiveWorkerHandler(db *common.DB) http.Handler {
+//	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+//		workers, err := db.FindActivePoolWorkers()
+//		if err != nil {
+//			respond500(w, "could not get pool active workers. err: "+err.Error())
+//			return
+//		}
+//		respondJson(w, workers)
+//	})
+//}
+//
+//// TODO: need to add a "lastCheckTime" param to prevent large datasets
+//// poolJobHistoryHandler returns a list of pool job history
+//func poolJobHistoryHandler(db *common.DB) http.Handler {
+//	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+//		lastCheckTime, err := parseLastCheckTime(r)
+//		if err != nil {
+//			http.Error(w, "Invalid lastCheckTime format. Use RFC3339 format.", http.StatusBadRequest)
+//			return
+//		}
+//
+//		history, err := db.FindJobHistoryEvents(lastCheckTime)
+//		if err != nil {
+//			respond500(w, "could not get pool job history. err: "+err.Error())
+//			return
+//		}
+//		respondJson(w, history)
+//	})
+//}
+//
+//// TODO: need to add a "lastCheckTime" param to prevent large datasets
+//// poolPerformanceStatHistoryHandler returns a list of pool performance stat history
+//func poolPerformanceStatHistoryHandler(db *common.DB) http.Handler {
+//	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+//		lastCheckTime, err := parseLastCheckTime(r)
+//		if err != nil {
+//			http.Error(w, "Invalid lastCheckTime format. Use RFC3339 format.", http.StatusBadRequest)
+//			return
+//		}
+//		stats, err := db.FindPerformanceStatHistoryEvents(lastCheckTime)
+//		if err != nil {
+//			respond500(w, "could not get pool performance stat history. err: "+err.Error())
+//			return
+//		}
+//		respondJson(w, stats)
+//	})
+//}
+
+// parseLastCheckTime extracts the 'lastCheckTime' query parameter from the request
+// and parses it as an RFC3339 time. Returns the parsed time or an error.
+func parseLastCheckTime(r *http.Request) (time.Time, error) {
+	lastCheckTimeStr := r.URL.Query().Get("lastCheckTime")
+	glog.Errorf("parseLastCheckTime lastCheckTime=%v", lastCheckTimeStr)
+
+	if lastCheckTimeStr == "" {
+		// Return zero value if the parameter is not provided
+		return time.Time{}, nil
+	}
+
+	lastCheckTime, err := time.Parse(time.RFC3339, lastCheckTimeStr)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	return lastCheckTime, nil
+}

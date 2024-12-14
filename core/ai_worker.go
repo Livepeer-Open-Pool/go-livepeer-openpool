@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	ethcommon "github.com/ethereum/go-ethereum/common"
+	"math/big"
 	"os"
 	"path"
 	"strconv"
@@ -38,6 +40,9 @@ type RemoteAIWorker struct {
 	capabilities *Capabilities
 	eof          chan struct{}
 	addr         string
+
+	// Pools
+	ethereumAddr ethcommon.Address
 }
 
 func (rw *RemoteAIWorker) done() {
@@ -62,13 +67,15 @@ type RemoteAIWorkerManager struct {
 	requestSessions map[string]*RemoteAIWorker
 }
 
-func NewRemoteAIWorker(m *RemoteAIWorkerManager, stream net.AIWorker_RegisterAIWorkerServer, caps *Capabilities) *RemoteAIWorker {
+// Pools
+func NewRemoteAIWorker(m *RemoteAIWorkerManager, stream net.AIWorker_RegisterAIWorkerServer, caps *Capabilities, ethereumAddr ethcommon.Address) *RemoteAIWorker {
 	return &RemoteAIWorker{
 		manager:      m,
 		stream:       stream,
 		eof:          make(chan struct{}, 1),
 		addr:         common.GetConnectionAddr(stream.Context()),
 		capabilities: caps,
+		ethereumAddr: ethereumAddr,
 	}
 }
 
@@ -85,40 +92,49 @@ func NewRemoteAIWorkerManager() *RemoteAIWorkerManager {
 	}
 }
 
-func (orch *orchestrator) ServeAIWorker(stream net.AIWorker_RegisterAIWorkerServer, capabilities *net.Capabilities) {
-	orch.node.serveAIWorker(stream, capabilities)
+// Pools
+func (orch *orchestrator) ServeAIWorker(stream net.AIWorker_RegisterAIWorkerServer, capabilities *net.Capabilities, ethereumAddr ethcommon.Address) {
+	orch.node.serveAIWorker(stream, capabilities, ethereumAddr)
 }
 
-func (n *LivepeerNode) serveAIWorker(stream net.AIWorker_RegisterAIWorkerServer, capabilities *net.Capabilities) {
+// Pools
+func (n *LivepeerNode) serveAIWorker(stream net.AIWorker_RegisterAIWorkerServer, capabilities *net.Capabilities, ethereumAddr ethcommon.Address) {
 	from := common.GetConnectionAddr(stream.Context())
 	wkrCaps := CapabilitiesFromNetCapabilities(capabilities)
 	if n.Capabilities.LivepeerVersionCompatibleWith(capabilities) {
-		glog.Infof("Worker compatible, connecting worker_version=%s orchestrator_version=%s worker_addr=%s", capabilities.Version, n.Capabilities.constraints.minVersion, from)
+		glog.Infof("Worker compatible, connecting worker_version=%s orchestrator_version=%s worker_addr=%s eth_address=%s", capabilities.Version, n.Capabilities.constraints.minVersion, from, ethereumAddr)
 		n.Capabilities.AddCapacity(wkrCaps)
 		n.AddAICapabilities(wkrCaps)
 		defer n.Capabilities.RemoveCapacity(wkrCaps)
 		defer n.RemoveAICapabilities(wkrCaps)
 
 		// Manage blocks while AI worker is connected
-		n.AIWorkerManager.Manage(stream, capabilities)
+		n.AIWorkerManager.Manage(n, stream, capabilities, ethereumAddr)
 		glog.V(common.DEBUG).Infof("Closing aiworker=%s channel", from)
 	} else {
 		glog.Errorf("worker %s not connected, version not compatible", from)
 	}
 }
 
+// Pools
 // Manage adds aiworker to list of live aiworkers. Doesn't return until aiworker disconnects
-func (rwm *RemoteAIWorkerManager) Manage(stream net.AIWorker_RegisterAIWorkerServer, capabilities *net.Capabilities) {
+func (rwm *RemoteAIWorkerManager) Manage(node *LivepeerNode, stream net.AIWorker_RegisterAIWorkerServer, capabilities *net.Capabilities, ethereumAddr ethcommon.Address) {
 	from := common.GetConnectionAddr(stream.Context())
-	aiworker := NewRemoteAIWorker(rwm, stream, CapabilitiesFromNetCapabilities(capabilities))
+	aiworker := NewRemoteAIWorker(rwm, stream, CapabilitiesFromNetCapabilities(capabilities), ethereumAddr)
 	go func() {
 		ctx := stream.Context()
 		<-ctx.Done()
 		err := ctx.Err()
-		glog.Errorf("Stream closed for aiworker=%s, err=%q", from, err)
+		glog.Errorf("Stream closed for aiworker=%s eth_address=%s, err=%q", from, ethereumAddr.String(), err)
 		aiworker.done()
 	}()
 
+	//Pools
+	ethAddrStr := ethereumAddr.String()
+	err := node.Database.CreateEventLog("worker-connected", "ethAddress", ethAddrStr, "connection", from, "nodeType", "ai", "event_time", time.Now().Unix())
+	if err != nil {
+		glog.Error("Error writing aiworker connection log=", err)
+	}
 	rwm.RWmutex.Lock()
 	rwm.liveAIWorkers[aiworker.stream] = aiworker
 	rwm.remoteAIWorkers = append(rwm.remoteAIWorkers, aiworker)
@@ -126,7 +142,11 @@ func (rwm *RemoteAIWorkerManager) Manage(stream net.AIWorker_RegisterAIWorkerSer
 
 	<-aiworker.eof
 	glog.Infof("Got aiworker=%s eof, removing from live aiworkers map", from)
-
+	// Pools
+	err = node.Database.CreateEventLog("worker-disconnected", "ethAddress", ethAddrStr, "connection", from, "nodeType", "ai", "event_time", time.Now().Unix())
+	if err != nil {
+		glog.Error("Error writing aiworker disconnect log=", err)
+	}
 	rwm.RWmutex.Lock()
 	delete(rwm.liveAIWorkers, aiworker.stream)
 	rwm.RWmutex.Unlock()
@@ -288,6 +308,9 @@ type RemoteAIWorkerResult struct {
 	Files        map[string][]byte
 	Err          error
 	DownloadTime time.Duration
+	Fees         big.Rat
+	ResponseTime time.Duration
+	EthAddress   ethcommon.Address
 }
 
 type AIWorkerChan chan *RemoteAIWorkerResult
@@ -357,7 +380,8 @@ func (rw *RemoteAIWorker) Process(logCtx context.Context, pipeline string, model
 		return signalEOF(err)
 	}
 
-	clog.V(common.DEBUG).Infof(logCtx, "Job sent to AI worker worker=%s taskId=%d pipeline=%s model_id=%s", rw.addr, taskID, pipeline, modelID)
+	// Pools
+	clog.V(common.DEBUG).Infof(logCtx, "Job sent to AI worker worker=%s taskId=%d pipeline=%s model_id=%s ethAddress=%s", rw.addr, taskID, pipeline, modelID, rw.ethereumAddr.String())
 	// set a minimum timeout to accommodate transport / processing overhead
 	// TODO: this should be set for each pipeline, using something long for now
 	dur := aiWorkerRequestTimeout
@@ -368,8 +392,10 @@ func (rw *RemoteAIWorker) Process(logCtx context.Context, pipeline string, model
 	case <-ctx.Done():
 		return signalEOF(ErrRemoteWorkerTimeout)
 	case chanData := <-taskChan:
-		clog.InfofErr(logCtx, "Successfully received results from remote worker=%s taskId=%d pipeline=%s model_id=%s dur=%v",
-			rw.addr, taskID, pipeline, modelID, time.Since(start), chanData.Err)
+		// Pools
+		ethAddress := rw.ethereumAddr
+		clog.InfofErr(logCtx, "Successfully received results from remote worker=%s taskId=%d pipeline=%s model_id=%s dur=%v ethAddress=%s",
+			rw.addr, taskID, pipeline, modelID, time.Since(start), ethAddress.String(), chanData.Err)
 
 		if monitor.Enabled {
 			monitor.AIResultDownloaded(logCtx, pipeline, modelID, chanData.DownloadTime)

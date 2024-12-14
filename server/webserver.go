@@ -114,5 +114,11 @@ func (s *LivepeerServer) cliWebServerHandlers(bindAddr string) *http.ServeMux {
 		mux.Handle("/metrics", monitor.Exporter)
 	}
 
+	// Pools - pool related endpoints
+	mux.Handle("/pool/events", poolEventsHandler(db))
+	//mux.Handle("/pool/active-workers", poolActiveWorkerHandler(db))
+	//mux.Handle("/pool/history/jobs", poolJobHistoryHandler(db))
+	//mux.Handle("/pool/history/performance", poolPerformanceStatHistoryHandler(db))
+
 	return mux
 }
