@@ -375,6 +375,9 @@ message RegisterRequest {
 
   // Transcoder capabilities
   Capabilities capabilities = 3;
+  // ** Pool Customization **
+  // Pool: Remote Transcoder ethereum address
+  bytes ethereum_address = 4;
 }
 
 // Sent by the orchestrator to the transcoder
@@ -416,6 +419,10 @@ message RegisterAIWorkerRequest {
 
   // AIWorker hardware info
   repeated HardwareInformation hardware = 3;
+
+  // ** Pool Customization **
+  // Pool: Remote AI Worker ethereum address
+  bytes ethereum_address = 4;
 }
 
 // Data included by the gateway when submitting a AI job.

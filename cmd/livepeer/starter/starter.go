@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/livepeer/go-livepeer/events"
 	"io"
 	"io/ioutil"
 	"math"
@@ -178,6 +179,9 @@ type LivepeerConfig struct {
 	LivePaymentInterval        *time.Duration
 	LiveOutSegmentTimeout      *time.Duration
 	LiveAICapRefreshModels     *string
+
+	// ** Pool Customization **
+	RemoteWorkerWebhookURL *string
 }
 
 // DefaultLivepeerConfig creates LivepeerConfig exactly the same as when no flags are passed to the livepeer process.
@@ -286,6 +290,8 @@ func DefaultLivepeerConfig() LivepeerConfig {
 	defaultAuthWebhookURL := ""
 	defaultOrchWebhookURL := ""
 	defaultMinLivepeerVersion := ""
+	// ** Pool Customization **
+	defaultRemoteWorkerWebhookURL := ""
 
 	// Flags
 	defaultTestOrchAvail := true
@@ -400,6 +406,9 @@ func DefaultLivepeerConfig() LivepeerConfig {
 		// API
 		AuthWebhookURL: &defaultAuthWebhookURL,
 		OrchWebhookURL: &defaultOrchWebhookURL,
+
+		// ** Pool Customization **
+		RemoteWorkerWebhookURL: &defaultRemoteWorkerWebhookURL,
 
 		// Versioning constraints
 		OrchMinLivepeerVersion: &defaultMinLivepeerVersion,
@@ -525,11 +534,34 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 	}
 	defer dbh.Close()
 
+	// ** Pool Customization **
+	// Create an instance of eventTracker
+	isNoop := (*cfg.Transcoder || *cfg.AIWorker)
+	isGateway := *cfg.Gateway
+	isOrchestrator := *cfg.Orchestrator
+	pool_ops, err := NewPoolTrackerOptionsFromEnv(isNoop)
+	if err != nil {
+		glog.Errorf("Error creating pool-enabled livepeer node: %v", err)
+	}
+	events.InitPoolTracker(pool_ops)
+	defer events.GlobalEventTracker.Stop()
+
 	n, err := core.NewLivepeerNode(nil, *cfg.Datadir, dbh)
 	if err != nil {
 		glog.Errorf("Error creating livepeer node: %v", err)
 	}
 	n.AIProcesssingRetryTimeout = *cfg.AIProcessingRetryTimeout
+
+	// ** Pool Customization **
+	//signal orchestrator was restarted
+	var nodeResetMsg = "node-reset"
+	if isGateway {
+		nodeResetMsg = "gateway-reset"
+	}
+	if isOrchestrator {
+		nodeResetMsg = "orchestrator-reset"
+	}
+	events.GlobalEventTracker.CreateEventLog(nodeResetMsg)
 
 	if *cfg.OrchSecret != "" {
 		n.OrchSecret, _ = common.ReadFromFile(*cfg.OrchSecret)
@@ -609,7 +641,17 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 			n.Transcoder = n.TranscoderManager
 		}
 		if !*cfg.AIWorker {
-			n.AIWorkerManager = core.NewRemoteAIWorkerManager()
+			// ** Pool Customization **
+			if *cfg.RemoteWorkerWebhookURL != "" {
+				whurl, err := validateURL(*cfg.RemoteWorkerWebhookURL)
+				if err != nil {
+					glog.Exit("Error setting remote worker webhook URL ", err)
+				}
+				glog.Info("Using remote worker webhook URL ", whurl)
+				n.AIWorkerManager = core.NewRemoteAIWorkerManager(*cfg.RemoteWorkerWebhookURL)
+			} else {
+				n.AIWorkerManager = core.NewRemoteAIWorkerManager("")
+			}
 		}
 	} else if *cfg.Transcoder {
 		n.NodeType = core.TranscoderNode
@@ -1726,13 +1768,25 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 		if len(orchURLs) <= 0 {
 			glog.Exit("Missing -orchAddr")
 		}
+		// ** Pool Customization **
+		// Pool: validate the orch URL
+		orchUri := ""
+		if len(orchURLs) > 0 {
+			orchUri = orchURLs[0].Host
+		}
+
+		// Pool: Add ETH Address to Remote Node
+		if *cfg.EthAcctAddr == "" {
+			glog.Fatal("Starting a pool-based clients require an ethereum address, use '-ethAcctAddr'")
+		}
+		ethAddr := ethcommon.HexToAddress(*cfg.EthAcctAddr)
 
 		if n.NodeType == core.TranscoderNode {
-			go server.RunTranscoder(n, orchURLs[0].Host, core.MaxSessions, transcoderCaps)
+			go server.RunTranscoder(n, orchUri, core.MaxSessions, transcoderCaps, ethAddr)
 		}
 
 		if n.NodeType == core.AIWorkerNode {
-			go server.RunAIWorker(n, orchURLs[0].Host, n.Capabilities.ToNetCapabilities())
+			go server.RunAIWorker(n, orchUri, n.Capabilities.ToNetCapabilities(), ethAddr)
 		}
 	}
 
@@ -2168,4 +2222,47 @@ func updatePerfScore(region string, respBody []byte, score *common.PerfScore) {
 func exit(msg string, args ...any) {
 	glog.Errorf(msg, args...)
 	os.Exit(2)
+}
+
+func NewPoolTrackerOptionsFromEnv(useNoop bool) (events.PoolTrackerOptions, error) {
+	opts := events.PoolTrackerOptions{
+		UseNoop:       useNoop,
+		Threshold:     10000,            // default
+		FlushInterval: 60 * time.Second, // default
+	}
+
+	if v := os.Getenv("POOL_EVENT_THRESHOLD"); v != "" {
+		t, err := strconv.Atoi(v)
+		if err != nil {
+			return opts, fmt.Errorf("invalid POOL_EVENT_THRESHOLD: %w", err)
+		}
+		opts.Threshold = t
+	}
+
+	if v := os.Getenv("POOL_FLUSH_INTERVAL_SECONDS"); v != "" {
+		sec, err := strconv.Atoi(v)
+		if err != nil {
+			return opts, fmt.Errorf("invalid POOL_FLUSH_INTERVAL_SECONDS: %w", err)
+		}
+		opts.FlushInterval = time.Duration(sec) * time.Second
+	}
+
+	// now pull in the required S3 vars
+	required := map[string]*string{
+		"POOL_S3_HOST":       &opts.S3Host,
+		"POOL_S3_BUCKET":     &opts.S3Bucket,
+		"POOL_S3_ACCESS_KEY": &opts.S3AccessKey,
+		"POOL_S3_SECRET_KEY": &opts.S3SecretKey,
+		"POOL_REGION":        &opts.Region,
+		"POOL_NODE_TYPE":     &opts.NodeType,
+	}
+	for env, ptr := range required {
+		if val := os.Getenv(env); val != "" {
+			*ptr = val
+		} else {
+			return opts, fmt.Errorf("missing %s", env)
+		}
+	}
+
+	return opts, nil
 }

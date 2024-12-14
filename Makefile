@@ -119,8 +119,14 @@ livepeer_bench:
 livepeer_router:
 	GO111MODULE=on CGO_ENABLED=1 CC="$(cc)" CGO_CFLAGS="$(cgo_cflags)" CGO_LDFLAGS="$(cgo_ldflags) ${CGO_LDFLAGS}" go build -o $(GO_BUILD_DIR) -ldflags="$(ldflags)" cmd/livepeer_router/*.go
 
+## ** Pool Customization **
+## Pool: used build tags
 docker:
-	docker buildx build --build-arg='BUILD_TAGS=mainnet,experimental' -f docker/Dockerfile .
+	docker buildx build --build-arg='BUILD_TAGS=mainnet,experimental' -t tztcloud/go-livepeer:v0.8.6-pool -f docker/Dockerfile .
+## ** Pool Customization **
+## Pool: Remote transcoders can run windows (NOT AI WORKERS!)
+docker-windows:
+	docker buildx build --build-arg='BUILD_TAGS=mainnet,experimental' -t go-livepeer:v0.8.6-pool.windows -f docker/Dockerfile.windows .
 
 docker_mtx:
 	docker buildx build -f docker/Dockerfile.mediamtx docker/

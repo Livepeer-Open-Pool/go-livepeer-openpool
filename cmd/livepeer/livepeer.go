@@ -141,6 +141,9 @@ func parseLivepeerConfig() starter.LivepeerConfig {
 	cfg.DiscoveryTimeout = flag.Duration("discoveryTimeout", *cfg.DiscoveryTimeout, "Time to wait for orchestrators to return info to be included in transcoding sessions for manifest (default = 500ms)")
 	cfg.GatewayHost = flag.String("gatewayHost", *cfg.GatewayHost, "External hostname on which the Gateway node is running. Used when telling external services how to reach the node.")
 
+	// ** Pool Customization **
+	cfg.RemoteWorkerWebhookURL = flag.String("remoteWorkerWebhookURL", *cfg.RemoteWorkerWebhookURL, "Remote Worker discovery callback URL")
+
 	// Transcoding:
 	cfg.Orchestrator = flag.Bool("orchestrator", *cfg.Orchestrator, "Set to true to be an orchestrator")
 	cfg.Transcoder = flag.Bool("transcoder", *cfg.Transcoder, "Set to true to be a transcoder")

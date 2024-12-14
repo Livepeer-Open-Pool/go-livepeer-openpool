@@ -5,10 +5,14 @@ package core
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/livepeer/go-livepeer/events"
 	"math/big"
+	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strconv"
@@ -44,6 +48,9 @@ type RemoteAIWorker struct {
 	version      []worker.Version
 	eof          chan struct{}
 	addr         string
+	// ** Pool Customization **
+	// Pool: Remote AI Workers use ETH Address for Identity
+	ethereumAddress ethcommon.Address
 }
 
 func (rw *RemoteAIWorker) done() {
@@ -66,20 +73,27 @@ type RemoteAIWorkerManager struct {
 
 	// Map for keeping track of sessions and their respective aiworkers
 	requestSessions map[string]*RemoteAIWorker
+
+	// ** Pool Customization **
+	webhookURL string
 }
 
-func NewRemoteAIWorker(m *RemoteAIWorkerManager, stream net.AIWorker_RegisterAIWorkerServer, caps *Capabilities, hardware []worker.HardwareInformation) *RemoteAIWorker {
+// ** Pool Customization **
+// Pool: Added ETH Address for Remote AI Workers
+func NewRemoteAIWorker(m *RemoteAIWorkerManager, stream net.AIWorker_RegisterAIWorkerServer, caps *Capabilities, hardware []worker.HardwareInformation, ethereumAddress ethcommon.Address) *RemoteAIWorker {
 	return &RemoteAIWorker{
-		manager:      m,
-		stream:       stream,
-		eof:          make(chan struct{}, 1),
-		addr:         common.GetConnectionAddr(stream.Context()),
-		capabilities: caps,
-		hardware:     hardware,
+		manager:         m,
+		stream:          stream,
+		eof:             make(chan struct{}, 1),
+		addr:            common.GetConnectionAddr(stream.Context()),
+		capabilities:    caps,
+		hardware:        hardware,
+		ethereumAddress: ethereumAddress,
 	}
 }
 
-func NewRemoteAIWorkerManager() *RemoteAIWorkerManager {
+// ** Pool Customization **
+func NewRemoteAIWorkerManager(webhookURL string) *RemoteAIWorkerManager {
 	return &RemoteAIWorkerManager{
 		remoteAIWorkers: []*RemoteAIWorker{},
 		liveAIWorkers:   map[net.AIWorker_RegisterAIWorkerServer]*RemoteAIWorker{},
@@ -89,45 +103,56 @@ func NewRemoteAIWorkerManager() *RemoteAIWorkerManager {
 		taskChans: make(map[int64]AIWorkerChan),
 
 		requestSessions: make(map[string]*RemoteAIWorker),
+		webhookURL:      webhookURL,
 	}
 }
 
-func (orch *orchestrator) ServeAIWorker(stream net.AIWorker_RegisterAIWorkerServer, capabilities *net.Capabilities, hardware []*net.HardwareInformation) {
-	orch.node.serveAIWorker(stream, capabilities, hardware)
+// ** Pool Customization **
+func (orch *orchestrator) ServeAIWorker(stream net.AIWorker_RegisterAIWorkerServer, capabilities *net.Capabilities, hardware []*net.HardwareInformation, ethereumAddr ethcommon.Address) {
+	orch.node.serveAIWorker(stream, capabilities, hardware, ethereumAddr)
 }
 
-func (n *LivepeerNode) serveAIWorker(stream net.AIWorker_RegisterAIWorkerServer, capabilities *net.Capabilities, hardware []*net.HardwareInformation) {
+// ** Pool Customization **
+func (n *LivepeerNode) serveAIWorker(stream net.AIWorker_RegisterAIWorkerServer, capabilities *net.Capabilities, hardware []*net.HardwareInformation, ethereumAddr ethcommon.Address) {
 	from := common.GetConnectionAddr(stream.Context())
 	wkrCaps := CapabilitiesFromNetCapabilities(capabilities)
 	wkrHdw := hardwareInformationFromNetHardware(hardware)
 	if n.Capabilities.LivepeerVersionCompatibleWith(capabilities) {
-		glog.Infof("Worker compatible, connecting worker_version=%s orchestrator_version=%s worker_addr=%s", capabilities.Version, n.Capabilities.constraints.minVersion, from)
+		// ** Pool Customization **
+		glog.Infof("Worker compatible, connecting worker_version=%s orchestrator_version=%s worker_addr=%s eth_address=%s", capabilities.Version, n.Capabilities.constraints.minVersion, from, ethereumAddr)
 		n.Capabilities.AddCapacity(wkrCaps)
 		n.AddAICapabilities(wkrCaps)
 		defer n.Capabilities.RemoveCapacity(wkrCaps)
 		defer n.RemoveAICapabilities(wkrCaps)
 
 		// Manage blocks while AI worker is connected
-		n.AIWorkerManager.Manage(stream, capabilities, wkrHdw)
+		// ** Pool Customization **
+		n.AIWorkerManager.Manage(stream, capabilities, wkrHdw, ethereumAddr)
 		glog.V(common.DEBUG).Infof("Closing aiworker=%s channel", from)
 	} else {
 		glog.Errorf("worker %s not connected, version not compatible", from)
 	}
 }
 
+// ** Pool Customization **
+// Pool: added ETH Address for event tracking
 // Manage adds aiworker to list of live aiworkers. Doesn't return until aiworker disconnects
-func (rwm *RemoteAIWorkerManager) Manage(stream net.AIWorker_RegisterAIWorkerServer, capabilities *net.Capabilities, hardware []worker.HardwareInformation) {
+func (rwm *RemoteAIWorkerManager) Manage(stream net.AIWorker_RegisterAIWorkerServer, capabilities *net.Capabilities, hardware []worker.HardwareInformation, ethereumAddr ethcommon.Address) {
 	from := common.GetConnectionAddr(stream.Context())
-
-	aiworker := NewRemoteAIWorker(rwm, stream, CapabilitiesFromNetCapabilities(capabilities), hardware)
+	// ** Pool Customization **
+	aiworker := NewRemoteAIWorker(rwm, stream, CapabilitiesFromNetCapabilities(capabilities), hardware, ethereumAddr)
 	go func() {
 		ctx := stream.Context()
 		<-ctx.Done()
 		err := ctx.Err()
-		glog.Errorf("Stream closed for aiworker=%s, err=%q", from, err)
+		// ** Pool Customization **
+		glog.Errorf("Stream closed for aiworker=%s eth_address=%s, err=%q", from, ethereumAddr.String(), err)
 		aiworker.done()
 	}()
 
+	// ** Pool Customization **
+	ethAddrStr := ethereumAddr.String()
+	events.GlobalEventTracker.CreateEventLog("worker-connected", "ethAddress", ethAddrStr, "connection", from)
 	rwm.RWmutex.Lock()
 	rwm.liveAIWorkers[aiworker.stream] = aiworker
 	rwm.remoteAIWorkers = append(rwm.remoteAIWorkers, aiworker)
@@ -135,7 +160,8 @@ func (rwm *RemoteAIWorkerManager) Manage(stream net.AIWorker_RegisterAIWorkerSer
 
 	<-aiworker.eof
 	glog.Infof("Got aiworker=%s eof, removing from live aiworkers map", from)
-
+	// ** Pool Customization **
+	events.GlobalEventTracker.CreateEventLog("worker-disconnected", "ethAddress", ethAddrStr, "connection", from)
 	rwm.RWmutex.Lock()
 	delete(rwm.liveAIWorkers, aiworker.stream)
 	rwm.RWmutex.Unlock()
@@ -158,7 +184,9 @@ func (rwm *RemoteAIWorkerManager) Process(ctx context.Context, requestID string,
 	if err != nil {
 		return nil, err
 	}
-	res, err := worker.Process(ctx, pipeline, modelID, fname, req)
+	// ** Pool Customization **
+	// Pool: added request ID to allow pool payment correlation of events
+	res, err := worker.Process(ctx, requestID, pipeline, modelID, fname, req)
 	if err != nil {
 		rwm.completeAIRequest(requestID, pipeline, modelID)
 	}
@@ -175,10 +203,73 @@ func (rwm *RemoteAIWorkerManager) Process(ctx context.Context, requestID string,
 	return res, err
 }
 
+// TODO need to implement "custom pool worker/transcoder" selection
+// fetchPreferredWorkers calls the webhook URL and returns a set of eligible ETH addresses.
+func (rwm *RemoteAIWorkerManager) fetchPreferredWorkers(pipeline, modelID string) (map[string]struct{}, error) {
+	if rwm.webhookURL == "" {
+		return nil, nil
+	}
+	// Parse the webhook URL.
+	parsedURL, err := url.Parse(rwm.webhookURL)
+	if err != nil {
+		return nil, err
+	}
+	// Set query parameters.
+	q := parsedURL.Query()
+	q.Set("pipeline", pipeline)
+	q.Set("modelID", modelID)
+	parsedURL.RawQuery = q.Encode()
+
+	// Create an HTTP client with a custom TLS configuration and timeout.
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		Timeout: common.HTTPTimeout / 2,
+	}
+	// Ensure that idle connections are closed when done.
+	defer client.CloseIdleConnections()
+
+	resp, err := client.Get(parsedURL.String())
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("webhook returned status: %d", resp.StatusCode)
+	}
+
+	// Define a struct to capture the webhook's response.
+	type WorkerEligibility struct {
+		EthAddress string `json:"ethAddress"`
+		// other fields are ignored
+	}
+	var workerInfos []WorkerEligibility
+	if err := json.NewDecoder(resp.Body).Decode(&workerInfos); err != nil {
+		return nil, err
+	}
+
+	// Create a set for quick lookup of eligible addresses.
+	eligibleSet := make(map[string]struct{})
+	for _, info := range workerInfos {
+		eligibleSet[info.EthAddress] = struct{}{}
+	}
+	return eligibleSet, nil
+}
+
+// selectWorker selects a worker for the given request using the webhook's eligible ETH addresses.
 func (rwm *RemoteAIWorkerManager) selectWorker(requestID string, pipeline string, modelID string) (*RemoteAIWorker, error) {
 	rwm.RWmutex.Lock()
 	defer rwm.RWmutex.Unlock()
 
+	// ** Pool Customization **
+	// Get the set of eligible addresses from the webhook.
+	eligibleSet, err := rwm.fetchPreferredWorkers(pipeline, modelID)
+	if err != nil || len(eligibleSet) == 0 {
+		// Fallback: no eligible filtering, use the full worker list.
+		eligibleSet = nil
+	}
 	checkWorkers := func(rwm *RemoteAIWorkerManager) bool {
 		return len(rwm.remoteAIWorkers) > 0
 	}
@@ -334,8 +425,10 @@ func (rwm *RemoteAIWorkerManager) removeTaskChan(taskID int64) {
 	delete(rwm.taskChans, taskID)
 }
 
+// ** Pool Customization **
+// Pool: added requestID for pool payment correlation
 // Process does actual AI processing by sending work to remote ai worker and waiting for the result
-func (rw *RemoteAIWorker) Process(logCtx context.Context, pipeline string, modelID string, fname string, req AIJobRequestData) (*RemoteAIWorkerResult, error) {
+func (rw *RemoteAIWorker) Process(logCtx context.Context, requestID string, pipeline string, modelID string, fname string, req AIJobRequestData) (*RemoteAIWorkerResult, error) {
 	taskID, taskChan := rw.manager.addTaskChan()
 	defer rw.manager.removeTaskChan(taskID)
 
@@ -366,7 +459,8 @@ func (rw *RemoteAIWorker) Process(logCtx context.Context, pipeline string, model
 		return signalEOF(err)
 	}
 
-	clog.V(common.DEBUG).Infof(logCtx, "Job sent to AI worker worker=%s taskId=%d pipeline=%s model_id=%s", rw.addr, taskID, pipeline, modelID)
+	// ** Pool Customization **
+	clog.V(common.DEBUG).Infof(logCtx, "Job sent to AI worker worker=%s taskId=%d pipeline=%s model_id=%s ethAddress=%s", rw.addr, taskID, pipeline, modelID, rw.ethereumAddress.String())
 	// set a minimum timeout to accommodate transport / processing overhead
 	// TODO: this should be set for each pipeline, using something long for now
 	dur := aiWorkerRequestTimeout
@@ -377,8 +471,13 @@ func (rw *RemoteAIWorker) Process(logCtx context.Context, pipeline string, model
 	case <-ctx.Done():
 		return signalEOF(ErrRemoteWorkerTimeout)
 	case chanData := <-taskChan:
-		clog.InfofErr(logCtx, "Successfully received results from remote worker=%s taskId=%d pipeline=%s model_id=%s dur=%v",
-			rw.addr, taskID, pipeline, modelID, time.Since(start), chanData.Err)
+		// ** Pool Customization **
+		// Pool: make sure Jobs have ETH Address of Remote AI Worker
+		ethAddress := rw.ethereumAddress.String()
+		events.GlobalEventTracker.CreateEventLog("job-received", "ethAddress", ethAddress, "requestID", requestID, "pipeline", pipeline, "modelID", modelID)
+
+		clog.InfofErr(logCtx, "Successfully received results from remote worker=%s ethAddress=%s taskId=%d pipeline=%s model_id=%s dur=%v",
+			rw.addr, ethAddress, taskID, pipeline, modelID, time.Since(start), chanData.Err)
 
 		if monitor.Enabled {
 			monitor.AIResultDownloaded(logCtx, pipeline, modelID, chanData.DownloadTime)
