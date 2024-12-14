@@ -1634,3 +1634,42 @@ func mustHaveDb(db interface{}, h http.Handler) http.Handler {
 		h.ServeHTTP(w, r)
 	})
 }
+
+// Pools
+// poolActiveWorkerHandler returns a list of active pool workers
+func poolActiveWorkerHandler(db *common.DB) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		poolNodes, err := db.FindActivePoolWorkers()
+		if err != nil {
+			respond500(w, "could not get pool active workers. err: "+err.Error())
+			return
+		}
+		respondJson(w, poolNodes)
+	})
+}
+
+// TODO: need to add a "lastCheckTime" param to prevent large datasets
+// poolJobHistoryHandler returns a list of pool job history
+func poolJobHistoryHandler(db *common.DB) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		poolNodes, err := db.FindJobHistoryEvents()
+		if err != nil {
+			respond500(w, "could not get pool job history. err: "+err.Error())
+			return
+		}
+		respondJson(w, poolNodes)
+	})
+}
+
+// TODO: need to add a "lastCheckTime" param to prevent large datasets
+// poolPerformanceStatHistoryHandler returns a list of pool performance stat history
+func poolPerformanceStatHistoryHandler(db *common.DB) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		poolNodes, err := db.FindPerformanceStatHistoryEvents()
+		if err != nil {
+			respond500(w, "could not get pool performance stat history. err: "+err.Error())
+			return
+		}
+		respondJson(w, poolNodes)
+	})
+}

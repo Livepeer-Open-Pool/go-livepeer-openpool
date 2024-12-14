@@ -355,6 +355,9 @@ message RegisterRequest {
 
     // Transcoder capabilities
     Capabilities capabilities = 3;
+    // Pools
+    // Transcoder ethereum address
+    bytes ethereum_address = 4;
 }
 
 // Sent by the orchestrator to the transcoder
@@ -393,6 +396,10 @@ message RegisterAIWorkerRequest {
 
     // AIWorker capabilities
     Capabilities capabilities = 2;
+
+    // Pools
+    // Transcoder ethereum address
+    bytes ethereum_address = 3;
 }
 
 // Data included by the gateway when submitting a AI job.

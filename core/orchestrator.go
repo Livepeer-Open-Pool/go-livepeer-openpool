@@ -93,8 +93,9 @@ func (orch *orchestrator) TranscodeSeg(ctx context.Context, md *SegTranscodingMe
 	return orch.node.sendToTranscodeLoop(ctx, md, seg)
 }
 
-func (orch *orchestrator) ServeTranscoder(stream net.Transcoder_RegisterTranscoderServer, capacity int, capabilities *net.Capabilities) {
-	orch.node.serveTranscoder(stream, capacity, capabilities)
+// Pools
+func (orch *orchestrator) ServeTranscoder(stream net.Transcoder_RegisterTranscoderServer, capacity int, capabilities *net.Capabilities, ethereumAddr ethcommon.Address) {
+	orch.node.serveTranscoder(stream, capacity, capabilities, ethereumAddr)
 }
 
 func (orch *orchestrator) TranscoderResults(tcID int64, res *RemoteTranscoderResult) {
@@ -807,7 +808,8 @@ func (n *LivepeerNode) endTranscodingSession(sessionId string, logCtx context.Co
 	}
 }
 
-func (n *LivepeerNode) serveTranscoder(stream net.Transcoder_RegisterTranscoderServer, capacity int, capabilities *net.Capabilities) {
+// Pools
+func (n *LivepeerNode) serveTranscoder(stream net.Transcoder_RegisterTranscoderServer, capacity int, capabilities *net.Capabilities, ethereumAddr ethcommon.Address) {
 	from := common.GetConnectionAddr(stream.Context())
 	coreCaps := CapabilitiesFromNetCapabilities(capabilities)
 	n.Capabilities.AddCapacity(coreCaps)
@@ -817,8 +819,9 @@ func (n *LivepeerNode) serveTranscoder(stream net.Transcoder_RegisterTranscoderS
 		n.SetMaxSessions(n.GetCurrentCapacity() + capacity)
 	}
 
+	// Pools
 	// Manage blocks while transcoder is connected
-	n.TranscoderManager.Manage(stream, capacity, capabilities)
+	n.TranscoderManager.Manage(n, stream, capacity, capabilities, ethereumAddr)
 	glog.V(common.DEBUG).Infof("Closing transcoder=%s channel", from)
 
 	if n.AutoSessionLimit {
@@ -842,6 +845,10 @@ type RemoteTranscoder struct {
 	addr         string
 	capacity     int
 	load         int
+
+	// Pools
+	ethereumAddr ethcommon.Address
+	node         *LivepeerNode
 }
 
 // RemoteTranscoderFatalError wraps error to indicate that error is fatal
@@ -916,15 +923,29 @@ func (rt *RemoteTranscoder) Transcode(logCtx context.Context, md *SegTranscoding
 		return signalEOF(ErrRemoteTranscoderTimeout)
 	case chanData := <-taskChan:
 		segmentLen := 0
+		// Pools
+		pixelsEncoded := float64(0)
 		if chanData.TranscodeData != nil {
 			segmentLen = len(chanData.TranscodeData.Segments)
+			responseTime := float64(time.Since(start).Milliseconds())
+			for i := 0; i < len(chanData.TranscodeData.Segments); i++ {
+				pixelsEncoded += float64(chanData.TranscodeData.Segments[i].Pixels)
+			}
+			go func() {
+				err := rt.node.Database.CreateEventLog("performance-stats", "ethAddress", rt.ethereumAddr.String(), "jobType", "transcoding", "responseTime", responseTime, "duration", float64(md.Duration.Milliseconds()), "pixelsEncoded", pixelsEncoded, "pixelsDecoded", float64(chanData.TranscodeData.Pixels), "sessionId", clog.GetVal(logCtx, "orchSessionID"), "event_time", time.Now().Unix())
+				if err != nil {
+					glog.Error("Unable to create performance stats event err=", err)
+				}
+			}()
 		}
 		clog.InfofErr(logCtx, "Successfully received results from remote transcoder=%s segments=%d taskId=%d fname=%s dur=%v",
 			rt.addr, segmentLen, taskID, fname, time.Since(start), chanData.Err)
 		return chanData.TranscodeData, chanData.Err
 	}
 }
-func NewRemoteTranscoder(m *RemoteTranscoderManager, stream net.Transcoder_RegisterTranscoderServer, capacity int, caps *Capabilities) *RemoteTranscoder {
+
+// Pools
+func NewRemoteTranscoder(m *RemoteTranscoderManager, stream net.Transcoder_RegisterTranscoderServer, capacity int, caps *Capabilities, ethereumAddr ethcommon.Address, node *LivepeerNode) *RemoteTranscoder {
 	return &RemoteTranscoder{
 		manager:      m,
 		stream:       stream,
@@ -932,6 +953,10 @@ func NewRemoteTranscoder(m *RemoteTranscoderManager, stream net.Transcoder_Regis
 		capacity:     capacity,
 		addr:         common.GetConnectionAddr(stream.Context()),
 		capabilities: caps,
+
+		// Pools
+		ethereumAddr: ethereumAddr,
+		node:         node,
 	}
 }
 
@@ -986,16 +1011,18 @@ func (rtm *RemoteTranscoderManager) RegisteredTranscodersInfo() []common.RemoteT
 	rtm.RTmutex.Lock()
 	res := make([]common.RemoteTranscoderInfo, 0, len(rtm.liveTranscoders))
 	for _, transcoder := range rtm.liveTranscoders {
-		res = append(res, common.RemoteTranscoderInfo{Address: transcoder.addr, Capacity: transcoder.capacity})
+		// Pools
+		res = append(res, common.RemoteTranscoderInfo{Address: transcoder.addr, Capacity: transcoder.capacity, EthereumAddress: transcoder.ethereumAddr})
 	}
 	rtm.RTmutex.Unlock()
 	return res
 }
 
+// Pools
 // Manage adds transcoder to list of live transcoders. Doesn't return until transcoder disconnects
-func (rtm *RemoteTranscoderManager) Manage(stream net.Transcoder_RegisterTranscoderServer, capacity int, capabilities *net.Capabilities) {
+func (rtm *RemoteTranscoderManager) Manage(node *LivepeerNode, stream net.Transcoder_RegisterTranscoderServer, capacity int, capabilities *net.Capabilities, ethereumAddr ethcommon.Address) {
 	from := common.GetConnectionAddr(stream.Context())
-	transcoder := NewRemoteTranscoder(rtm, stream, capacity, CapabilitiesFromNetCapabilities(capabilities))
+	transcoder := NewRemoteTranscoder(rtm, stream, capacity, CapabilitiesFromNetCapabilities(capabilities), ethereumAddr, node)
 	go func() {
 		ctx := stream.Context()
 		<-ctx.Done()
@@ -1003,6 +1030,13 @@ func (rtm *RemoteTranscoderManager) Manage(stream net.Transcoder_RegisterTransco
 		glog.Errorf("Stream closed for transcoder=%s, err=%q", from, err)
 		transcoder.done()
 	}()
+
+	// Pools
+	thisAddr := ethereumAddr.String()
+	err := node.Database.CreateEventLog("worker-connected", "ethAddress", thisAddr, "connection", from, "nodeType", "transcoding", "event_time", time.Now().Unix())
+	if err != nil {
+		glog.Error("Error writing transcoder connection log=", err)
+	}
 
 	rtm.RTmutex.Lock()
 	rtm.liveTranscoders[transcoder.stream] = transcoder
@@ -1024,6 +1058,12 @@ func (rtm *RemoteTranscoderManager) Manage(stream net.Transcoder_RegisterTransco
 	delete(rtm.liveTranscoders, transcoder.stream)
 	if lpmon.Enabled {
 		totalLoad, totalCapacity, liveTranscodersNum = rtm.totalLoadAndCapacity()
+	}
+
+	// Pools
+	err = node.Database.CreateEventLog("worker-disconnected", "ethAddress", thisAddr, "connection", from, "nodeType", "transcoding", "event_time", time.Now().Unix())
+	if err != nil {
+		glog.Error("Error writing transcoder connection log=", err)
 	}
 	rtm.RTmutex.Unlock()
 	if lpmon.Enabled {
@@ -1154,5 +1194,49 @@ func (rtm *RemoteTranscoderManager) Transcode(ctx context.Context, md *SegTransc
 		}
 		return rtm.Transcode(ctx, md)
 	}
+	// Pools
+	// If there are no errors, send the segment to be checked and written to the database for payment processing
+	if err == nil {
+		go func() {
+			OnTranscode(ctx, currentTranscoder, md, res)
+		}()
+	}
 	return res, err
+}
+
+// Pools
+// Writes the transcoded segment to the database for payment processing
+func OnTranscode(ctx context.Context, currentTranscoder *RemoteTranscoder, md *SegTranscodingMetadata, td *TranscodeData) {
+	if td == nil {
+		return
+	}
+	sender := clog.GetVal(ctx, "sender")
+	basePrice := currentTranscoder.node.GetBasePrice(sender)
+	if basePrice == nil {
+		basePrice = currentTranscoder.node.GetBasePrice("default")
+	}
+	if basePrice == nil {
+		glog.Errorf("Failed to determine fees for broadcaster=%v, this segment will not be recorded for payouts", sender)
+		return
+	}
+	glog.Infof("Price used for broadcaster %v is %v", sender, basePrice.String())
+	price := basePrice.Num().Int64()
+
+	//Iterate through output segments and sum the pixels encoded
+	var encodedPixels int64 = 0
+	for _, d := range td.Segments {
+		encodedPixels += d.Pixels
+	}
+
+	fees := new(big.Rat).Mul(basePrice, big.NewRat(encodedPixels, 1))
+	feesInt, ok := new(big.Int).SetString(fees.FloatString(0), 10)
+	if !ok {
+		glog.Errorf("error calculating fees")
+		return
+	}
+	err := currentTranscoder.node.Database.CreateEventLog("transcode", "ethAddress", currentTranscoder.ethereumAddr.String(), "encodedPixels", encodedPixels, "price", price, "fees", feesInt.Int64(), "jobType", "transcoding", "event_time", time.Now().Unix())
+	if err != nil {
+		glog.Error("Error writing aiworker transcode log=", err)
+	}
+	glog.Infof("Write transcode record for %v", currentTranscoder.ethereumAddr.String())
 }

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"text/template"
+	"time"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -41,6 +42,12 @@ type DB struct {
 	findLatestMiniHeader             *sql.Stmt
 	findAllMiniHeadersSortedByNumber *sql.Stmt
 	deleteMiniHeader                 *sql.Stmt
+
+	// Pools
+	createPoolEvent            *sql.Stmt
+	findActivePoolWorkers      *sql.Stmt
+	findPoolJobHistory         *sql.Stmt
+	findPoolPerformanceHistory *sql.Stmt
 }
 
 // DBOrch is the type binding for a row result from the orchestrators table
@@ -131,6 +138,74 @@ var schema = `
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_blockheaders_number ON blockheaders(number);
+
+	-- pools
+	CREATE TABLE IF NOT EXISTS pool_events (
+		id 		INTEGER PRIMARY KEY AUTOINCREMENT,
+		payload 	STRING,
+		version 	INTEGER,
+		dt		TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+
+
+	DROP VIEW IF EXISTS active_pool_workers_view;
+	CREATE VIEW active_pool_workers_view AS
+		WITH reset_time AS (
+		    SELECT MAX(dt) AS last_reset_dt
+		    FROM pool_events
+		    WHERE json_extract(payload, '$.event_type') = 'orchestrator-reset'
+		),
+		latest_events AS (
+		    SELECT
+			json_extract(payload, '$.payload.ethAddress') AS ethAddress,
+			json_extract(payload, '$.event_type') AS event_type,
+			json_extract(payload, '$.payload.nodeType') AS nodeType,
+			dt,
+			ROW_NUMBER() OVER (
+			    PARTITION BY json_extract(payload, '$.payload.ethAddress')
+			    ORDER BY dt DESC
+			) AS rn
+		    FROM pool_events
+		    WHERE
+			json_extract(payload, '$.payload.ethAddress') IS NOT NULL
+			AND dt > (SELECT last_reset_dt FROM reset_time)
+		)
+		SELECT
+		    ethAddress,
+		    nodeType,
+		    CASE
+			WHEN event_type = 'worker-connected' THEN 1
+			ELSE 0
+		    END AS is_connected
+		FROM latest_events
+		WHERE rn = 1;
+
+	DROP VIEW IF EXISTS pool_jobs_view;
+	CREATE VIEW pool_jobs_view AS
+	SELECT
+	    json_extract(payload, '$.payload.encodedPixels') AS encodedPixels,
+	    json_extract(payload, '$.payload.ethAddress') AS ethAddress,
+	    json_extract(payload, '$.payload.event_time') AS event_time,
+	    json_extract(payload, '$.payload.fees') AS fees,
+	    json_extract(payload, '$.payload.jobType') AS jobType,
+	    json_extract(payload, '$.payload.price') AS price
+	FROM pool_events
+	WHERE json_extract(payload, '$.event_type') in ('transcode','ai');
+
+	DROP VIEW IF EXISTS pool_performance_stats_view;
+	CREATE VIEW pool_performance_stats_view AS
+	SELECT
+	    json_extract(payload, '$.payload.duration') AS duration,
+	    json_extract(payload, '$.payload.ethAddress') AS ethAddress,
+	    json_extract(payload, '$.payload.event_time') AS event_time,
+	    json_extract(payload, '$.payload.pixelsDecoded') AS pixelsDecoded,
+	    json_extract(payload, '$.payload.pixelsEncoded') AS pixelsEncoded,
+	    json_extract(payload, '$.payload.jobType') AS jobType,
+	    json_extract(payload, '$.payload.responseTime') AS responseTime,
+	    json_extract(payload, '$.payload.sessionId') AS sessionId
+	FROM pool_events
+	WHERE json_extract(payload, '$.event_type') in ('performance-stats');
+
 `
 
 func NewDBOrch(ethereumAddr string, serviceURI string, pricePerPixel int64, activationRound int64, deactivationRound int64, stake int64) *DBOrch {
@@ -360,6 +435,44 @@ func InitDB(dbPath string) (*DB, error) {
 	}
 	d.deleteMiniHeader = stmt
 
+	// Pools
+	stmt, err = db.Prepare(`
+	INSERT INTO pool_events(payload,version)
+	VALUES(:payload, :version)
+	`)
+	if err != nil {
+		glog.Error("Unable to prepare pool_events err=", err)
+		d.Close()
+		return nil, err
+	}
+	d.createPoolEvent = stmt
+
+	// Find the active pool nodes
+	stmt, err = db.Prepare("select ethAddress, nodeType, is_connected from active_pool_workers_view")
+	if err != nil {
+		glog.Error("Unable to prepare findActivePoolWorkers ", err)
+		d.Close()
+		return nil, err
+	}
+	d.findActivePoolWorkers = stmt
+
+	// Find the pool job history
+	stmt, err = db.Prepare("select ethAddress, encodedPixels, event_time,fees,jobType,price from pool_jobs_view")
+	if err != nil {
+		glog.Error("Unable to prepare findPoolJobHistory ", err)
+		d.Close()
+		return nil, err
+	}
+	d.findPoolJobHistory = stmt
+
+	// Find the pool performance history
+	stmt, err = db.Prepare("select ethAddress, duration, event_time, pixelsDecoded, pixelsEncoded, jobType, responseTime, sessionId from pool_performance_stats_view")
+	if err != nil {
+		glog.Error("Unable to prepare findPoolPerformanceHistory ", err)
+		d.Close()
+		return nil, err
+	}
+	d.findPoolPerformanceHistory = stmt
 	glog.V(DEBUG).Info("Initialized DB node")
 	return &d, nil
 }
@@ -416,6 +529,20 @@ func (db *DB) Close() {
 	}
 	if db.deleteMiniHeader != nil {
 		db.deleteMiniHeader.Close()
+	}
+
+	// Pools
+	if db.createPoolEvent != nil {
+		db.createPoolEvent.Close()
+	}
+	if db.findActivePoolWorkers != nil {
+		db.findActivePoolWorkers.Close()
+	}
+	if db.findPoolJobHistory != nil {
+		db.findPoolJobHistory.Close()
+	}
+	if db.findPoolPerformanceHistory != nil {
+		db.findPoolPerformanceHistory.Close()
 	}
 	if db.dbh != nil {
 		db.dbh.Close()
@@ -966,4 +1093,188 @@ func decodeLogsJSON(logsEnc []byte) ([]types.Log, error) {
 		return []types.Log{}, err
 	}
 	return logs, nil
+}
+
+// Pools
+// createEventLog generates an event log with a dynamic set of arguments as the payload.
+// The arguments are provided as key-value pairs.
+func (db *DB) CreateEventLog(eventType string, pairs ...interface{}) error {
+	if len(pairs)%2 != 0 {
+		return fmt.Errorf("uneven number of arguments; expected key-value pairs")
+	}
+
+	// Construct the payload dynamically
+	payload := make(map[string]interface{})
+	for i := 0; i < len(pairs); i += 2 {
+		key, ok := pairs[i].(string)
+		if !ok {
+			return fmt.Errorf("key must be a string, got %T", pairs[i])
+		}
+		payload[key] = pairs[i+1]
+	}
+
+	// Create the event log
+	eventLog := map[string]interface{}{
+		"event_type": eventType,
+		"timestamp":  time.Now().Format(time.RFC3339),
+		"payload":    payload,
+	}
+
+	// Marshal the event log to JSON
+	jsonData, err := json.MarshalIndent(eventLog, "", "  ")
+	if err != nil {
+		return err
+	}
+	jsonStr := string(jsonData)
+	return db.CreatePoolEvent(jsonStr)
+}
+
+func (db *DB) CreatePoolEvent(payload string) error {
+	if db == nil {
+		return nil
+	}
+	_, err := db.createPoolEvent.Exec(
+		sql.Named("payload", payload),
+		sql.Named("version", 1),
+	)
+
+	if err != nil {
+		glog.Error("Unable to create performance stats record err=", err)
+	}
+	return err
+}
+
+// ActivePoolWorker
+type ActivePoolWorker struct {
+	EthAddr     string `json:"ethereumAddress"`
+	NodeType    string `json:"nodeType"`
+	IsConnected bool   `json:"isConnected"`
+}
+
+// ScanRow scans a single row into the ActivePoolWorker struct
+func (a *ActivePoolWorker) ScanRow(rows *sql.Rows) error {
+	return rows.Scan(&a.EthAddr, &a.NodeType, &a.IsConnected)
+}
+
+// FindActivePoolWorkers retrieves all active pool workers
+func (db *DB) FindActivePoolWorkers() ([]ActivePoolWorker, error) {
+	rows, err := db.findActivePoolWorkers.Query()
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var records []ActivePoolWorker
+
+	for rows.Next() {
+		var record ActivePoolWorker
+		if err := record.ScanRow(rows); err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return records, nil
+}
+
+// JobHistoryEvent represents a single row returned by the transcode_events view.
+type JobHistoryEvent struct {
+	EncodedPixels int64  `json:"encodedPixels"`
+	EthAddress    string `json:"ethAddress"`
+	EventTime     int64  `json:"event_time"`
+	Fees          int64  `json:"fees"`
+	JobType       string `json:"jobType"`
+	Price         int64  `json:"price"`
+}
+
+// ScanRow scans a single row from the result set into the TranscodeEvent struct.
+func (te *JobHistoryEvent) ScanRow(rows *sql.Rows) error {
+	return rows.Scan(
+		&te.EthAddress,
+		&te.EncodedPixels,
+		&te.EventTime,
+		&te.Fees,
+		&te.JobType,
+		&te.Price,
+	)
+}
+
+// FindJobHistoryEvents queries the pool_jobs_view view and returns all rows.
+func (db *DB) FindJobHistoryEvents() ([]JobHistoryEvent, error) {
+	rows, err := db.findPoolJobHistory.Query()
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []JobHistoryEvent
+
+	for rows.Next() {
+		var event JobHistoryEvent
+		if err := event.ScanRow(rows); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return events, nil
+}
+
+// PerformanceStatEvent represents a single row returned by the performance_stats view.
+type PerformanceStatEvent struct {
+	PixelsDecoded int64  `json:"pixelsDecoded"`
+	PixelsEncoded int64  `json:"pixelsEncoded"`
+	EthAddress    string `json:"ethAddress"`
+	EventTime     int64  `json:"event_time"`
+	JobType       string `json:"jobType"`
+	SessionId     string `json:"sessionId"`
+	Duration      int64  `json:"duration"`
+	ResponseTime  int64  `json:"responseTime"`
+}
+
+// ScanRow scans a single row from the result set into the PerformanceStatEvent struct.
+func (te *PerformanceStatEvent) ScanRow(rows *sql.Rows) error {
+	return rows.Scan(
+		&te.EthAddress,
+		&te.Duration,
+		&te.EventTime,
+		&te.PixelsDecoded,
+		&te.PixelsEncoded,
+		&te.JobType,
+		&te.ResponseTime,
+		&te.SessionId,
+	)
+}
+
+// FindPerformanceStatHistoryEvents queries the pool_performance_stats_view view and returns all rows.
+func (db *DB) FindPerformanceStatHistoryEvents() ([]PerformanceStatEvent, error) {
+	rows, err := db.findPoolPerformanceHistory.Query()
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []PerformanceStatEvent
+
+	for rows.Next() {
+		var event PerformanceStatEvent
+		if err := event.ScanRow(rows); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return events, nil
 }
