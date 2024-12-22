@@ -169,7 +169,8 @@ func runAIJob(n *core.LivepeerNode, orchAddr string, httpc *http.Client, notify 
 	ctx := clog.AddVal(context.Background(), "taskId", strconv.FormatInt(notify.TaskId, 10))
 	ctx = clog.AddVal(ctx, "ethAddress", ethAddress.String())
 
-	clog.Infof(ctx, "Received AI job, validating request")
+	clog.Infof(ctx, "Received AI job, validating request ethAddress=%s", ethAddress.String())
+	clog.Infof(ctx, "!!!  is pool evnet tracker here???? %v", n.PoolEventTracker)
 
 	var processFn func(context.Context) (interface{}, error)
 	var resp interface{} // this is used for video as well because Frames received are transcoded to an MP4
@@ -183,7 +184,7 @@ func runAIJob(n *core.LivepeerNode, orchAddr string, httpc *http.Client, notify 
 	var reqData AIJobRequestData
 	err = json.Unmarshal(notify.AIJobData.RequestData, &reqData)
 	if err != nil {
-		sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, httpc, contentType, &body, err)
+		sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, ethAddress, httpc, contentType, &body, err)
 		return
 	}
 
@@ -336,7 +337,7 @@ func runAIJob(n *core.LivepeerNode, orchAddr string, httpc *http.Client, notify 
 	if !reqOk {
 		resp = nil
 		err = fmt.Errorf("AI request validation failed for %v pipeline err=%v", notify.AIJobData.Pipeline, err)
-		sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, httpc, contentType, &body, err)
+		sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, ethAddress, httpc, contentType, &body, err)
 		return
 	}
 
@@ -347,7 +348,7 @@ func runAIJob(n *core.LivepeerNode, orchAddr string, httpc *http.Client, notify 
 	err = n.ReserveAICapability(notify.AIJobData.Pipeline, modelID)
 	if err != nil {
 		clog.Errorf(ctx, "No capability available to process requested AI job with this node taskId=%d pipeline=%s modelID=%s err=%q", notify.TaskId, notify.AIJobData.Pipeline, modelID, core.ErrNoCompatibleWorkersAvailable)
-		sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, httpc, contentType, &body, core.ErrNoCompatibleWorkersAvailable)
+		sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, ethAddress, httpc, contentType, &body, core.ErrNoCompatibleWorkersAvailable)
 		return
 	}
 
@@ -360,7 +361,7 @@ func runAIJob(n *core.LivepeerNode, orchAddr string, httpc *http.Client, notify 
 		if _, ok := err.(core.UnrecoverableError); ok {
 			defer panic(err)
 		}
-		sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, httpc, contentType, &body, err)
+		sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, ethAddress, httpc, contentType, &body, err)
 		return
 	}
 
@@ -374,7 +375,7 @@ func runAIJob(n *core.LivepeerNode, orchAddr string, httpc *http.Client, notify 
 				sendStreamingAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, httpc, resultType, streamChan)
 				return
 			} else {
-				sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, httpc, contentType, &body, fmt.Errorf("streaming not supported"))
+				sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, ethAddress, httpc, contentType, &body, fmt.Errorf("streaming not supported"))
 				return
 			}
 		}
@@ -394,7 +395,7 @@ func runAIJob(n *core.LivepeerNode, orchAddr string, httpc *http.Client, notify 
 					err := worker.ReadImageB64DataUrl(image.Url, &resBuf)
 					if err != nil {
 						clog.Errorf(ctx, "AI Worker failed to save image from data url err=%q", err)
-						sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, httpc, contentType, &body, err)
+						sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, ethAddress, httpc, contentType, &body, err)
 						return
 					}
 					length = resBuf.Len()
@@ -410,7 +411,7 @@ func runAIJob(n *core.LivepeerNode, orchAddr string, httpc *http.Client, notify 
 					fw, err := w.CreatePart(hdrs)
 					if err != nil {
 						clog.Errorf(ctx, "Could not create multipart part err=%q", err)
-						sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, httpc, contentType, nil, err)
+						sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, ethAddress, httpc, contentType, nil, err)
 						return
 					}
 					io.Copy(fw, &resBuf)
@@ -421,7 +422,7 @@ func runAIJob(n *core.LivepeerNode, orchAddr string, httpc *http.Client, notify 
 					f, err := os.ReadFile(image.Url)
 					if err != nil {
 						clog.Errorf(ctx, "Could not create multipart part err=%q", err)
-						sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, httpc, contentType, nil, err)
+						sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, ethAddress, httpc, contentType, nil, err)
 						return
 					}
 					defer os.Remove(image.Url)
@@ -435,7 +436,7 @@ func runAIJob(n *core.LivepeerNode, orchAddr string, httpc *http.Client, notify 
 					fw, err := w.CreatePart(hdrs)
 					if err != nil {
 						clog.Errorf(ctx, "Could not create multipart part err=%q", err)
-						sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, httpc, contentType, nil, err)
+						sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, ethAddress, httpc, contentType, nil, err)
 						return
 					}
 					io.Copy(fw, bytes.NewBuffer(f))
@@ -447,7 +448,7 @@ func runAIJob(n *core.LivepeerNode, orchAddr string, httpc *http.Client, notify 
 			err := worker.ReadAudioB64DataUrl(wkrResp.Audio.Url, &resBuf)
 			if err != nil {
 				clog.Errorf(ctx, "AI Worker failed to save image from data url err=%q", err)
-				sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, httpc, contentType, &body, err)
+				sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, ethAddress, httpc, contentType, &body, err)
 				return
 			}
 			length = resBuf.Len()
@@ -462,7 +463,7 @@ func runAIJob(n *core.LivepeerNode, orchAddr string, httpc *http.Client, notify 
 			fw, err := w.CreatePart(hdrs)
 			if err != nil {
 				clog.Errorf(ctx, "Could not create multipart part err=%q", err)
-				sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, httpc, contentType, nil, err)
+				sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, ethAddress, httpc, contentType, nil, err)
 				return
 			}
 			io.Copy(fw, &resBuf)
@@ -475,7 +476,7 @@ func runAIJob(n *core.LivepeerNode, orchAddr string, httpc *http.Client, notify 
 
 		if err != nil {
 			clog.Errorf(ctx, "Could not marshal json response err=%q", err)
-			sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, httpc, contentType, nil, err)
+			sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, ethAddress, httpc, contentType, nil, err)
 			return
 		}
 
@@ -493,14 +494,14 @@ func runAIJob(n *core.LivepeerNode, orchAddr string, httpc *http.Client, notify 
 
 	w.Close()
 	contentType = "multipart/mixed; boundary=" + boundary
-	sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, httpc, contentType, &body, nil)
+	sendAIResult(ctx, n, orchAddr, notify.AIJobData.Pipeline, modelID, ethAddress, httpc, contentType, &body, nil)
 }
 
-func sendAIResult(ctx context.Context, n *core.LivepeerNode, orchAddr string, pipeline string, modelID string, httpc *http.Client,
+func sendAIResult(ctx context.Context, n *core.LivepeerNode, orchAddr string, pipeline string, modelID string, ethAddress ethcommon.Address, httpc *http.Client,
 	contentType string, body *bytes.Buffer, err error,
 ) {
 	taskId := clog.GetVal(ctx, "taskId")
-	clog.Infof(ctx, "sending results back to Orchestrator")
+	clog.Infof(ctx, "sending results back to Orchestrator. PoolEthAddress=%s", ethAddress.String())
 	if err != nil {
 		clog.Errorf(ctx, "Unable to process AI job err=%q", err)
 		body.Write([]byte(err.Error()))
@@ -518,6 +519,7 @@ func sendAIResult(ctx context.Context, n *core.LivepeerNode, orchAddr string, pi
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("TaskId", taskId)
 	req.Header.Set("Pipeline", pipeline)
+	req.Header.Set("EthAddress", ethAddress.String())
 
 	//TODO: possible place to put the Worker ETH? need access to outPixels, fees, price for worker
 
@@ -564,6 +566,7 @@ func sendStreamingAIResult(ctx context.Context, n *core.LivepeerNode, orchAddr s
 	req.Header.Set("Credentials", n.OrchSecret)
 	req.Header.Set("TaskId", taskId)
 	req.Header.Set("Pipeline", pipeline)
+	//TODO: req.Header.Set("EthAddress", ethAddress)
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set("Connection", "keep-alive")

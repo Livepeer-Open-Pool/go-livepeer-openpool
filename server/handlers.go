@@ -1710,13 +1710,7 @@ func parseLastCheckTime(r *http.Request) (time.Time, error) {
 
 	if lastCheckTimeStr == "" {
 		// Return zero value if the parameter is not provided
-		return time.Time{}, nil
+		return time.Date(1, time.January, 1, 0, 0, 0, 0, time.UTC), nil
 	}
-
-	lastCheckTime, err := time.Parse(time.RFC3339, lastCheckTimeStr)
-	if err != nil {
-		return time.Time{}, err
-	}
-
-	return lastCheckTime, nil
+	return time.Parse(time.RFC3339, lastCheckTimeStr)
 }

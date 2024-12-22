@@ -157,6 +157,8 @@ type LivepeerNode struct {
 	LiveAITrickleHostForRunner string
 	LiveAIAuthApiKey           string
 	LivePaymentInterval        time.Duration
+
+	PoolEventTracker *PoolEventTracker
 }
 
 type LivePipeline struct {

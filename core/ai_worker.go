@@ -131,9 +131,9 @@ func (rwm *RemoteAIWorkerManager) Manage(node *LivepeerNode, stream net.AIWorker
 
 	//Pools
 	ethAddrStr := ethereumAddr.String()
-	err := node.Database.CreateEventLog("worker-connected", "ethAddress", ethAddrStr, "connection", from, "nodeType", "ai", "event_time", time.Now().Unix())
+	err := node.Database.CreateEventLog("worker-connected", "ethAddress", ethAddrStr, "connection", from, "jobType", "ai", "region", "TODO")
 	if err != nil {
-		glog.Error("Error writing aiworker connection log=", err)
+		glog.Infof("ERROR: Failed to write connect record for ethAddr=%v err=%v", ethAddrStr, err)
 	}
 	rwm.RWmutex.Lock()
 	rwm.liveAIWorkers[aiworker.stream] = aiworker
@@ -143,9 +143,9 @@ func (rwm *RemoteAIWorkerManager) Manage(node *LivepeerNode, stream net.AIWorker
 	<-aiworker.eof
 	glog.Infof("Got aiworker=%s eof, removing from live aiworkers map", from)
 	// Pools
-	err = node.Database.CreateEventLog("worker-disconnected", "ethAddress", ethAddrStr, "connection", from, "nodeType", "ai", "event_time", time.Now().Unix())
-	if err != nil {
-		glog.Error("Error writing aiworker disconnect log=", err)
+	err2 := node.Database.CreateEventLog("worker-disconnected", "ethAddress", ethAddrStr, "connection", from, "jobType", "ai", "region", "TODO")
+	if err2 != nil {
+		glog.Infof("ERROR: Failed to write disconnect record for ethAddr=%v err=%v", ethAddrStr, err2)
 	}
 	rwm.RWmutex.Lock()
 	delete(rwm.liveAIWorkers, aiworker.stream)
@@ -164,12 +164,12 @@ func NewRemoteAIWorkerFatalError(err error) error {
 }
 
 // Process does actual AI job using remote worker from the pool
-func (rwm *RemoteAIWorkerManager) Process(ctx context.Context, requestID string, pipeline string, modelID string, fname string, req AIJobRequestData) (*RemoteAIWorkerResult, error) {
+func (rwm *RemoteAIWorkerManager) Process(ctx context.Context, requestID string, pipeline string, modelID string, fname string, req AIJobRequestData, poolEventTracker PoolEventTracker) (*RemoteAIWorkerResult, error) {
 	worker, err := rwm.selectWorker(requestID, pipeline, modelID)
 	if err != nil {
 		return nil, err
 	}
-	res, err := worker.Process(ctx, pipeline, modelID, fname, req)
+	res, err := worker.Process(ctx, pipeline, modelID, fname, req, poolEventTracker)
 	if err != nil {
 		rwm.completeAIRequest(requestID, pipeline, modelID)
 	}
@@ -179,7 +179,7 @@ func (rwm *RemoteAIWorkerManager) Process(ctx context.Context, requestID string,
 		if err.(RemoteAIWorkerFatalError).error == ErrRemoteWorkerTimeout {
 			return res, err
 		}
-		return rwm.Process(ctx, requestID, pipeline, modelID, fname, req)
+		return rwm.Process(ctx, requestID, pipeline, modelID, fname, req, poolEventTracker)
 	}
 
 	rwm.completeAIRequest(requestID, pipeline, modelID)
@@ -310,7 +310,7 @@ type RemoteAIWorkerResult struct {
 	DownloadTime time.Duration
 	Fees         big.Rat
 	ResponseTime time.Duration
-	EthAddress   ethcommon.Address
+	EthAddress   string
 }
 
 type AIWorkerChan chan *RemoteAIWorkerResult
@@ -349,7 +349,7 @@ func (rwm *RemoteAIWorkerManager) removeTaskChan(taskID int64) {
 }
 
 // Process does actual AI processing by sending work to remote ai worker and waiting for the result
-func (rw *RemoteAIWorker) Process(logCtx context.Context, pipeline string, modelID string, fname string, req AIJobRequestData) (*RemoteAIWorkerResult, error) {
+func (rw *RemoteAIWorker) Process(logCtx context.Context, pipeline string, modelID string, fname string, req AIJobRequestData, poolEventTracker PoolEventTracker) (*RemoteAIWorkerResult, error) {
 	taskID, taskChan := rw.manager.addTaskChan()
 	defer rw.manager.removeTaskChan(taskID)
 
@@ -384,18 +384,20 @@ func (rw *RemoteAIWorker) Process(logCtx context.Context, pipeline string, model
 	clog.V(common.DEBUG).Infof(logCtx, "Job sent to AI worker worker=%s taskId=%d pipeline=%s model_id=%s ethAddress=%s", rw.addr, taskID, pipeline, modelID, rw.ethereumAddr.String())
 	// set a minimum timeout to accommodate transport / processing overhead
 	// TODO: this should be set for each pipeline, using something long for now
+	poolEventTracker.CreateEventLog("ai-job-sent", "ethAddress", rw.ethereumAddr.String(), "taskID", taskID, "pipeline", pipeline, "modelID", modelID, "jobType", "ai", "region", "TODO")
 	dur := aiWorkerRequestTimeout
 
 	ctx, cancel := context.WithTimeout(context.Background(), dur)
+
 	defer cancel()
 	select {
 	case <-ctx.Done():
 		return signalEOF(ErrRemoteWorkerTimeout)
 	case chanData := <-taskChan:
 		// Pools
-		ethAddress := rw.ethereumAddr
+		ethAddress := chanData.EthAddress
 		clog.InfofErr(logCtx, "Successfully received results from remote worker=%s taskId=%d pipeline=%s model_id=%s dur=%v ethAddress=%s",
-			rw.addr, taskID, pipeline, modelID, time.Since(start), ethAddress.String(), chanData.Err)
+			rw.addr, taskID, pipeline, modelID, time.Since(start), ethAddress)
 
 		if monitor.Enabled {
 			monitor.AIResultDownloaded(logCtx, pipeline, modelID, chanData.DownloadTime)
@@ -558,7 +560,7 @@ func (orch *orchestrator) TextToImage(ctx context.Context, requestID string, req
 	}
 
 	// remote ai worker proceses job
-	res, err := orch.node.AIWorkerManager.Process(ctx, requestID, "text-to-image", *req.ModelId, "", AIJobRequestData{Request: req})
+	res, err := orch.node.AIWorkerManager.Process(ctx, requestID, "text-to-image", *req.ModelId, "", AIJobRequestData{Request: req}, NewPoolEventTracker(orch.node.Database))
 	if err != nil {
 		return nil, err
 	}
@@ -591,7 +593,7 @@ func (orch *orchestrator) LiveVideoToVideo(ctx context.Context, requestID string
 	}
 
 	// remote ai worker processes job
-	res, err := orch.node.AIWorkerManager.Process(ctx, requestID, "live-video-to-video", *req.ModelId, "", AIJobRequestData{Request: req})
+	res, err := orch.node.AIWorkerManager.Process(ctx, requestID, "live-video-to-video", *req.ModelId, "", AIJobRequestData{Request: req}, NewPoolEventTracker(orch.node.Database))
 	if err != nil {
 		return nil, err
 	}
@@ -635,7 +637,7 @@ func (orch *orchestrator) ImageToImage(ctx context.Context, requestID string, re
 	}
 	req.Image.InitFromBytes(nil, "") // remove image data
 
-	res, err := orch.node.AIWorkerManager.Process(ctx, requestID, "image-to-image", *req.ModelId, inputUrl, AIJobRequestData{Request: req, InputUrl: inputUrl})
+	res, err := orch.node.AIWorkerManager.Process(ctx, requestID, "image-to-image", *req.ModelId, inputUrl, AIJobRequestData{Request: req, InputUrl: inputUrl}, NewPoolEventTracker(orch.node.Database))
 	if err != nil {
 		return nil, err
 	}
@@ -679,7 +681,7 @@ func (orch *orchestrator) ImageToVideo(ctx context.Context, requestID string, re
 	}
 	req.Image.InitFromBytes(nil, "") // remove image data
 
-	res, err := orch.node.AIWorkerManager.Process(ctx, requestID, "image-to-video", *req.ModelId, inputUrl, AIJobRequestData{Request: req, InputUrl: inputUrl})
+	res, err := orch.node.AIWorkerManager.Process(ctx, requestID, "image-to-video", *req.ModelId, inputUrl, AIJobRequestData{Request: req, InputUrl: inputUrl}, NewPoolEventTracker(orch.node.Database))
 	if err != nil {
 		return nil, err
 	}
@@ -723,7 +725,7 @@ func (orch *orchestrator) Upscale(ctx context.Context, requestID string, req wor
 	}
 	req.Image.InitFromBytes(nil, "") // remove image data
 
-	res, err := orch.node.AIWorkerManager.Process(ctx, requestID, "upscale", *req.ModelId, inputUrl, AIJobRequestData{Request: req, InputUrl: inputUrl})
+	res, err := orch.node.AIWorkerManager.Process(ctx, requestID, "upscale", *req.ModelId, inputUrl, AIJobRequestData{Request: req, InputUrl: inputUrl}, NewPoolEventTracker(orch.node.Database))
 	if err != nil {
 		return nil, err
 	}
@@ -759,7 +761,7 @@ func (orch *orchestrator) AudioToText(ctx context.Context, requestID string, req
 	}
 	req.Audio.InitFromBytes(nil, "") // remove audio data
 
-	res, err := orch.node.AIWorkerManager.Process(ctx, requestID, "audio-to-text", *req.ModelId, inputUrl, AIJobRequestData{Request: req, InputUrl: inputUrl})
+	res, err := orch.node.AIWorkerManager.Process(ctx, requestID, "audio-to-text", *req.ModelId, inputUrl, AIJobRequestData{Request: req, InputUrl: inputUrl}, NewPoolEventTracker(orch.node.Database))
 	if err != nil {
 		return nil, err
 	}
@@ -795,7 +797,7 @@ func (orch *orchestrator) SegmentAnything2(ctx context.Context, requestID string
 	}
 	req.Image.InitFromBytes(nil, "") // remove image data
 
-	res, err := orch.node.AIWorkerManager.Process(ctx, requestID, "segment-anything-2", *req.ModelId, inputUrl, AIJobRequestData{Request: req, InputUrl: inputUrl})
+	res, err := orch.node.AIWorkerManager.Process(ctx, requestID, "segment-anything-2", *req.ModelId, inputUrl, AIJobRequestData{Request: req, InputUrl: inputUrl}, NewPoolEventTracker(orch.node.Database))
 	if err != nil {
 		return nil, err
 	}
@@ -820,7 +822,7 @@ func (orch *orchestrator) LLM(ctx context.Context, requestID string, req worker.
 		return orch.node.AIWorker.LLM(ctx, req)
 	}
 
-	res, err := orch.node.AIWorkerManager.Process(ctx, requestID, "llm", *req.ModelId, "", AIJobRequestData{Request: req})
+	res, err := orch.node.AIWorkerManager.Process(ctx, requestID, "llm", *req.ModelId, "", AIJobRequestData{Request: req}, NewPoolEventTracker(orch.node.Database))
 	if err != nil {
 		return nil, err
 	}
@@ -860,7 +862,7 @@ func (orch *orchestrator) ImageToText(ctx context.Context, requestID string, req
 	}
 	req.Image.InitFromBytes(nil, "")
 
-	res, err := orch.node.AIWorkerManager.Process(ctx, requestID, "image-to-text", *req.ModelId, inputUrl, AIJobRequestData{Request: req, InputUrl: inputUrl})
+	res, err := orch.node.AIWorkerManager.Process(ctx, requestID, "image-to-text", *req.ModelId, inputUrl, AIJobRequestData{Request: req, InputUrl: inputUrl}, NewPoolEventTracker(orch.node.Database))
 	if err != nil {
 		return nil, err
 	}
@@ -893,7 +895,7 @@ func (orch *orchestrator) TextToSpeech(ctx context.Context, requestID string, re
 	}
 
 	// remote ai worker proceses job
-	res, err := orch.node.AIWorkerManager.Process(ctx, requestID, "text-to-speech", *req.ModelId, "", AIJobRequestData{Request: req})
+	res, err := orch.node.AIWorkerManager.Process(ctx, requestID, "text-to-speech", *req.ModelId, "", AIJobRequestData{Request: req}, NewPoolEventTracker(orch.node.Database))
 	if err != nil {
 		return nil, err
 	}

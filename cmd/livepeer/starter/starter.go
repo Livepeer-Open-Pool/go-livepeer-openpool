@@ -501,17 +501,22 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 		glog.Errorf("Error opening DB: %v", err)
 		return
 	}
-	//Pools - signal orchestrator was restarted
-	glog.Infof("Writing reset flag to connection records")
-	err = dbh.CreateEventLog("orchestrator-reset", "nodeType", "ai", "event_time", time.Now().Unix())
-	if err != nil {
-		glog.Error("Error writing orchestrator reset log=", err)
-	}
 	defer dbh.Close()
 
 	n, err := core.NewLivepeerNode(nil, *cfg.Datadir, dbh)
 	if err != nil {
 		glog.Errorf("Error creating livepeer node: %v", err)
+	}
+	//Pools - signal orchestrator was restarted
+	glog.Infof("Writing reset flag to connection records")
+	jobType := "transcode"
+	if *cfg.AIModels != "" && n.NodeType == core.OrchestratorNode {
+		jobType = "ai"
+	}
+
+	err = dbh.CreateEventLog("orchestrator-reset", "jobType", jobType, "region", "TODO")
+	if err != nil {
+		glog.Error("Error writing orchestrator reset log=", err)
 	}
 
 	if *cfg.OrchSecret != "" {

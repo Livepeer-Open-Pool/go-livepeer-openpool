@@ -82,14 +82,13 @@ func aiHttpHandle[I any](h *lphttp, decoderFunc func(*I, *http.Request) error) h
 		orch := h.orchestrator
 		remoteAddr := getRemoteAddr(r)
 		ctx := clog.AddVal(r.Context(), clog.ClientIP, remoteAddr)
-
 		var req I
 		if err := decoderFunc(&req, r); err != nil {
 			respondWithError(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		handleAIRequest(ctx, w, r, orch, req)
+		handleAIRequest(ctx, w, r, orch, req, core.NewPoolEventTracker(h.node.Database))
 	})
 }
 
@@ -275,7 +274,7 @@ func overwriteHost(hostOverwrite, url string) string {
 	return u.String()
 }
 
-func handleAIRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, orch Orchestrator, req interface{}) {
+func handleAIRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, orch Orchestrator, req interface{}, poolEventTracker core.PoolEventTracker) {
 	payment, err := getPayment(r.Header.Get(paymentHeader))
 	if err != nil {
 		respondWithError(w, err.Error(), http.StatusPaymentRequired)
@@ -296,7 +295,7 @@ func handleAIRequest(ctx context.Context, w http.ResponseWriter, r *http.Request
 	var modelID string
 	var submitFn func(context.Context) (interface{}, error)
 	var outPixels int64
-
+	ethAddress := r.Header.Get("EthAddress")
 	switch v := req.(type) {
 	case worker.GenTextToImageJSONRequestBody:
 		pipeline = "text-to-image"
@@ -507,6 +506,8 @@ func handleAIRequest(ctx context.Context, w http.ResponseWriter, r *http.Request
 
 	start := time.Now()
 	resp, err := submitFn(ctx)
+	clog.Infof(ctx, "WTFFFFFFFFFF request id=%v cap=%v modelID=%v RESP = %v", requestID, cap, modelID, resp)
+
 	if err != nil {
 		if monitor.Enabled {
 			monitor.AIProcessingError(err.Error(), pipeline, modelID, sender.Hex())
@@ -542,7 +543,7 @@ func handleAIRequest(ctx context.Context, w http.ResponseWriter, r *http.Request
 	}
 
 	took := time.Since(start)
-	clog.Infof(ctx, "Processed request id=%v cap=%v modelID=%v took=%v", requestID, cap, modelID, took)
+	clog.Infof(ctx, "Processed request id=%v cap=%v modelID=%v took=%v ETH BABY!!!!!!=%v", requestID, cap, modelID, took, ethAddress)
 
 	// At the moment, outPixels is expected to just be height * width * frames
 	// If the # of inference/denoising steps becomes configurable, a possible updated formula could be height * width * frames * steps
@@ -577,6 +578,17 @@ func handleAIRequest(ctx context.Context, w http.ResponseWriter, r *http.Request
 		if priceInfo := payment.GetExpectedPrice(); priceInfo != nil && priceInfo.GetPixelsPerUnit() != 0 {
 			pricePerAIUnit = float64(priceInfo.GetPricePerUnit()) / float64(priceInfo.GetPixelsPerUnit())
 		}
+		poolEventTracker.CreateEventLog("ai-job-processedd",
+			"ethAddress", ctx.Value("ethAddress"),
+			"sender", sender,
+			"manifestID", manifestID,
+			"responseTime", took,
+			"price", payment.GetExpectedPrice(),
+			"aiComputeUnits", outPixels,
+			"pricePerAIComputeUnit", pricePerAIUnit,
+			"jobType", "ai",
+			"region", "TODO")
+
 		//TODO: possible place to put the Worker ETH? need access to outPixels, fees, price for worker
 		monitor.AIJobProcessed(ctx, pipeline, modelID, monitor.AIJobInfo{LatencyScore: latencyScore, PricePerUnit: pricePerAIUnit})
 	}
@@ -656,10 +668,12 @@ func (h *lphttp) AIResults() http.Handler {
 		}
 
 		pipeline := r.Header.Get("Pipeline")
+		ethAddress := r.Header.Get("EthAddress")
+		glog.Infof("AIResults = ethAddress=%s", ethAddress)
 
 		var workerResult core.RemoteAIWorkerResult
 		workerResult.Files = make(map[string][]byte)
-
+		workerResult.EthAddress = ethAddress
 		start := time.Now()
 		dlDur := time.Duration(0) // default to 0 in case of early return
 		resultType := ""
@@ -672,16 +686,17 @@ func (h *lphttp) AIResults() http.Handler {
 			} else {
 				workerResult.Err = fmt.Errorf(string(body))
 			}
+			workerResult.EthAddress = ethAddress
 			glog.Errorf("AI Worker error for taskId=%v err=%q", tid, workerResult.Err)
 			orch.AIResults(tid, &workerResult)
 			w.Write([]byte("OK"))
 			return
 		case "text/event-stream":
 			resultType = "streaming"
-			glog.Infof("Received %s response from remote worker=%s taskId=%d", resultType, r.RemoteAddr, tid)
+			glog.Infof("Received %s response from remote worker=%s taskId=%d ethAddress=%s", resultType, r.RemoteAddr, tid, ethAddress)
 			resChan := make(chan worker.LlmStreamChunk, 100)
 			workerResult.Results = (<-chan worker.LlmStreamChunk)(resChan)
-
+			workerResult.EthAddress = ethAddress
 			defer r.Body.Close()
 			defer close(resChan)
 			//set a reasonable timeout to stop waiting for results
@@ -715,16 +730,17 @@ func (h *lphttp) AIResults() http.Handler {
 			dlDur = time.Since(start)
 		case "multipart/mixed":
 			resultType = "uploaded"
-			glog.Infof("Received %s response from remote worker=%s taskId=%d", resultType, r.RemoteAddr, tid)
+			glog.Infof("Received %s response from remote worker=%s taskId=%d ethAddress=%s", resultType, r.RemoteAddr, tid, ethAddress)
 			workerResult := parseMultiPartResult(r.Body, params["boundary"], pipeline)
 
 			//return results
 			dlDur = time.Since(start)
 			workerResult.DownloadTime = dlDur
+			workerResult.EthAddress = ethAddress
 			orch.AIResults(tid, &workerResult)
 		}
 
-		glog.V(common.VERBOSE).Infof("Processed %s results from remote worker=%s taskId=%d dur=%s", resultType, r.RemoteAddr, tid, dlDur)
+		glog.V(common.VERBOSE).Infof("Processed %s results from remote worker=%s taskId=%d dur=%s ethAddress=%s", resultType, r.RemoteAddr, tid, dlDur, workerResult.EthAddress)
 
 		if workerResult.Err != nil {
 			http.Error(w, workerResult.Err.Error(), http.StatusInternalServerError)

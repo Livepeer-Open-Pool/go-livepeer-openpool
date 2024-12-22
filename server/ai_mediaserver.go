@@ -99,11 +99,12 @@ func aiMediaServerHandle[I, O any](ls *LivepeerServer, decoderFunc func(*I, *htt
 		ctx := clog.AddVal(r.Context(), clog.ClientIP, remoteAddr)
 		requestID := string(core.RandomManifestID())
 		ctx = clog.AddVal(ctx, "request_id", requestID)
-
+		clog.Infof(ctx, "adding poolEventTracker to the params AI request!!!!!")
 		params := aiRequestParams{
-			node:        ls.LivepeerNode,
-			os:          drivers.NodeStorage.NewSession(requestID),
-			sessManager: ls.AISessionManager,
+			node:             ls.LivepeerNode,
+			os:               drivers.NodeStorage.NewSession(requestID),
+			sessManager:      ls.AISessionManager,
+			poolEventTracker: core.NewPoolEventTracker(ls.LivepeerNode.Database),
 		}
 
 		var req I
@@ -162,9 +163,10 @@ func (ls *LivepeerServer) ImageToVideo() http.Handler {
 		clog.V(common.VERBOSE).Infof(ctx, "Received ImageToVideo request imageSize=%v model_id=%v async=%v", req.Image.FileSize(), *req.ModelId, async)
 
 		params := aiRequestParams{
-			node:        ls.LivepeerNode,
-			os:          drivers.NodeStorage.NewSession(requestID),
-			sessManager: ls.AISessionManager,
+			node:             ls.LivepeerNode,
+			os:               drivers.NodeStorage.NewSession(requestID),
+			sessManager:      ls.AISessionManager,
+			poolEventTracker: core.NewPoolEventTracker(ls.LivepeerNode.Database),
 		}
 
 		if !async {
@@ -271,9 +273,10 @@ func (ls *LivepeerServer) LLM() http.Handler {
 		clog.V(common.VERBOSE).Infof(ctx, "Received LLM request prompt=%v model_id=%v stream=%v", req.Prompt, *req.ModelId, *req.Stream)
 
 		params := aiRequestParams{
-			node:        ls.LivepeerNode,
-			os:          drivers.NodeStorage.NewSession(requestID),
-			sessManager: ls.AISessionManager,
+			node:             ls.LivepeerNode,
+			os:               drivers.NodeStorage.NewSession(requestID),
+			sessManager:      ls.AISessionManager,
+			poolEventTracker: core.NewPoolEventTracker(ls.LivepeerNode.Database),
 		}
 
 		start := time.Now()
@@ -521,10 +524,13 @@ func (ls *LivepeerServer) StartLiveVideo() http.Handler {
 			}
 		}
 
+		clog.Infof(ctx, "adding poolEventTracker to the params AI request!!!!!")
+
 		params := aiRequestParams{
-			node:        ls.LivepeerNode,
-			os:          drivers.NodeStorage.NewSession(requestID),
-			sessManager: ls.AISessionManager,
+			node:             ls.LivepeerNode,
+			os:               drivers.NodeStorage.NewSession(requestID),
+			sessManager:      ls.AISessionManager,
+			poolEventTracker: core.NewPoolEventTracker(ls.LivepeerNode.Database),
 
 			liveParams: liveRequestParams{
 				segmentReader:          ssr,

@@ -932,9 +932,10 @@ func (rt *RemoteTranscoder) Transcode(logCtx context.Context, md *SegTranscoding
 				pixelsEncoded += float64(chanData.TranscodeData.Segments[i].Pixels)
 			}
 			go func() {
-				err := rt.node.Database.CreateEventLog("performance-stats", "ethAddress", rt.ethereumAddr.String(), "jobType", "transcoding", "responseTime", responseTime, "duration", float64(md.Duration.Milliseconds()), "pixelsEncoded", pixelsEncoded, "pixelsDecoded", float64(chanData.TranscodeData.Pixels), "sessionId", clog.GetVal(logCtx, "orchSessionID"), "event_time", time.Now().Unix())
+				err := rt.node.Database.CreateEventLog("performance-stats", "ethAddress", rt.ethereumAddr.String(), "responseTime", responseTime, "duration", float64(md.Duration.Milliseconds()), "pixelsEncoded", pixelsEncoded, "pixelsDecoded", float64(chanData.TranscodeData.Pixels), "sessionId", clog.GetVal(logCtx, "orchSessionID"), "jobType", "transcode", "region", "TODO")
 				if err != nil {
-					glog.Error("Unable to create performance stats event err=", err)
+					glog.Infof("ERROR: Failed to write performance-stat record for ethAddr=%v err=%v", rt.ethereumAddr.String(), err)
+
 				}
 			}()
 		}
@@ -1033,11 +1034,11 @@ func (rtm *RemoteTranscoderManager) Manage(node *LivepeerNode, stream net.Transc
 
 	// Pools
 	thisAddr := ethereumAddr.String()
-	err := node.Database.CreateEventLog("worker-connected", "ethAddress", thisAddr, "connection", from, "nodeType", "transcoding", "event_time", time.Now().Unix())
+	err := node.Database.CreateEventLog("worker-connected", "ethAddress", thisAddr, "connection", from, "jobType", "transcode")
 	if err != nil {
-		glog.Error("Error writing transcoder connection log=", err)
-	}
+		glog.Infof("ERROR: Failed to write connect record for ethAddr=%v err=%v", thisAddr, err)
 
+	}
 	rtm.RTmutex.Lock()
 	rtm.liveTranscoders[transcoder.stream] = transcoder
 	rtm.remoteTranscoders = append(rtm.remoteTranscoders, transcoder)
@@ -1061,9 +1062,10 @@ func (rtm *RemoteTranscoderManager) Manage(node *LivepeerNode, stream net.Transc
 	}
 
 	// Pools
-	err = node.Database.CreateEventLog("worker-disconnected", "ethAddress", thisAddr, "connection", from, "nodeType", "transcoding", "event_time", time.Now().Unix())
-	if err != nil {
-		glog.Error("Error writing transcoder connection log=", err)
+	err2 := node.Database.CreateEventLog("worker-disconnected", "ethAddress", thisAddr, "connection", from, "jobType", "transcode")
+	if err2 != nil {
+		glog.Infof("ERROR: Failed to write disconnect record for ethAddr=%v err=%v", thisAddr, err2)
+
 	}
 	rtm.RTmutex.Unlock()
 	if lpmon.Enabled {
@@ -1234,9 +1236,10 @@ func OnTranscode(ctx context.Context, currentTranscoder *RemoteTranscoder, md *S
 		glog.Errorf("error calculating fees")
 		return
 	}
-	err := currentTranscoder.node.Database.CreateEventLog("transcode", "ethAddress", currentTranscoder.ethereumAddr.String(), "encodedPixels", encodedPixels, "price", price, "fees", feesInt.Int64(), "jobType", "transcoding", "event_time", time.Now().Unix())
+	err := currentTranscoder.node.Database.CreateEventLog("transcode", "ethAddress", currentTranscoder.ethereumAddr.String(), "encodedPixels", encodedPixels, "price", price, "fees", feesInt.Int64(), "jobType", "transcode")
 	if err != nil {
-		glog.Error("Error writing aiworker transcode log=", err)
+		glog.Infof("ERROR: Failed to write transcode record for ethAddr=%v err=%v", currentTranscoder.ethereumAddr.String(), err)
+
 	}
 	glog.Infof("Write transcode record for %v", currentTranscoder.ethereumAddr.String())
 }

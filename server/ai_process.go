@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/golang/glog"
 	"image"
 	"io"
 	"math"
@@ -85,7 +86,8 @@ type aiRequestParams struct {
 	os          drivers.OSSession
 	sessManager *AISessionManager
 
-	liveParams liveRequestParams
+	liveParams       liveRequestParams
+	poolEventTracker core.PoolEventTracker
 }
 
 func (a aiRequestParams) inputStreamExists() bool {
@@ -130,6 +132,8 @@ func CalculateTextToImageLatencyScore(took time.Duration, req worker.GenTextToIm
 }
 
 func processTextToImage(ctx context.Context, params aiRequestParams, req worker.GenTextToImageJSONRequestBody) (*worker.ImageResponse, error) {
+
+	fmt.Errorf("TEXT TO IMAGE REQUEST!!!!!!")
 	resp, err := processAIRequest(ctx, params, req)
 	if err != nil {
 		return nil, err
@@ -245,13 +249,8 @@ func submitTextToImage(ctx context.Context, params aiRequestParams, sess *AISess
 	if monitor.Enabled {
 		monitor.AIRequestFinished(ctx, "text-to-image", *req.ModelId, monitor.AIJobInfo{LatencyScore: sess.LatencyScore, PricePerUnit: pricePerAIUnit}, sess.OrchestratorInfo)
 	}
-	//no db available>>>>
-	//err := CreateEventLog("worker-connected", "ethAddress", ethAddrStr, "connection", from, "nodeType", "ai", "event_time", time.Now().Unix())
-	//if err != nil {
-	//	glog.Error("Error writing aiworker connection log=", err)
-	//}
-
-	clog.Infof(ctx, "Pool Record Work: text-to-image aiComputeUnits %s pricePerAIUnit %d ethAddress %s", outPixels, pricePerAIUnit, ctx.Value("ethAddress"))
+	glog.Info("ai_process creating event log for text to image")
+	params.poolEventTracker.CreateEventLog("text-to-image", "ethAddress", ctx.Value("ethAddress"), "aiComputeUnits", outPixels, "pricePerAIUnit", pricePerAIUnit, "jobType", "ai", "region", "TODO")
 	return resp.JSON200, nil
 }
 
@@ -400,11 +399,10 @@ func submitImageToImage(ctx context.Context, params aiRequestParams, sess *AISes
 	if priceInfo := sess.OrchestratorInfo.GetPriceInfo(); priceInfo != nil && priceInfo.PixelsPerUnit != 0 {
 		pricePerAIUnit = float64(priceInfo.PricePerUnit) / float64(priceInfo.PixelsPerUnit)
 	}
-
 	if monitor.Enabled {
 		monitor.AIRequestFinished(ctx, "image-to-image", *req.ModelId, monitor.AIJobInfo{LatencyScore: sess.LatencyScore, PricePerUnit: pricePerAIUnit}, sess.OrchestratorInfo)
 	}
-	clog.Infof(ctx, "Pool Record Work: image-to-image aiComputeUnits %s pricePerAIUnit %d", outPixels, pricePerAIUnit)
+	params.poolEventTracker.CreateEventLog("image-to-image", "ethAddress", ctx.Value("ethAddress"), "aiComputeUnits", outPixels, "pricePerAIUnit", pricePerAIUnit, "jobType", "ai", "region", "TODO")
 	return resp.JSON200, nil
 }
 
@@ -546,7 +544,7 @@ func submitImageToVideo(ctx context.Context, params aiRequestParams, sess *AISes
 	if monitor.Enabled {
 		monitor.AIRequestFinished(ctx, "image-to-video", *req.ModelId, monitor.AIJobInfo{LatencyScore: sess.LatencyScore, PricePerUnit: pricePerAIUnit}, sess.OrchestratorInfo)
 	}
-	clog.Infof(ctx, "Pool Record Work: image-to-video aiComputeUnits %s pricePerAIUnit %d", outPixels, pricePerAIUnit)
+	params.poolEventTracker.CreateEventLog("image-to-video", "ethAddress", ctx.Value("ethAddress"), "aiComputeUnits", outPixels, "pricePerAIUnit", pricePerAIUnit, "jobType", "ai", "region", "TODO")
 	return &res, nil
 }
 
@@ -685,7 +683,7 @@ func submitUpscale(ctx context.Context, params aiRequestParams, sess *AISession,
 
 		monitor.AIRequestFinished(ctx, "upscale", *req.ModelId, monitor.AIJobInfo{LatencyScore: sess.LatencyScore, PricePerUnit: pricePerAIUnit}, sess.OrchestratorInfo)
 	}
-	clog.Infof(ctx, "Pool Record Work: text-to-speech aiComputeUnits %s pricePerAIUnit %d", outPixels, pricePerAIUnit)
+	params.poolEventTracker.CreateEventLog("text-to-speech", "ethAddress", ctx.Value("ethAddress"), "aiComputeUnits", outPixels, "pricePerAIUnit", pricePerAIUnit, "jobType", "ai", "region", "TODO")
 
 	return resp.JSON200, nil
 }
@@ -782,7 +780,7 @@ func submitSegmentAnything2(ctx context.Context, params aiRequestParams, sess *A
 	if monitor.Enabled {
 		monitor.AIRequestFinished(ctx, "segment-anything-2", *req.ModelId, monitor.AIJobInfo{LatencyScore: sess.LatencyScore, PricePerUnit: pricePerAIUnit}, sess.OrchestratorInfo)
 	}
-	clog.Infof(ctx, "Pool Record Work: segment-anything-2 aiComputeUnits %s pricePerAIUnit %d", outPixels, pricePerAIUnit)
+	params.poolEventTracker.CreateEventLog("segment-anything-2", "ethAddress", ctx.Value("ethAddress"), "aiComputeUnits", outPixels, "pricePerAIUnit", pricePerAIUnit, "jobType", "ai", "region", "TODO")
 	return resp.JSON200, nil
 }
 
@@ -897,8 +895,7 @@ func submitTextToSpeech(ctx context.Context, params aiRequestParams, sess *AISes
 		}
 		return nil, err
 	}
-	clog.Infof(ctx, "Pool Record Work: text-to-speech aiComputeUnits %s pricePerAIUnit %d", inCharacters, pricePerAIUnit)
-
+	params.poolEventTracker.CreateEventLog("text-to-speech", "ethAddress", ctx.Value("ethAddress"), "aiComputeUnits", inCharacters, "pricePerAIUnit", pricePerAIUnit, "jobType", "ai", "region", "TODO")
 	return &res, nil
 }
 
@@ -1011,8 +1008,9 @@ func submitAudioToText(ctx context.Context, params aiRequestParams, sess *AISess
 	if priceInfo := sess.OrchestratorInfo.GetPriceInfo(); priceInfo != nil && priceInfo.PixelsPerUnit != 0 {
 		pricePerAIUnit = float64(priceInfo.PricePerUnit) / float64(priceInfo.PixelsPerUnit)
 	}
-	clog.Infof(ctx, "Pool Record Work: audio-to-text aiComputeUnits %s pricePerAIUnit %d", outPixels, pricePerAIUnit)
+	glog.V(common.DEBUG).Info("ai_process creating event log for audio to text")
 
+	params.poolEventTracker.CreateEventLog("audio-to-text", "ethAddress", ctx.Value("ethAddress"), "aiComputeUnits", outPixels, "pricePerAIUnit", pricePerAIUnit, "jobType", "ai", "region", "TODO")
 	if monitor.Enabled {
 		monitor.AIRequestFinished(ctx, "audio-to-text", *req.ModelId, monitor.AIJobInfo{LatencyScore: sess.LatencyScore, PricePerUnit: pricePerAIUnit}, sess.OrchestratorInfo)
 	}
@@ -1334,8 +1332,7 @@ func submitImageToText(ctx context.Context, params aiRequestParams, sess *AISess
 	if monitor.Enabled {
 		monitor.AIRequestFinished(ctx, "image-to-text", *req.ModelId, monitor.AIJobInfo{LatencyScore: sess.LatencyScore, PricePerUnit: pricePerAIUnit}, sess.OrchestratorInfo)
 	}
-	clog.Infof(ctx, "Pool Record Work: image-to-text aiComputeUnits %s pricePerAIUnit %d ethAddress %s", inPixels, pricePerAIUnit, ctx.Value("ethAddress"))
-
+	params.poolEventTracker.CreateEventLog("image-to-text", "ethAddress", ctx.Value("ethAddress"), "aiComputeUnits", inPixels, "pricePerAIUnit", pricePerAIUnit, "jobType", "ai", "region", "TODO")
 	return resp.JSON200, nil
 }
 
@@ -1351,6 +1348,7 @@ func processImageToText(ctx context.Context, params aiRequestParams, req worker.
 }
 
 func processAIRequest(ctx context.Context, params aiRequestParams, req interface{}) (interface{}, error) {
+	fmt.Errorf("processAIRequest!!!!!! PARAMS EVENT TRACKER??????? ", params.poolEventTracker)
 	var cap core.Capability
 	var modelID string
 	var submitFn func(context.Context, aiRequestParams, *AISession) (interface{}, error)
@@ -1363,6 +1361,8 @@ func processAIRequest(ctx context.Context, params aiRequestParams, req interface
 			modelID = *v.ModelId
 		}
 		submitFn = func(ctx context.Context, params aiRequestParams, sess *AISession) (interface{}, error) {
+			clog.Infof(ctx, "submitFn is poolEventTracker here??? ", params.poolEventTracker)
+
 			return submitTextToImage(ctx, params, sess, v)
 		}
 		ctx = clog.AddVal(ctx, "prompt", v.Prompt)
@@ -1462,7 +1462,7 @@ func processAIRequest(ctx context.Context, params aiRequestParams, req interface
 	clog.V(common.VERBOSE).Infof(ctx, "Received AI request model_id=%s", modelID)
 	start := time.Now()
 	defer clog.Infof(ctx, "Processed AI request model_id=%v took=%v", modelID, time.Since(start))
-
+	clog.Infof(ctx, " ...... is poolEventTracker here??? ", params.poolEventTracker)
 	var resp interface{}
 
 	cctx, cancel := context.WithTimeout(ctx, processingRetryTimeout)
