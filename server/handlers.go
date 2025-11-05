@@ -1788,3 +1788,40 @@ func mustHaveDb(db interface{}, h http.Handler) http.Handler {
 		h.ServeHTTP(w, r)
 	})
 }
+
+// ** Pool Customization **
+// Pool: HTTP Handlers for pool related tasks
+// TODO: need to support pagination by default...
+// TODO: is a purge process needed for too many events?
+func poolEventsHandler(db *common.DB) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lastCheckTime, err := parseLastCheckTime(r)
+		if err != nil {
+			http.Error(w, "Invalid lastCheckTime format. Use RFC3339 format.", http.StatusBadRequest)
+			return
+		}
+		glog.Infof("[poolEventsHandler] lastCheckTime=%v", lastCheckTime)
+
+		events, err := db.FindPoolEvents(lastCheckTime)
+		if err != nil {
+			respond500(w, "could not get pool events. err: "+err.Error())
+			return
+		}
+		glog.Infof("[poolEventsHandler] found %v events since last check", len(events))
+
+		respondJson(w, events)
+	})
+}
+
+// parseLastCheckTime extracts the 'lastCheckTime' query parameter from the request
+// and parses it as an RFC3339 time. Returns the parsed time or an error.
+func parseLastCheckTime(r *http.Request) (time.Time, error) {
+	lastCheckTimeStr := r.URL.Query().Get("lastCheckTime")
+	//glog.Errorf("parseLastCheckTime lastCheckTime=%v", lastCheckTimeStr)
+
+	if lastCheckTimeStr == "" {
+		// Return zero value if the parameter is not provided
+		return time.Date(1, time.January, 1, 0, 0, 0, 0, time.UTC), nil
+	}
+	return time.Parse(time.RFC3339, lastCheckTimeStr)
+}
