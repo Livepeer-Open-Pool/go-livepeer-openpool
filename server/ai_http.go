@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/livepeer/go-livepeer/events"
 	"image"
 	"io"
 	"log/slog"
@@ -576,6 +577,14 @@ func handleAIRequest(ctx context.Context, w http.ResponseWriter, r *http.Request
 	// If the # of inference/denoising steps becomes configurable, a possible updated formula could be height * width * frames * steps
 	// If additional parameters that influence compute cost become configurable, then the formula should be reconsidered
 	orch.DebitFees(sender, manifestID, payment.GetExpectedPrice(), outPixels)
+	// ** Pool Customization **
+	// Pool: create pool event for AI Job payment.
+	// Pool: requestID correlation is critical for this process to reconcile for the pool manager
+	pricePerComputeUnit := payment.GetExpectedPrice().GetPricePerUnit() / payment.GetExpectedPrice().GetPixelsPerUnit()
+	fees := pricePerComputeUnit * outPixels
+
+	// Log event with calculated price and fees
+	events.GlobalEventTracker.CreateEventLog("job-processed", "requestID", requestID, "pipeline", pipeline, "modelID", modelID, "responseTime", took, "computeUnits", outPixels, "pricePerComputeUnit", pricePerComputeUnit, "fees", fees)
 
 	if monitor.Enabled {
 		var latencyScore float64
@@ -689,6 +698,10 @@ func (h *lphttp) AIResults() http.Handler {
 		}
 
 		pipeline := r.Header.Get("Pipeline")
+		// ** Pool Customization **
+		// Pool: eth address used for correlation of requestID for Remote AI Worker payment
+		ethAddress := r.Header.Get("PoolEthereumAddress")
+		glog.Infof("AIResults received for remote worker ethAddress=%s ", ethAddress)
 
 		var workerResult core.RemoteAIWorkerResult
 		workerResult.Files = make(map[string][]byte)

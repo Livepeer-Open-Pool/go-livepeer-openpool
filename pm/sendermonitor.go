@@ -3,6 +3,7 @@ package pm
 import (
 	"context"
 	"fmt"
+	"github.com/livepeer/go-livepeer/events"
 	"math/big"
 	"sync"
 	"time"
@@ -301,6 +302,15 @@ func (sm *LocalSenderMonitor) startTicketQueueConsumerLoop(queue *ticketQueue, d
 			if tx != nil {
 				res.txHash = tx.Hash()
 			}
+			recipient := red.SignedTicket.Ticket.Recipient
+			faceValue := red.SignedTicket.Ticket.FaceValue
+			sender := red.SignedTicket.Ticket.Sender
+			winProb := red.SignedTicket.Ticket.WinProb
+			pricePerPixel := red.SignedTicket.Ticket.PricePerPixel
+			creationRound := red.SignedTicket.Ticket.CreationRound
+			txHash := res.txHash.String()
+			events.GlobalEventTracker.CreateEventLog("ticket-redeemed", "recipient", recipient, "faceValue", faceValue, "sender", sender, "winProb", winProb, "pricePerPixel", pricePerPixel, "creationRound", creationRound, "txHash", txHash)
+			glog.Infof("Write ticketed redeemed record ")
 
 			red.resCh <- res
 		case <-done:

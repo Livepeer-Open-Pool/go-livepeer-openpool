@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"text/template"
+	"time"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -41,6 +42,10 @@ type DB struct {
 	findLatestMiniHeader             *sql.Stmt
 	findAllMiniHeadersSortedByNumber *sql.Stmt
 	deleteMiniHeader                 *sql.Stmt
+	// ** Pool Customization **
+	// Pool: Add/Find Events
+	createPoolEvent *sql.Stmt
+	findPoolEvents  *sql.Stmt
 }
 
 // DBOrch is the type binding for a row result from the orchestrators table
@@ -131,6 +136,15 @@ var schema = `
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_blockheaders_number ON blockheaders(number);
+
+	-- ** Pool Customization **
+	-- Pool: create pool_events
+	CREATE TABLE IF NOT EXISTS pool_events (
+		id 		INTEGER PRIMARY KEY AUTOINCREMENT,
+		payload 	STRING,
+		version 	INTEGER,
+		dt		TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
 `
 
 func NewDBOrch(ethereumAddr string, serviceURI string, pricePerPixel int64, activationRound int64, deactivationRound int64, stake int64) *DBOrch {
@@ -360,6 +374,28 @@ func InitDB(dbPath string) (*DB, error) {
 	}
 	d.deleteMiniHeader = stmt
 
+	// ** Pool Customization **
+	// Pool: create stmt instances for finding/creating pool_events
+	stmt, err = db.Prepare(`
+	INSERT INTO pool_events(payload,version)
+	VALUES(:payload, :version)
+	`)
+	if err != nil {
+		glog.Error("Unable to prepare pool_events err=", err)
+		d.Close()
+		return nil, err
+	}
+	d.createPoolEvent = stmt
+
+	// Find the pool events
+	stmt, err = db.Prepare("select id,payload,version,dt from pool_events where dt > ?")
+	if err != nil {
+		glog.Error("Unable to prepare findPoolEvents ", err)
+		d.Close()
+		return nil, err
+	}
+	d.findPoolEvents = stmt
+
 	glog.V(DEBUG).Info("Initialized DB node")
 	return &d, nil
 }
@@ -416,6 +452,15 @@ func (db *DB) Close() {
 	}
 	if db.deleteMiniHeader != nil {
 		db.deleteMiniHeader.Close()
+	}
+
+	// ** Pool Customization **
+	// Pool: add proper close handlers
+	if db.createPoolEvent != nil {
+		db.createPoolEvent.Close()
+	}
+	if db.findPoolEvents != nil {
+		db.findPoolEvents.Close()
 	}
 	if db.dbh != nil {
 		db.dbh.Close()
@@ -966,4 +1011,88 @@ func decodeLogsJSON(logsEnc []byte) ([]types.Log, error) {
 		return []types.Log{}, err
 	}
 	return logs, nil
+}
+
+// ** Pool Customization **
+// createEventLog generates an event log with a dynamic set of arguments as the payload.
+// The arguments are provided as key-value pairs.
+func (db *DB) CreateEventLog(eventType string, pairs ...interface{}) error {
+	if len(pairs)%2 != 0 {
+		return fmt.Errorf("uneven number of arguments; expected key-value pairs")
+	}
+
+	// Construct the payload dynamically
+	payload := make(map[string]interface{})
+	for i := 0; i < len(pairs); i += 2 {
+		key, ok := pairs[i].(string)
+		if !ok {
+			return fmt.Errorf("key must be a string, got %T", pairs[i])
+		}
+		payload[key] = pairs[i+1]
+	}
+
+	// Create the event log
+	eventLog := map[string]interface{}{
+		"event_type": eventType,
+		"payload":    payload,
+	}
+
+	// Marshal the event log to JSON
+	jsonData, err := json.MarshalIndent(eventLog, "", "  ")
+	if err != nil {
+		return err
+	}
+	jsonStr := string(jsonData)
+	return db.CreatePoolEvent(jsonStr)
+}
+
+func (db *DB) CreatePoolEvent(payload string) error {
+	if db == nil {
+		return nil
+	}
+	_, err := db.createPoolEvent.Exec(
+		sql.Named("payload", payload),
+		sql.Named("version", 1),
+	)
+
+	if err != nil {
+		glog.Error("Unable to create performance stats record err=", err)
+	}
+	return err
+}
+
+type PoolEvent struct {
+	ID      int       `db:"id"`
+	Payload string    `db:"payload"`
+	Version int       `db:"version"`
+	DT      time.Time `db:"dt"`
+}
+
+func (a *PoolEvent) ScanRow(rows *sql.Rows) error {
+	return rows.Scan(&a.ID, &a.Payload, &a.Version, &a.DT)
+}
+
+// FindPoolEvents queries the pool events and returns all rows after lastCheckTime
+func (db *DB) FindPoolEvents(lastCheckTime time.Time) ([]PoolEvent, error) {
+	rows, err := db.findPoolEvents.Query(lastCheckTime)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []PoolEvent
+
+	for rows.Next() {
+		var event PoolEvent
+		if err := event.ScanRow(rows); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return events, nil
 }
