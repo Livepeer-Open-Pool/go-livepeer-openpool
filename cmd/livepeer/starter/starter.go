@@ -192,6 +192,8 @@ type LivepeerConfig struct {
 	KafkaUsername              *string
 	KafkaPassword              *string
 	KafkaGatewayTopic          *string
+	KafkaRequireDelivery       *bool
+	KafkaEnqueueTimeout        *time.Duration
 	MediaMTXApiPassword        *string
 	LiveAIAuthApiKey           *string
 	LiveAIHeartbeatURL         *string
@@ -336,6 +338,8 @@ func DefaultLivepeerConfig() LivepeerConfig {
 	defaultKafkaUsername := ""
 	defaultKafkaPassword := ""
 	defaultKafkaGatewayTopic := ""
+	defaultKafkaRequireDelivery := false
+	defaultKafkaEnqueueTimeout := 2 * time.Second
 
 	return LivepeerConfig{
 		// Network & Addresses:
@@ -470,6 +474,8 @@ func DefaultLivepeerConfig() LivepeerConfig {
 		KafkaUsername:         &defaultKafkaUsername,
 		KafkaPassword:         &defaultKafkaPassword,
 		KafkaGatewayTopic:     &defaultKafkaGatewayTopic,
+		KafkaRequireDelivery:  &defaultKafkaRequireDelivery,
+		KafkaEnqueueTimeout:   &defaultKafkaEnqueueTimeout,
 	}
 }
 
@@ -792,6 +798,16 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 		if err := startKafkaProducer(cfg); err != nil {
 			exit("Error while starting Kafka producer", err)
 		}
+	}
+	if *cfg.KafkaRequireDelivery {
+		if !*cfg.Monitor || *cfg.KafkaBootstrapServers == "" || *cfg.KafkaGatewayTopic == "" {
+			exit("-kafkaRequireDelivery requires -monitor, -kafkaBootstrapServers and -kafkaGatewayTopic")
+		}
+		if *cfg.KafkaEnqueueTimeout <= 0 {
+			exit("-kafkaEnqueueTimeout must be positive, got %v", *cfg.KafkaEnqueueTimeout)
+		}
+		n.KafkaRequireDelivery = true
+		n.KafkaEnqueueTimeout = *cfg.KafkaEnqueueTimeout
 	}
 
 	watcherErr := make(chan error)

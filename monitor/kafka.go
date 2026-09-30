@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 	"uuid"
@@ -20,10 +21,24 @@ const (
 	KafkaChannelSize    = 100
 )
 
+var (
+	// ErrKafkaProducerNotConfigured is returned when no Kafka producer has been started.
+	ErrKafkaProducerNotConfigured = errors.New("kafka producer not configured")
+	// ErrEventQueueFull is returned when an event cannot be enqueued because the queue is full.
+	ErrEventQueueFull = errors.New("kafka event queue full")
+)
+
+// KafkaWriter is the subset of kafka.Writer used by the producer.
+type KafkaWriter interface {
+	WriteMessages(ctx context.Context, msgs ...kafka.Message) error
+}
+
 type KafkaProducer struct {
-	writer         *kafka.Writer
+	writer         KafkaWriter
 	topic          string
 	events         chan GatewayEvent
+	reserved       chan GatewayEvent // events sent through an EventReservation
+	slots          chan struct{}     // one token per reservation held or waiting in reserved
 	gatewayAddress string
 }
 
@@ -55,16 +70,36 @@ type PipelineStatus struct {
 var kafkaProducer *KafkaProducer
 
 func InitKafkaProducer(bootstrapServers, user, password, topic, gatewayAddress string) error {
-	producer, err := newKafkaProducer(bootstrapServers, user, password, topic, gatewayAddress)
+	writer, err := newKafkaWriter(bootstrapServers, user, password, topic)
 	if err != nil {
 		return err
 	}
-	kafkaProducer = producer
-	go producer.processEvents()
+	producer := NewKafkaProducer(writer, topic, gatewayAddress)
+	SetKafkaProducer(producer)
+	go producer.Run(context.Background())
 	return nil
 }
 
-func newKafkaProducer(bootstrapServers, user, password, topic, gatewayAddress string) (*KafkaProducer, error) {
+// NewKafkaProducer creates a producer that publishes events through writer.
+// The producer does not consume its queue until Run is called.
+func NewKafkaProducer(writer KafkaWriter, topic, gatewayAddress string) *KafkaProducer {
+	return &KafkaProducer{
+		writer:         writer,
+		topic:          topic,
+		events:         make(chan GatewayEvent, KafkaChannelSize),
+		reserved:       make(chan GatewayEvent, KafkaChannelSize),
+		slots:          make(chan struct{}, KafkaChannelSize),
+		gatewayAddress: gatewayAddress,
+	}
+}
+
+// SetKafkaProducer installs producer as the process-wide event producer.
+// A nil producer disables event publishing.
+func SetKafkaProducer(producer *KafkaProducer) {
+	kafkaProducer = producer
+}
+
+func newKafkaWriter(bootstrapServers, user, password, topic string) (KafkaWriter, error) {
 	dialer := &kafka.Dialer{
 		Timeout:   KafkaRequestTimeout,
 		DualStack: true,
@@ -89,15 +124,20 @@ func newKafkaProducer(bootstrapServers, user, password, topic, gatewayAddress st
 		Dialer:   dialer,
 	})
 
-	return &KafkaProducer{
-		writer:         writer,
-		topic:          topic,
-		events:         make(chan GatewayEvent, KafkaChannelSize),
-		gatewayAddress: gatewayAddress,
-	}, nil
+	return writer, nil
 }
 
-func (p *KafkaProducer) processEvents() {
+// QueueLength returns the number of events waiting to be batched.
+func (p *KafkaProducer) QueueLength() int {
+	return len(p.events) + len(p.reserved)
+}
+
+func (p *KafkaProducer) reportQueueLength() {
+	KafkaEventQueueLength(p.QueueLength())
+}
+
+// Run consumes the event queue and publishes batches until ctx is done.
+func (p *KafkaProducer) Run(ctx context.Context) {
 	ticker := time.NewTicker(KafkaBatchInterval)
 	defer ticker.Stop()
 
@@ -106,31 +146,45 @@ func (p *KafkaProducer) processEvents() {
 	for {
 		select {
 		case event := <-p.events:
-			value, err := json.Marshal(event)
-			if err != nil {
-				glog.Errorf("error while marshalling gateway log to Kafka, err=%v", err)
-				continue
-			}
+			p.reportQueueLength()
+			eventsBatch = p.appendEvent(eventsBatch, event)
 
-			msg := kafka.Message{
-				Key:   []byte(*event.ID),
-				Value: value,
-			}
-			eventsBatch = append(eventsBatch, msg)
-
-			// Send batch if it reaches the defined size
-			if len(eventsBatch) >= KafkaBatchSize {
-				p.sendBatch(eventsBatch)
-				eventsBatch = nil
-			}
+		case event := <-p.reserved:
+			<-p.slots
+			p.reportQueueLength()
+			eventsBatch = p.appendEvent(eventsBatch, event)
 
 		case <-ticker.C:
 			if len(eventsBatch) > 0 {
 				p.sendBatch(eventsBatch)
 				eventsBatch = nil
 			}
+
+		case <-ctx.Done():
+			return
 		}
 	}
+}
+
+func (p *KafkaProducer) appendEvent(eventsBatch []kafka.Message, event GatewayEvent) []kafka.Message {
+	value, err := json.Marshal(event)
+	if err != nil {
+		glog.Errorf("error while marshalling gateway log to Kafka, err=%v", err)
+		return eventsBatch
+	}
+
+	msg := kafka.Message{
+		Key:   []byte(*event.ID),
+		Value: value,
+	}
+	eventsBatch = append(eventsBatch, msg)
+
+	// Send batch if it reaches the defined size
+	if len(eventsBatch) >= KafkaBatchSize {
+		p.sendBatch(eventsBatch)
+		eventsBatch = nil
+	}
+	return eventsBatch
 }
 
 func (p *KafkaProducer) sendBatch(eventsBatch []kafka.Message) {
@@ -149,28 +203,90 @@ func (p *KafkaProducer) sendBatch(eventsBatch []kafka.Message) {
 	}
 }
 
-func SendQueueEventAsync(eventType string, data interface{}) {
-	if kafkaProducer == nil {
-		return
-	}
-
+func (p *KafkaProducer) newEvent(eventType string, data interface{}) GatewayEvent {
 	randomID := uuid.New().String()
 	timestampMs := time.Now().UnixMilli()
 
-	event := GatewayEvent{
+	return GatewayEvent{
 		ID:        stringPtr(randomID),
-		Gateway:   stringPtr(kafkaProducer.gatewayAddress),
+		Gateway:   stringPtr(p.gatewayAddress),
 		Type:      &eventType,
 		Timestamp: stringPtr(fmt.Sprint(timestampMs)),
 		Data:      data,
 	}
+}
+
+// SendQueueEventAsync enqueues an event without blocking. It returns
+// ErrKafkaProducerNotConfigured when no producer is running and
+// ErrEventQueueFull when the event was dropped because the queue is full.
+func SendQueueEventAsync(eventType string, data interface{}) error {
+	p := kafkaProducer
+	if p == nil {
+		return ErrKafkaProducerNotConfigured
+	}
 
 	select {
-	case kafkaProducer.events <- event:
+	case p.events <- p.newEvent(eventType, data):
+		p.reportQueueLength()
+		return nil
 	default:
 		glog.Warningf("kafka producer event queue is full, dropping event %q", eventType)
 		KafkaEventSendError(eventType)
+		return ErrEventQueueFull
 	}
+}
+
+// EventReservation is a held slot in the event queue. Sending through it
+// never blocks and never drops the event.
+type EventReservation struct {
+	producer *KafkaProducer
+	done     bool
+}
+
+// ReserveQueueEvent waits up to timeout for a free slot in the event queue.
+// The caller must either Send or Release the reservation. It returns
+// ErrKafkaProducerNotConfigured when no producer is running, ErrEventQueueFull
+// when no slot frees up within timeout, and the context error when ctx ends.
+func ReserveQueueEvent(ctx context.Context, timeout time.Duration) (*EventReservation, error) {
+	p := kafkaProducer
+	if p == nil {
+		return nil, ErrKafkaProducerNotConfigured
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case p.slots <- struct{}{}:
+		return &EventReservation{producer: p}, nil
+	case <-timer.C:
+		return nil, ErrEventQueueFull
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// Send enqueues the event in the reserved slot. It is a no-op once the
+// reservation has been used or released.
+func (r *EventReservation) Send(eventType string, data interface{}) {
+	if r == nil || r.done {
+		return
+	}
+	r.done = true
+	// Never blocks: the number of events in reserved cannot exceed the
+	// number of held slots, and this reservation holds one of them.
+	r.producer.reserved <- r.producer.newEvent(eventType, data)
+	r.producer.reportQueueLength()
+}
+
+// Release frees the reserved slot without sending an event. It is a no-op
+// once the reservation has been used or released.
+func (r *EventReservation) Release() {
+	if r == nil || r.done {
+		return
+	}
+	r.done = true
+	<-r.producer.slots
 }
 
 func stringPtr(s string) *string {

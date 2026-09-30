@@ -161,6 +161,8 @@ type (
 		mHTTPClientTimeout1           *stats.Int64Measure
 		mHTTPClientTimeout2           *stats.Int64Measure
 		mKafkaEventSendError          *stats.Int64Measure
+		mRemoteSignerEventDropped     *stats.Int64Measure
+		mRemoteSignerEventQueueLength *stats.Int64Measure
 		mLiveRunnerTunnels            *stats.Int64Measure
 		mLiveRunnerTunnelStreams      *stats.Int64Measure
 		mLiveRunnerTunnelEvents       *stats.Int64Measure
@@ -317,6 +319,8 @@ func InitCensus(nodeType NodeType, version string) {
 	census.mHTTPClientTimeout1 = stats.Int64("http_client_timeout_1", "Number of times HTTP connection was dropped before transcoding complete", "tot")
 	census.mHTTPClientTimeout2 = stats.Int64("http_client_timeout_2", "Number of times HTTP connection was dropped before transcoded segments was sent back to client", "tot")
 	census.mKafkaEventSendError = stats.Int64("kafka_event_send_errors", "Dropped Kafka events due to a full queue", "tot")
+	census.mRemoteSignerEventDropped = stats.Int64("remote_signer_events_dropped_total", "Remote signer events dropped because the Kafka event queue was full", "tot")
+	census.mRemoteSignerEventQueueLength = stats.Int64("remote_signer_event_queue_length", "Number of events waiting in the Kafka event queue", "tot")
 	census.mLiveRunnerTunnels = stats.Int64("live_runner_tunnels", "Number of connected live runner tunnels", "tot")
 	census.mLiveRunnerTunnelStreams = stats.Int64("live_runner_tunnel_streams", "Number of open live runner tunnel streams", "tot")
 	census.mLiveRunnerTunnelEvents = stats.Int64("live_runner_tunnel_events_total", "Live runner tunnel events by type", "tot")
@@ -519,6 +523,20 @@ func InitCensus(nodeType NodeType, version string) {
 			Description: "Dropped Kafka events due to a full queue",
 			TagKeys:     append([]tag.Key{census.kEventType}, baseTags...),
 			Aggregation: view.Count(),
+		},
+		{
+			Name:        "remote_signer_events_dropped_total",
+			Measure:     census.mRemoteSignerEventDropped,
+			Description: "Remote signer events dropped because the Kafka event queue was full",
+			TagKeys:     append([]tag.Key{census.kEventType}, baseTags...),
+			Aggregation: view.Count(),
+		},
+		{
+			Name:        "remote_signer_event_queue_length",
+			Measure:     census.mRemoteSignerEventQueueLength,
+			Description: "Number of events waiting in the Kafka event queue",
+			TagKeys:     baseTags,
+			Aggregation: view.LastValue(),
 		},
 		{
 			Name:        "live_runner_tunnels",
@@ -1845,6 +1863,28 @@ func KafkaEventSendError(eventType string) {
 		census.mKafkaEventSendError.M(1)); err != nil {
 		glog.Errorf("Error recording metrics err=%q", err)
 	}
+}
+
+// RemoteSignerEventDropped records a remote signer event that was dropped
+// because the Kafka event queue was full.
+func RemoteSignerEventDropped(eventType string) {
+	if !Enabled || census.mRemoteSignerEventDropped == nil {
+		return
+	}
+	if err := stats.RecordWithTags(census.ctx,
+		[]tag.Mutator{tag.Insert(census.kEventType, eventType)},
+		census.mRemoteSignerEventDropped.M(1)); err != nil {
+		glog.Errorf("Error recording metrics err=%q", err)
+	}
+}
+
+// KafkaEventQueueLength records the number of events waiting in the Kafka
+// event queue.
+func KafkaEventQueueLength(length int) {
+	if !Enabled || census.mRemoteSignerEventQueueLength == nil {
+		return
+	}
+	stats.Record(census.ctx, census.mRemoteSignerEventQueueLength.M(int64(length)))
 }
 
 // Deposit records the current deposit for the gateway

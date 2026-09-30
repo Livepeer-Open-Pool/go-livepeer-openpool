@@ -37,6 +37,7 @@ const RemoteType_LiveVideoToVideo = "lv2v"
 const RemoteType_Fixed = "fixed"
 const PipelineLiveVideoToVideo = "live-video-to-video"
 const remoteSignerAuthIDHeader = "Signer-Auth-Id"
+const createSignedTicketEvent = "create_signed_ticket"
 
 // SignOrchestratorInfo handles signing GetOrchestratorInfo requests for multiple orchestrators
 func (ls *LivepeerServer) SignOrchestratorInfo(w http.ResponseWriter, r *http.Request) {
@@ -641,6 +642,20 @@ func (ls *LivepeerServer) GenerateLivePayment(w http.ResponseWriter, r *http.Req
 	balUpdate.Debit = fee
 	balUpdate.Status = ReceivedChange
 
+	// Reserve a slot in the event queue before signing so that a signed
+	// ticket batch is never left without an accounting record.
+	var eventReservation *monitor.EventReservation
+	if ls.LivepeerNode.KafkaRequireDelivery {
+		eventReservation, err = monitor.ReserveQueueEvent(ctx, ls.LivepeerNode.KafkaEnqueueTimeout)
+		if err != nil {
+			clog.Errorf(ctx, "Refusing to sign: event log unavailable err=%q", err)
+			respondEventLogUnavailable(w)
+			return
+		}
+		// No-op once the event has been sent; frees the slot on every other exit.
+		defer eventReservation.Release()
+	}
+
 	// Generate payment tickets
 	payment, err := genPayment(ctx, sess, balUpdate.NumTickets)
 	if err != nil {
@@ -756,8 +771,7 @@ func (ls *LivepeerServer) GenerateLivePayment(w http.ResponseWriter, r *http.Req
 				feeUSD = &usd
 			}
 		}
-		// NB: This could could drop events if tha Kafka queue is full!
-		monitor.SendQueueEventAsync("create_signed_ticket", map[string]interface{}{
+		eventData := map[string]interface{}{
 			"session_id":         state.StateID,
 			"session_status":     sessionStatus,
 			"app":                state.App,
@@ -781,7 +795,17 @@ func (ls *LivepeerServer) GenerateLivePayment(w http.ResponseWriter, r *http.Req
 			"sequence_number":    state.SequenceNumber,
 			"num_tickets":        balUpdate.NumTickets,
 			"auth_id":            state.AuthID,
-		})
+		}
+		if eventReservation != nil {
+			eventReservation.Send(createSignedTicketEvent, eventData)
+		} else if err := monitor.SendQueueEventAsync(createSignedTicketEvent, eventData); errors.Is(err, monitor.ErrEventQueueFull) {
+			// The payment is signed and the balance updated, but the event
+			// carrying the accounting record was dropped. Leave enough in the
+			// log to reconstruct the record.
+			monitor.RemoteSignerEventDropped(createSignedTicketEvent)
+			clog.Error(ctx, "Dropped "+createSignedTicketEvent+" event: Kafka event queue full",
+				signedTicketDropLogFields(requestID, manifestID, sess.PMSessionID, orchAddr.Hex(), fee.FloatString(0), balUpdate.NumTickets, state.SequenceNumber)...)
+		}
 	}
 
 	// Return payment (tickets), creds and signed state
@@ -793,6 +817,29 @@ func (ls *LivepeerServer) GenerateLivePayment(w http.ResponseWriter, r *http.Req
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// signedTicketDropLogFields returns the key-value pairs logged when a
+// create_signed_ticket event is dropped, so the record can be reconstructed
+// from the log.
+func signedTicketDropLogFields(requestID, manifestID, pmSessionID, orchAddr, computedFee string, numTickets int, sequenceNumber uint64) []interface{} {
+	return []interface{}{
+		"request_id", requestID,
+		"manifest_id", manifestID,
+		"pm_session_id", pmSessionID,
+		"orch_address", orchAddr,
+		"computed_fee", computedFee,
+		"num_tickets", numTickets,
+		"sequence_number", sequenceNumber,
+	}
+}
+
+// respondEventLogUnavailable rejects a signing request because the event
+// carrying its accounting record could not be enqueued in time.
+func respondEventLogUnavailable(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": "event log unavailable"})
 }
 
 // Gateway helper that calls the remote signer service for the GetOrchestratorInfo signature
