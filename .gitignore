@@ -29,6 +29,7 @@ eth/protocol
 /livepeer_cli
 /livepeer_router
 /livepeer_bench
+/livepeer_runner_tunnel
 
 # Generated run scripts
 run_*.sh

@@ -161,6 +161,9 @@ type (
 		mHTTPClientTimeout1           *stats.Int64Measure
 		mHTTPClientTimeout2           *stats.Int64Measure
 		mKafkaEventSendError          *stats.Int64Measure
+		mLiveRunnerTunnels            *stats.Int64Measure
+		mLiveRunnerTunnelStreams      *stats.Int64Measure
+		mLiveRunnerTunnelEvents       *stats.Int64Measure
 		mRealtimeRatio                *stats.Float64Measure
 		mRealtime3x                   *stats.Int64Measure
 		mRealtime2x                   *stats.Int64Measure
@@ -314,6 +317,9 @@ func InitCensus(nodeType NodeType, version string) {
 	census.mHTTPClientTimeout1 = stats.Int64("http_client_timeout_1", "Number of times HTTP connection was dropped before transcoding complete", "tot")
 	census.mHTTPClientTimeout2 = stats.Int64("http_client_timeout_2", "Number of times HTTP connection was dropped before transcoded segments was sent back to client", "tot")
 	census.mKafkaEventSendError = stats.Int64("kafka_event_send_errors", "Dropped Kafka events due to a full queue", "tot")
+	census.mLiveRunnerTunnels = stats.Int64("live_runner_tunnels", "Number of connected live runner tunnels", "tot")
+	census.mLiveRunnerTunnelStreams = stats.Int64("live_runner_tunnel_streams", "Number of open live runner tunnel streams", "tot")
+	census.mLiveRunnerTunnelEvents = stats.Int64("live_runner_tunnel_events_total", "Live runner tunnel events by type", "tot")
 	census.mRealtimeRatio = stats.Float64("http_client_segment_transcoded_realtime_ratio", "Ratio of source segment duration / transcode time as measured on HTTP client", "rat")
 	census.mRealtime3x = stats.Int64("http_client_segment_transcoded_realtime_3x", "Number of segment transcoded 3x faster than realtime", "tot")
 	census.mRealtime2x = stats.Int64("http_client_segment_transcoded_realtime_2x", "Number of segment transcoded 2x faster than realtime", "tot")
@@ -511,6 +517,27 @@ func InitCensus(nodeType NodeType, version string) {
 			Name:        "kafka_event_send_errors",
 			Measure:     census.mKafkaEventSendError,
 			Description: "Dropped Kafka events due to a full queue",
+			TagKeys:     append([]tag.Key{census.kEventType}, baseTags...),
+			Aggregation: view.Count(),
+		},
+		{
+			Name:        "live_runner_tunnels",
+			Measure:     census.mLiveRunnerTunnels,
+			Description: "Number of connected live runner tunnels",
+			TagKeys:     baseTags,
+			Aggregation: view.LastValue(),
+		},
+		{
+			Name:        "live_runner_tunnel_streams",
+			Measure:     census.mLiveRunnerTunnelStreams,
+			Description: "Number of open live runner tunnel streams",
+			TagKeys:     baseTags,
+			Aggregation: view.LastValue(),
+		},
+		{
+			Name:        "live_runner_tunnel_events_total",
+			Measure:     census.mLiveRunnerTunnelEvents,
+			Description: "Live runner tunnel events by type: connect, closed, replaced, removed",
 			TagKeys:     append([]tag.Key{census.kEventType}, baseTags...),
 			Aggregation: view.Count(),
 		},
@@ -2309,4 +2336,32 @@ func FastVerificationFailed(ctx context.Context, uri string, errtype int) {
 // ToPipeline converts capability name into pipeline name
 func ToPipeline(cap string) string {
 	return strings.Replace(strings.ToLower(cap), " ", "-", -1)
+}
+
+// LiveRunnerTunnels records the number of connected live runner tunnels.
+func LiveRunnerTunnels(count int) {
+	if !Enabled || census.mLiveRunnerTunnels == nil {
+		return
+	}
+	stats.Record(census.ctx, census.mLiveRunnerTunnels.M(int64(count)))
+}
+
+// LiveRunnerTunnelStreams records the number of open tunnel streams.
+func LiveRunnerTunnelStreams(count int) {
+	if !Enabled || census.mLiveRunnerTunnelStreams == nil {
+		return
+	}
+	stats.Record(census.ctx, census.mLiveRunnerTunnelStreams.M(int64(count)))
+}
+
+// LiveRunnerTunnelEvent counts a tunnel lifecycle event by type.
+func LiveRunnerTunnelEvent(event string) {
+	if !Enabled || census.mLiveRunnerTunnelEvents == nil {
+		return
+	}
+	if err := stats.RecordWithTags(census.ctx,
+		[]tag.Mutator{tag.Insert(census.kEventType, event)},
+		census.mLiveRunnerTunnelEvents.M(1)); err != nil {
+		glog.Errorf("Error recording live runner tunnel event err=%q", err)
+	}
 }

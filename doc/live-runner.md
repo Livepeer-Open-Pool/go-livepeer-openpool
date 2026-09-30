@@ -239,6 +239,68 @@ discovery and the orchestrator releases its sessions. See
 [Dynamic runner protocol](#dynamic-runner-protocol) for the wire-level
 heartbeat and unregister behavior.
 
+### Tunneled runners
+
+A dynamic runner normally needs an address the orchestrator can dial: the
+`runner_url` it registers is where health checks and every proxied request
+go. A runner behind NAT, or on a box with no public name, can instead own
+the connection. It registers with `"tunnel": true` and no `runner_url`,
+receives its `runner_id` and `heartbeat_secret` as usual, and then opens
+
+```
+GET /runners/{runner_id}/tunnel
+Authorization: <heartbeat_secret>
+```
+
+as a WebSocket (subprotocol `livepeer-runner-tunnel/1`). Over its binary
+frames both sides run a [yamux](https://github.com/hashicorp/yamux) session:
+the orchestrator opens one stream per proxied request and the runner serves
+plain HTTP/1.1 on each stream. Streamed responses, multipart uploads, and
+WebSocket upgrades pass exactly as they do through the ordinary proxy.
+Discovery is unchanged and lists the runner under the orchestrator's proxy
+URL; the registry records the runner's URL as `tunnel://<runner_id>`.
+
+Rules:
+
+- `tunnel` and `runner_url` are exclusive (`400`); a static configuration
+  entry cannot be tunneled; the flag cannot change after registration.
+- A tunneled runner is unavailable, and absent from discovery, until its
+  tunnel is connected and whenever it is not. Heartbeats keep the
+  registration alive on their own schedule, so a dropped tunnel costs only
+  the requests in flight on it: they fail, the runner reconnects with the
+  same `runner_id`, and it is ready again on its next heartbeat.
+- Keepalive pings run every 10 s; a session whose ping goes unanswered for
+  20 s is closed, so a silent drop is noticed within 30 s.
+- One tunnel per runner. A second connect with a valid secret replaces the
+  first, whose streams end with an error. Unregistering or expiry closes it.
+- Persistent-mode session proxies keep their rule that the target host
+  must equal the runner URL's host, which for a tunneled runner is its
+  `runner_id`; such targets are dialed through the tunnel.
+
+The `livepeer_runner_tunnel` command is the runner side for any app that is
+a plain HTTP server:
+
+```bash
+livepeer_runner_tunnel \
+  -orchestrator https://orch.example.com:8935 -orchSecret "$ORCH_SECRET" \
+  -target http://127.0.0.1:8000 -health /health \
+  -app blueclaw/chat/qwen3-27b -mode single-shot -capacity 8 \
+  -price 0.04 -currency usd -unit hour -metadata @metadata.json
+```
+
+It registers, connects the tunnel, proxies each stream to `-target`,
+reports `ready` while `-health` answers 200, reconnects with backoff from
+1 s to 30 s, re-registers when the orchestrator has forgotten it, and
+unregisters on `SIGTERM`. Nothing on the runner's host listens for the
+orchestrator. The `box` targets `box-live-runner-tunnel-app`,
+`box-live-runner-tunnel-call`, and `box-live-runner-tunnel-stop` run an
+echo app behind the command against the local orchestrator; the app's port
+is published on loopback only and the orchestrator is never given it.
+
+Metrics: `livepeer_live_runner_tunnels`, `livepeer_live_runner_tunnel_streams`,
+and `livepeer_live_runner_tunnel_events_total{event_type}` with `connect`,
+`closed`, `replaced`, and `removed`.
+
 ### Discovery
 
 Discovery has two layers. The orchestrator describes the applications it can

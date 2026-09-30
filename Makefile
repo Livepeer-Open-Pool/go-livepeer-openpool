@@ -6,11 +6,11 @@ GO_BUILD_DIR?="./"
 MOCKGEN=GOOS= GOARCH= go run github.com/golang/mock/mockgen
 ABIGEN=GOOS= GOARCH= go run github.com/ethereum/go-ethereum/cmd/abigen
 
-all: net/lp_rpc.pb.go net/redeemer.pb.go net/redeemer_mock.pb.go core/test_segment.go eth/contracts/chainlink/AggregatorV3Interface.go livepeer livepeer_cli livepeer_router livepeer_bench
+all: net/lp_rpc.pb.go net/redeemer.pb.go net/redeemer_mock.pb.go core/test_segment.go eth/contracts/chainlink/AggregatorV3Interface.go livepeer livepeer_cli livepeer_router livepeer_bench livepeer_runner_tunnel
 
 # Release builds: skip the generated files, they are committed.
 .PHONY: binaries
-binaries: livepeer livepeer_cli livepeer_router livepeer_bench
+binaries: livepeer livepeer_cli livepeer_router livepeer_bench livepeer_runner_tunnel
 
 net/lp_rpc.pb.go: net/lp_rpc.proto
 	protoc -I=. --go_out=. --go-grpc_out=. $^
@@ -101,7 +101,7 @@ ifeq ($(BUILDOS),linux)
 endif
 
 
-.PHONY: ai_worker_codegen livepeer livepeer_bench livepeer_cli livepeer_router docker swagger
+.PHONY: ai_worker_codegen livepeer livepeer_bench livepeer_cli livepeer_router livepeer_runner_tunnel docker swagger
 
 # Git reference to download the OpenAPI spec from, defaults to `main` branch.
 # It can also be a simple git commit hash. e.g. `make ai_worker_codegen REF=c19289d`
@@ -124,6 +124,9 @@ livepeer_bench:
 
 livepeer_router:
 	GO111MODULE=on CGO_ENABLED=1 CC="$(cc)" CGO_CFLAGS="$(cgo_cflags)" CGO_LDFLAGS="$(cgo_ldflags) ${CGO_LDFLAGS}" go build -o $(GO_BUILD_DIR) -ldflags="$(ldflags)" cmd/livepeer_router/*.go
+
+livepeer_runner_tunnel:
+	GO111MODULE=on CGO_ENABLED=0 go build -o $(GO_BUILD_DIR)/livepeer_runner_tunnel -ldflags="$(ldflags)" ./cmd/livepeer_runner_tunnel
 
 docker:
 	docker buildx build --build-arg='BUILD_TAGS=mainnet,experimental' -f docker/Dockerfile .
@@ -196,6 +199,22 @@ box-live-runner-call:
 .PHONY: box-live-runner-echo
 box-live-runner-echo:
 	./box/live-runner.sh echo
+
+# A tunneled runner: an app with no published port behind the tunnel command.
+.PHONY: box-live-runner-tunnel-app
+box-live-runner-tunnel-app:
+ifneq ($(strip ${DOCKER}),true)
+	@$(MAKE) livepeer_runner_tunnel
+endif
+	./box/live-runner.sh tunnel-app
+
+.PHONY: box-live-runner-tunnel-call
+box-live-runner-tunnel-call:
+	./box/live-runner.sh tunnel-call
+
+.PHONY: box-live-runner-tunnel-stop
+box-live-runner-tunnel-stop:
+	./box/live-runner.sh tunnel-stop
 
 .PHONY: box-supabase
 box-supabase:

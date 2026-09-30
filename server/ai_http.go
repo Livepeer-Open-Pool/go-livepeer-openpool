@@ -14,11 +14,14 @@ import (
 	"log/slog"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	url2 "net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -26,7 +29,9 @@ import (
 	"github.com/getkin/kin-openapi/openapi3filter"
 	"github.com/golang/glog"
 	"github.com/golang/protobuf/proto"
+	"github.com/gorilla/websocket"
 	"github.com/livepeer/go-livepeer/ai/runner"
+	"github.com/livepeer/go-livepeer/ai/runner/tunnelconn"
 	"github.com/livepeer/go-livepeer/ai/worker"
 	"github.com/livepeer/go-livepeer/clog"
 	"github.com/livepeer/go-livepeer/common"
@@ -92,6 +97,7 @@ func startAIServer(lp *lphttp) error {
 	// Internal runner endpoints
 	lp.transRPC.HandleFunc("POST /runners/heartbeat", lp.LiveRunnerHeartbeat)
 	lp.transRPC.HandleFunc("POST /runners/{runner_id}/unregister", lp.UnregisterLiveRunner)
+	lp.transRPC.HandleFunc("GET /runners/{runner_id}/tunnel", lp.LiveRunnerTunnel)
 	lp.transRPC.HandleFunc("POST /runner/{runner_id}/session/{session_id}/channels", lp.CreateLiveRunnerTrickleChannel)
 	lp.transRPC.HandleFunc("DELETE /runner/{runner_id}/session/{session_id}/channels", lp.DeleteLiveRunnerTrickleChannels)
 	lp.transRPC.HandleFunc("POST /runner/{runner_id}/session/{session_id}/proxy", lp.CreateLiveRunnerSessionProxy)
@@ -126,6 +132,9 @@ type liveRunnerManager interface {
 	DeleteTrickleChannel(runnerID, sessionID, name string) error
 	CreateSessionProxy(runnerID, sessionID, targetURL string) (runner.LiveRunnerProxy, error)
 	ResolveSessionProxy(host, path string) (runner.LiveRunnerProxyRoute, bool, error)
+	AuthorizeTunnel(runnerID, auth string) error
+	AttachTunnel(runnerID, auth string, conn net.Conn) (*runner.LiveRunnerTunnel, error)
+	TunnelDialer(runnerID string) (runner.TunnelDialFunc, bool)
 }
 
 func (h *lphttp) liveRunnerManager() (liveRunnerManager, bool) {
@@ -172,6 +181,76 @@ func (h *lphttp) UnregisterLiveRunner(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// LiveRunnerTunnel accepts a tunneled runner's outbound connection: a
+// WebSocket carrying a yamux session that the reverse proxy dials through.
+// The handler holds the connection until the session ends.
+func (h *lphttp) LiveRunnerTunnel(w http.ResponseWriter, r *http.Request) {
+	manager, ok := h.liveRunnerManager()
+	if !ok {
+		respondWithError(w, "live runners are not supported", http.StatusNotFound)
+		return
+	}
+	runnerID := r.PathValue("runner_id")
+	auth := r.Header.Get("Authorization")
+	// Refuse before upgrading so the runner sees an HTTP status, not a closed socket.
+	if err := manager.AuthorizeTunnel(runnerID, auth); err != nil {
+		respondWithLiveRunnerError(w, err)
+		return
+	}
+	upgrader := websocket.Upgrader{
+		CheckOrigin:  func(*http.Request) bool { return true },
+		Subprotocols: []string{tunnelconn.Protocol},
+	}
+	ws, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		// Upgrade already wrote the error response.
+		return
+	}
+	conn := tunnelconn.NewConn(ws)
+	tunnel, err := manager.AttachTunnel(runnerID, auth, conn)
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
+	monitor.LiveRunnerTunnelEvent("connect")
+	monitor.LiveRunnerTunnels(int(liveRunnerTunnelsConnected.Add(1)))
+	<-tunnel.Done()
+	monitor.LiveRunnerTunnels(int(liveRunnerTunnelsConnected.Add(-1)))
+	monitor.LiveRunnerTunnelEvent(tunnel.Reason())
+}
+
+var (
+	liveRunnerTunnelsConnected atomic.Int64
+	liveRunnerTunnelStreams    atomic.Int64
+)
+
+// tunnelStreamConn counts open tunnel streams for the metrics gauge.
+type tunnelStreamConn struct {
+	net.Conn
+	once sync.Once
+}
+
+func (c *tunnelStreamConn) Close() error {
+	c.once.Do(func() { monitor.LiveRunnerTunnelStreams(int(liveRunnerTunnelStreams.Add(-1))) })
+	return c.Conn.Close()
+}
+
+func tunnelTransport(dial runner.TunnelDialFunc) http.RoundTripper {
+	return &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := dial(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			slog.Debug("live runner tunnel stream opened", "addr", addr)
+			monitor.LiveRunnerTunnelStreams(int(liveRunnerTunnelStreams.Add(1)))
+			return &tunnelStreamConn{Conn: conn}, nil
+		},
+		// One HTTP exchange per yamux stream; nothing to pool.
+		DisableKeepAlives: true,
+	}
 }
 
 type liveRunnerSessionResponse struct {
@@ -845,7 +924,21 @@ func (h *lphttp) proxyLiveRunner(w http.ResponseWriter, r *http.Request, runnerI
 		return
 	}
 	sessionControlURL := liveRunnerURI(h.node, h.orchestrator).JoinPath("runner", runnerID, "session", sessionID).String()
+	var transport http.RoundTripper
+	if manager, ok := h.liveRunnerManager(); ok {
+		if dial, tunneled := manager.TunnelDialer(runnerID); tunneled {
+			// A tunneled runner's endpoint is tunnel://<runner_id> (or, for a
+			// session proxy, an http URL on that same host); the stream the
+			// dialer opens is the connection, so the URL only needs a scheme
+			// the transport accepts.
+			transport = tunnelTransport(dial)
+			if target.Scheme == runner.LiveRunnerTunnelScheme {
+				target.Scheme = "http"
+			}
+		}
+	}
 	proxy := &httputil.ReverseProxy{
+		Transport: transport,
 		Rewrite: func(req *httputil.ProxyRequest) {
 			req.Out.URL.Scheme = target.Scheme
 			req.Out.URL.Host = target.Host
