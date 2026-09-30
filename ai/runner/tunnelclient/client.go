@@ -101,11 +101,12 @@ type Client struct {
 	orch   *url.URL
 	target *url.URL
 
-	mu       sync.Mutex
-	runnerID string
-	secret   string
-	interval time.Duration
-	session  *yamux.Session
+	mu         sync.Mutex
+	runnerID   string
+	secret     string
+	interval   time.Duration
+	session    *yamux.Session
+	lastStatus string
 }
 
 // errReregister says the orchestrator no longer knows this registration.
@@ -299,27 +300,46 @@ func (c *Client) heartbeat(ctx context.Context, runnerID, auth string) (*heartbe
 }
 
 // status is what the heartbeat reports: ready while the local health path
-// answers 200 (or when no health path is configured).
+// answers 200 (or when no health path is configured). A change is logged
+// with its cause, so an unavailable runner explains itself in its own log.
 func (c *Client) status(ctx context.Context) string {
+	status, cause := c.checkHealth(ctx)
+	c.mu.Lock()
+	changed := status != c.lastStatus
+	c.lastStatus = status
+	c.mu.Unlock()
+	if changed {
+		if cause != "" {
+			c.log.Warn("status changed", "status", status, "health", c.target.JoinPath(c.cfg.Health).String(), "cause", cause)
+		} else {
+			c.log.Info("status changed", "status", status)
+		}
+	} else if cause != "" {
+		c.log.Debug("health check failed", "cause", cause)
+	}
+	return status
+}
+
+func (c *Client) checkHealth(ctx context.Context) (string, string) {
 	if c.cfg.Health == "" {
-		return "ready"
+		return "ready", ""
 	}
 	ctx, cancel := context.WithTimeout(ctx, healthTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.target.JoinPath(c.cfg.Health).String(), nil)
 	if err != nil {
-		return "unavailable"
+		return "unavailable", err.Error()
 	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "unavailable"
+		return "unavailable", err.Error()
 	}
 	_, _ = io.Copy(io.Discard, res.Body)
 	res.Body.Close()
 	if res.StatusCode == http.StatusOK {
-		return "ready"
+		return "ready", ""
 	}
-	return "unavailable"
+	return "unavailable", fmt.Sprintf("health answered %d", res.StatusCode)
 }
 
 // serveTunnel connects one tunnel and serves it until it ends. Heartbeats
