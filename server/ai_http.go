@@ -117,6 +117,7 @@ func startAIServer(lp *lphttp) error {
 
 type liveRunnerManager interface {
 	Heartbeat(req runner.LiveRunnerHeartbeatRequest, auth string) (*runner.LiveRunnerHeartbeatResponse, error)
+	HeartbeatFrom(req runner.LiveRunnerHeartbeatRequest, auth, remoteAddr string) (*runner.LiveRunnerHeartbeatResponse, error)
 	Unregister(runnerID, auth string) error
 	Runners() []runner.LiveRunnerDiscoveryRunner
 	PaymentInfo(runnerID string) (*runner.LiveRunnerPriceInfo, error)
@@ -156,7 +157,11 @@ func (h *lphttp) LiveRunnerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	resp, err := manager.Heartbeat(req, r.Header.Get("Authorization"))
+	remoteAddr := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		remoteAddr = host
+	}
+	resp, err := manager.HeartbeatFrom(req, r.Header.Get("Authorization"), remoteAddr)
 	if err != nil {
 		respondWithLiveRunnerError(w, err)
 		return

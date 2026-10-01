@@ -233,6 +233,9 @@ type liveRunner struct {
 	static          bool
 	offchain        bool
 	o2r             *liveRunnerTrickleChannel
+	member          *liveRunnerMember // set for a runner admitted in pool mode
+	remoteAddr      string
+	registeredAt    time.Time
 
 	// all fields below are mutable and need to be protected by mu
 	mu sync.Mutex
@@ -246,6 +249,10 @@ type liveRunner struct {
 	priceSource   LiveRunnerPriceInfo
 	converter     *core.AutoConvertedPrice
 	tunnel        *LiveRunnerTunnel // connected tunnel of a Tunnel runner, nil while disconnected
+	state         string            // pool state; empty means active
+	// registeredCapacity is the capacity a pool runner was admitted with, the
+	// most its later heartbeats may report.
+	registeredCapacity int
 }
 
 type liveRunnerSession struct {
@@ -279,6 +286,8 @@ type LiveRunnerRegistry struct {
 	o2rInterval       time.Duration
 	stopRegistry      chan struct{}
 	stopRegistryOnce  sync.Once
+	admitter          LiveRunnerAdmitter // non-nil in pool mode
+	orchAddress       string
 
 	staticRegistrationMu sync.Mutex // serializes static runner config upserts
 
@@ -302,6 +311,11 @@ type LiveRunnerRegistryConfig struct {
 	Onchain          bool
 	ProxyURLTemplate string
 	O2RInterval      time.Duration
+	// Admitter turns on pool mode: it decides every dynamic registration, and
+	// the host's registration secret registers nothing.
+	Admitter LiveRunnerAdmitter
+	// OrchAddress is the orchestrator's on-chain address, reported to the admitter.
+	OrchAddress string
 }
 
 var liveRunnerChannelNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
@@ -340,6 +354,8 @@ func NewLiveRunnerRegistry(config LiveRunnerRegistryConfig) *LiveRunnerRegistry 
 		o2rInterval:       o2rInterval,
 		stopRegistry:      make(chan struct{}),
 		proxyTemplate:     proxyTemplate,
+		admitter:          config.Admitter,
+		orchAddress:       config.OrchAddress,
 	}
 	go r.healthLoop()
 	go r.expiryLoop()
@@ -376,7 +392,19 @@ func (r *LiveRunnerRegistry) Stop() {
 }
 
 func (r *LiveRunnerRegistry) Heartbeat(req LiveRunnerHeartbeatRequest, auth string) (*LiveRunnerHeartbeatResponse, error) {
+	return r.HeartbeatFrom(req, auth, "")
+}
+
+// HeartbeatFrom is Heartbeat with the network address the heartbeat came
+// from, which pool admission reports to the admitter.
+func (r *LiveRunnerRegistry) HeartbeatFrom(req LiveRunnerHeartbeatRequest, auth, remoteAddr string) (*LiveRunnerHeartbeatResponse, error) {
 	req.RunnerID = strings.TrimSpace(req.RunnerID)
+	// In pool mode a heartbeat without an id is a registration and the
+	// registry picks the id; a heartbeat with an id is never one.
+	poolRegistration := r.poolMode() && req.RunnerID == ""
+	if poolRegistration {
+		req.RunnerID = r.newPoolRunnerID()
+	}
 	if req.RunnerID == "" {
 		req.RunnerID = "runner_" + randomStr(liveRunnerIDRandomBytes)
 	}
@@ -384,6 +412,12 @@ func (r *LiveRunnerRegistry) Heartbeat(req LiveRunnerHeartbeatRequest, auth stri
 	req, err := r.normalizeHeartbeat(req.RunnerID, req)
 	if err != nil {
 		return nil, &RunnerError{StatusCode: http.StatusBadRequest, Message: err.Error()}
+	}
+	var member *liveRunnerMember
+	if poolRegistration {
+		if member, err = r.admit(req, auth, remoteAddr); err != nil {
+			return nil, err
+		}
 	}
 
 	// For now, only return the heartbeat secret on first registration.
@@ -400,14 +434,25 @@ func (r *LiveRunnerRegistry) Heartbeat(req LiveRunnerHeartbeatRequest, auth stri
 		trickleSrv := r.trickleSrv
 		trickleBaseURL := r.internalTrickleBaseURL
 		// registering a new runner
-		registrationSecret := r.host.RegistrationSecret()
-		if registrationSecret == "" {
-			r.mu.Unlock()
-			return nil, &RunnerError{StatusCode: http.StatusNotFound, Message: "dynamic live runner registration is disabled"}
-		}
-		if !validSecret(auth, registrationSecret) {
-			r.mu.Unlock()
-			return nil, &RunnerError{StatusCode: http.StatusUnauthorized, Message: "invalid registration authorization"}
+		if r.poolMode() {
+			if member == nil {
+				r.mu.Unlock()
+				return nil, &RunnerError{StatusCode: http.StatusNotFound, Message: "runner not found"}
+			}
+			if err := r.memberWithinLimitLocked(member); err != nil {
+				r.mu.Unlock()
+				return nil, err
+			}
+		} else {
+			registrationSecret := r.host.RegistrationSecret()
+			if registrationSecret == "" {
+				r.mu.Unlock()
+				return nil, &RunnerError{StatusCode: http.StatusNotFound, Message: "dynamic live runner registration is disabled"}
+			}
+			if !validSecret(auth, registrationSecret) {
+				r.mu.Unlock()
+				return nil, &RunnerError{StatusCode: http.StatusUnauthorized, Message: "invalid registration authorization"}
+			}
 		}
 		seed := newRunnerSeed()
 		heartbeatSecret := deriveSecret(seed, "heartbeat")
@@ -415,6 +460,9 @@ func (r *LiveRunnerRegistry) Heartbeat(req LiveRunnerHeartbeatRequest, auth stri
 			seed:            seed,
 			heartbeatSecret: heartbeatSecret,
 			offchain:        r.offchain,
+			member:          member,
+			remoteAddr:      remoteAddr,
+			registeredAt:    time.Now(),
 			route:           req.RunnerID, // No label-based routing for now
 			sessions:        make(map[string]*liveRunnerSession),
 		}
@@ -432,6 +480,11 @@ func (r *LiveRunnerRegistry) Heartbeat(req LiveRunnerHeartbeatRequest, auth stri
 		runner.LiveRunnerHeartbeatRequest = req
 		runner.LastHeartbeat = time.Now()
 		runner.route = runner.RunnerID // not doing label based routing here for now
+		runner.registeredCapacity = req.Capacity
+		if member != nil {
+			runner.state = member.state
+			slog.Info("live runner admitted", "runner_id", runner.RunnerID, "app", runner.App, "member_id", member.id, "state", runner.state, "remote_addr", remoteAddr)
+		}
 		slog.Info("live runner registered", "runner_id", runner.RunnerID, "app", runner.App, "runner_url", runner.RunnerURL)
 		runner.updatePriceConverterLocked()
 
@@ -464,6 +517,11 @@ func (r *LiveRunnerRegistry) Heartbeat(req LiveRunnerHeartbeatRequest, auth stri
 	}
 	if runner.Tunnel != req.Tunnel {
 		return nil, &RunnerError{StatusCode: http.StatusBadRequest, Message: "tunnel cannot change after registration"}
+	}
+	if runner.member != nil {
+		if err := runner.frozenFieldsLocked(req); err != nil {
+			return nil, err
+		}
 	}
 	runner.LiveRunnerHeartbeatRequest = req
 	runner.LastHeartbeat = time.Now()
@@ -979,6 +1037,9 @@ func (r *LiveRunnerRegistry) ReserveSession(runnerID string, optSessionID ...str
 	if !runner.readyLocked() {
 		return "", "", &RunnerError{StatusCode: http.StatusNotFound, Message: "runner not found"}
 	}
+	if err := runner.newWorkAllowedLocked(); err != nil {
+		return "", "", err
+	}
 	id := ""
 	if len(optSessionID) > 0 {
 		// use supplied id if given - usually ticket param's auth token id / manifest id
@@ -1035,6 +1096,9 @@ func (r *LiveRunnerRegistry) PaymentInfo(runnerID string) (*LiveRunnerPriceInfo,
 	if !runner.readyLocked() {
 		return nil, &RunnerError{StatusCode: http.StatusNotFound, Message: "runner not found"}
 	}
+	if err := runner.newWorkAllowedLocked(); err != nil {
+		return nil, err
+	}
 	if runner.offchain {
 		return nil, nil
 	}
@@ -1079,6 +1143,9 @@ func (r *LiveRunnerRegistry) RunnerMode(runnerID string) (string, error) {
 	defer unlock()
 	if !runner.readyLocked() {
 		return "", &RunnerError{StatusCode: http.StatusNotFound, Message: "runner not found"}
+	}
+	if err := runner.newWorkAllowedLocked(); err != nil {
+		return "", err
 	}
 	if runner.Mode == "" {
 		return LiveRunnerModePersistent, nil
@@ -1350,7 +1417,7 @@ func (r *LiveRunnerRegistry) Runners() []LiveRunnerDiscoveryRunner {
 	runners := make([]LiveRunnerDiscoveryRunner, 0, len(snapshot))
 	for _, runner := range snapshot {
 		runner.mu.Lock()
-		if runner.removed || liveRunnerExpiredLocked(runner, time.Now(), heartbeatTTL) || !runner.readyLocked() {
+		if runner.removed || liveRunnerExpiredLocked(runner, time.Now(), heartbeatTTL) || !runner.readyLocked() || runner.stateLocked() != LiveRunnerStateActive {
 			runner.mu.Unlock()
 			continue
 		}

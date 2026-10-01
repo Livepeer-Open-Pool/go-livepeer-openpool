@@ -103,6 +103,9 @@ type LivepeerConfig struct {
 	UseLiveRunners             *bool
 	LiveRunnerConfig           *string
 	LiveRunnerProxyURL         *string
+	LiveRunnerAuthWebhookURL   *string
+	LiveRunnerAuthTimeout      *time.Duration
+	LiveRunnerPoolSecret       *string
 	Gateway                    *bool
 	Broadcaster                *bool
 	OrchSecret                 *string
@@ -251,6 +254,9 @@ func DefaultLivepeerConfig() LivepeerConfig {
 	defaultUseLiveRunners := false
 	defaultLiveRunnerConfig := ""
 	defaultLiveRunnerProxyURL := ""
+	defaultLiveRunnerAuthWebhookURL := ""
+	defaultLiveRunnerAuthTimeout := 5 * time.Second
+	defaultLiveRunnerPoolSecret := ""
 	defaultAIModels := ""
 	defaultAIModelsDir := ""
 	defaultAIRunnerImage := "livepeer/ai-runner:latest"
@@ -385,6 +391,9 @@ func DefaultLivepeerConfig() LivepeerConfig {
 		UseLiveRunners:           &defaultUseLiveRunners,
 		LiveRunnerConfig:         &defaultLiveRunnerConfig,
 		LiveRunnerProxyURL:       &defaultLiveRunnerProxyURL,
+		LiveRunnerAuthWebhookURL: &defaultLiveRunnerAuthWebhookURL,
+		LiveRunnerAuthTimeout:    &defaultLiveRunnerAuthTimeout,
+		LiveRunnerPoolSecret:     &defaultLiveRunnerPoolSecret,
 		AIModels:                 &defaultAIModels,
 		AIModelsDir:              &defaultAIModelsDir,
 		AIRunnerImage:            &defaultAIRunnerImage,
@@ -491,6 +500,7 @@ func (cfg LivepeerConfig) PrintConfig(w io.Writer) {
 	sensitiveFields := map[string]bool{
 		"EthPassword":                true,
 		"OrchSecret":                 true,
+		"LiveRunnerPoolSecret":       true,
 		"KafkaPassword":              true,
 		"MediaMTXApiPassword":        true,
 		"LiveAIAuthApiKey":           true,
@@ -2071,8 +2081,25 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 		orch := core.NewOrchestrator(s.LivepeerNode, timeWatcher)
 
 		if *cfg.UseLiveRunners || *cfg.LiveRunnerConfig != "" {
-			if n.OrchSecret == "" && *cfg.LiveRunnerConfig == "" {
-				glog.Exit("running with -useLiveRunners requires -orchSecret")
+			// Pool mode: the admission webhook, not -orchSecret, decides who registers.
+			var admitter runner.LiveRunnerAdmitter
+			if *cfg.LiveRunnerAuthWebhookURL != "" {
+				poolSecret := ""
+				if *cfg.LiveRunnerPoolSecret != "" {
+					poolSecret, _ = common.ReadFromFile(*cfg.LiveRunnerPoolSecret)
+				}
+				webhook, err := runner.NewLiveRunnerWebhookAdmitter(*cfg.LiveRunnerAuthWebhookURL, poolSecret, *cfg.LiveRunnerAuthTimeout)
+				if err != nil {
+					glog.Exitf("invalid -liveRunnerAuthWebhookUrl: %v", err)
+				}
+				if poolSecret == "" {
+					glog.Warning("No -liveRunnerPoolSecret configured; the LiveRunner admission webhook cannot tell this orchestrator from any other caller")
+				}
+				admitter = webhook
+				glog.Info("LiveRunner pool mode: registrations are decided by ", *cfg.LiveRunnerAuthWebhookURL)
+			}
+			if n.OrchSecret == "" && *cfg.LiveRunnerConfig == "" && admitter == nil {
+				glog.Exit("running with -useLiveRunners requires -orchSecret or -liveRunnerAuthWebhookUrl")
 			}
 			if cfg.LiveRunnerProxyURL != nil && *cfg.LiveRunnerProxyURL != "" {
 				if err := runner.ValidateProxyURLTemplate(*cfg.LiveRunnerProxyURL, orch.ServiceURI()); err != nil {
@@ -2083,8 +2110,10 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 				Host:             liveRunnerHost{RunnerHost: orch, LivepeerNode: n},
 				Onchain:          *cfg.Network != "offchain",
 				ProxyURLTemplate: *cfg.LiveRunnerProxyURL,
+				Admitter:         admitter,
+				OrchAddress:      liveRunnerOrchAddress(orch.Address()),
 			})
-			if n.OrchSecret == "" {
+			if n.OrchSecret == "" && admitter == nil {
 				glog.Warning("No -orchSecret configured; dynamic LiveRunner heartbeat registration is disabled")
 			}
 			if *cfg.LiveRunnerConfig != "" {
@@ -2681,6 +2710,15 @@ func (h liveRunnerHost) LiveRunnerURI() *url.URL {
 		return &v
 	}
 	return h.RunnerHost.ServiceURI()
+}
+
+// liveRunnerOrchAddress is the address pool events and the admission webhook
+// identify this orchestrator by; an off-chain orchestrator has none.
+func liveRunnerOrchAddress(addr ethcommon.Address) string {
+	if addr == (ethcommon.Address{}) {
+		return ""
+	}
+	return addr.Hex()
 }
 
 func parseLiveRunnerAddr(addr string) (*url.URL, error) {
