@@ -758,3 +758,161 @@ func TestProbeSessionsNobodyStoppedAreReleased(t *testing.T) {
 	_, err = registry.RunnerEndpointForSession(resp.RunnerID, customerID)
 	require.NoError(t, err)
 }
+
+func TestPoolRunnersListsEveryRunnerInEveryState(t *testing.T) {
+	healthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer healthSrv.Close()
+	registry := newPoolTestRegistry(t, &fakeAdmitter{answer: func(LiveRunnerAdmissionRequest) (*LiveRunnerAdmissionResponse, error) {
+		return &LiveRunnerAdmissionResponse{Allow: true, MemberID: "m1", PayoutAddress: "0x00000000000000000000000000000000000000b1", MaxRunners: 4}, nil
+	}})
+	before := time.Now().Add(-time.Second).UnixMilli()
+	resp := poolTestRegister(t, registry, "c1")
+	sessionID, _, err := registry.ReserveProbeSession(resp.RunnerID)
+	require.NoError(t, err)
+	static, err := registry.RegisterStaticRunners(StaticLiveRunnerConfig{Runners: []StaticLiveRunnerConfigEntry{{
+		Label: "own-box", Routing: LiveRunnerRoutingLabel, RunnerURL: "https://runner.example.com", App: "echo", Capacity: 3, HealthURL: healthSrv.URL,
+	}}})
+	require.NoError(t, err)
+	require.Empty(t, registry.Runners()[0].Metadata) // only the static runner is discoverable
+	require.Len(t, registry.Runners(), 1)
+
+	runners := registry.PoolRunners()
+	require.Len(t, runners, 2)
+	// The static runner has no registration time and sorts first.
+	require.Equal(t, LiveRunnerPoolRunner{
+		RunnerID: static.Runners[0].RunnerID, MemberID: "operator", State: LiveRunnerStateActive, Status: "ready", Ready: true,
+		App: "echo", Mode: LiveRunnerModePersistent, Label: "own-box", Capacity: 3, CapacityRegistered: 3,
+		RunnerURL: "https://runner.example.com", LastHeartbeatMs: runners[0].LastHeartbeatMs, SessionIDs: []string{}, Static: true,
+	}, runners[0])
+
+	member := runners[1]
+	require.GreaterOrEqual(t, member.RegisteredAtMs, before)
+	require.GreaterOrEqual(t, member.LastHeartbeatMs, member.RegisteredAtMs)
+	require.Equal(t, LiveRunnerPoolRunner{
+		RunnerID: resp.RunnerID, MemberID: "m1", PayoutAddress: "0x00000000000000000000000000000000000000b1",
+		State: LiveRunnerStateProbation, Status: "ready", Ready: true,
+		App: "vllm/qwen2.5-7b-instruct", Mode: LiveRunnerModeSingleShot, Version: "vllm-app:1.4.2",
+		Capacity: 2, CapacityRegistered: 2, CapacityUsed: 1,
+		Tunnel: true, TunnelConnected: true, RemoteAddr: "203.0.113.7",
+		RegisteredAtMs: member.RegisteredAtMs, LastHeartbeatMs: member.LastHeartbeatMs,
+		SessionIDs: []string{sessionID},
+	}, member)
+
+	// The listing is what the operator's JSON endpoint returns.
+	data, err := json.Marshal(member)
+	require.NoError(t, err)
+	require.Contains(t, string(data), `"tunnel_connected":true`)
+	require.NotContains(t, string(data), "runner_url", "a tunneled runner has no address to report")
+}
+
+func TestPoolRunnersReportsThePriceARunnerIsOfferedAt(t *testing.T) {
+	registry := newOnchainPoolTestRegistry(t, &fakeAdmitter{})
+	poolTestRegister(t, registry, "c1")
+	runners := registry.PoolRunners()
+	require.Len(t, runners, 1)
+	require.Equal(t, &LiveRunnerPriceInfo{Price: "10", Currency: "usd", Unit: "hour"}, runners[0].PriceInfo)
+}
+
+func TestSetRunnerState(t *testing.T) {
+	healthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer healthSrv.Close()
+	registry := newPoolTestRegistry(t, &fakeAdmitter{})
+	resp := poolTestRegister(t, registry, "c1")
+	require.Empty(t, registry.Runners())
+
+	require.NoError(t, registry.SetRunnerState(resp.RunnerID, LiveRunnerStateActive, "probe passed"))
+	require.Len(t, registry.Runners(), 1)
+	sessionID, _, err := registry.ReserveSession(resp.RunnerID)
+	require.NoError(t, err)
+
+	// Leaving active stops new work and leaves the running session alone.
+	require.NoError(t, registry.SetRunnerState(resp.RunnerID, LiveRunnerStateSuspended, "slow"))
+	require.Empty(t, registry.Runners())
+	_, err = registry.RunnerEndpointForSession(resp.RunnerID, sessionID)
+	require.NoError(t, err)
+	require.NoError(t, registry.SetRunnerState(resp.RunnerID, LiveRunnerStateProbation, "retest"))
+	_, _, err = registry.ReserveSession(resp.RunnerID)
+	requireRunnerError(t, err, http.StatusNotFound, "runner not found")
+	_, err = registry.RunnerEndpointForSession(resp.RunnerID, sessionID)
+	require.NoError(t, err)
+
+	requireRunnerError(t, registry.SetRunnerState(resp.RunnerID, "trusted", ""), http.StatusBadRequest, "state must be probation, active, or suspended")
+	requireRunnerError(t, registry.SetRunnerState("runner_missing", LiveRunnerStateActive, ""), http.StatusNotFound, "runner not found")
+
+	// A static runner routed by its label is still addressed by its runner id.
+	static, err := registry.RegisterStaticRunners(StaticLiveRunnerConfig{Runners: []StaticLiveRunnerConfigEntry{{
+		Label: "own-box", Routing: LiveRunnerRoutingLabel, RunnerURL: "https://runner.example.com", App: "echo", HealthURL: healthSrv.URL,
+	}}})
+	require.NoError(t, err)
+	require.Len(t, registry.Runners(), 1)
+	require.NoError(t, registry.SetRunnerState(static.Runners[0].RunnerID, LiveRunnerStateSuspended, "maintenance"))
+	require.Empty(t, registry.Runners())
+}
+
+func TestEvictRunner(t *testing.T) {
+	healthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer healthSrv.Close()
+	registry := newPoolTestRegistry(t, &fakeAdmitter{answer: admitAs("m1", LiveRunnerStateActive, 4)})
+	resp, err := registry.HeartbeatFrom(poolTestHeartbeat(), "c1", "")
+	require.NoError(t, err)
+	tunnel, _ := attachPipeTunnel(t, registry, resp.RunnerID, resp.HeartbeatSecret)
+	sessionID, _, err := registry.ReserveSession(resp.RunnerID)
+	require.NoError(t, err)
+
+	require.NoError(t, registry.EvictRunner(resp.RunnerID, "returned garbage"))
+
+	require.Empty(t, registry.PoolRunners())
+	select {
+	case <-tunnel.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the evicted runner's tunnel was not closed")
+	}
+	require.Equal(t, "removed", tunnel.Reason())
+	_, err = registry.RunnerEndpointForSession(resp.RunnerID, sessionID)
+	requireRunnerError(t, err, http.StatusNotFound, "runner not found")
+	// Its heartbeat secret is worthless: the runner has to register again, through the admitter.
+	req := poolTestHeartbeat()
+	req.RunnerID = resp.RunnerID
+	_, err = registry.HeartbeatFrom(req, resp.HeartbeatSecret, "")
+	requireRunnerError(t, err, http.StatusNotFound, "runner not found")
+	requireRunnerError(t, registry.EvictRunner(resp.RunnerID, ""), http.StatusNotFound, "runner not found")
+
+	static, err := registry.RegisterStaticRunners(StaticLiveRunnerConfig{Runners: []StaticLiveRunnerConfigEntry{{
+		Label: "own-box", RunnerURL: "https://runner.example.com", App: "echo", HealthURL: healthSrv.URL,
+	}}})
+	require.NoError(t, err)
+	requireRunnerError(t, registry.EvictRunner(static.Runners[0].RunnerID, ""), http.StatusBadRequest, "")
+	require.Len(t, registry.PoolRunners(), 1)
+}
+
+func TestEvictMember(t *testing.T) {
+	registry := newPoolTestRegistry(t, &fakeAdmitter{answer: func(req LiveRunnerAdmissionRequest) (*LiveRunnerAdmissionResponse, error) {
+		return &LiveRunnerAdmissionResponse{Allow: true, MemberID: req.Credential, MaxRunners: 4, State: LiveRunnerStateActive}, nil
+	}})
+	first := poolTestRegister(t, registry, "alice")
+	second := poolTestRegister(t, registry, "alice")
+	bob := poolTestRegister(t, registry, "bob")
+	_, _, err := registry.ReserveSession(first.RunnerID)
+	require.NoError(t, err)
+
+	evicted, err := registry.EvictMember("alice", "banned")
+	require.NoError(t, err)
+	require.Equal(t, 2, evicted)
+
+	remaining := registry.PoolRunners()
+	require.Len(t, remaining, 1)
+	require.Equal(t, bob.RunnerID, remaining[0].RunnerID)
+	for _, gone := range []*LiveRunnerHeartbeatResponse{first, second} {
+		req := poolTestHeartbeat()
+		req.RunnerID = gone.RunnerID
+		_, err := registry.HeartbeatFrom(req, gone.HeartbeatSecret, "")
+		requireRunnerError(t, err, http.StatusNotFound, "runner not found")
+	}
+	// The member's places are free again; whether it may come back is the admitter's call.
+	poolTestRegister(t, registry, "alice")
+
+	_, err = registry.EvictMember("carol", "")
+	requireRunnerError(t, err, http.StatusNotFound, "member has no runners")
+	_, err = registry.EvictMember("operator", "")
+	requireRunnerError(t, err, http.StatusNotFound, "member has no runners")
+}

@@ -476,3 +476,221 @@ func (r *LiveRunnerRegistry) releaseExpiredProbeSessions(now time.Time) {
 		runner.mu.Unlock()
 	}
 }
+
+// LiveRunnerOperatorMember is the member a runner outside the pool is
+// reported under: the operator's static runners, and every runner of an
+// orchestrator that is not in pool mode.
+const LiveRunnerOperatorMember = "operator"
+
+// LiveRunnerPoolRunner is a registered runner as the operator sees it, in
+// whatever state, including what discovery hides.
+type LiveRunnerPoolRunner struct {
+	RunnerID           string               `json:"runner_id"`
+	MemberID           string               `json:"member_id"`
+	PayoutAddress      string               `json:"payout_address"`
+	State              string               `json:"state"`
+	Status             string               `json:"status"`
+	Ready              bool                 `json:"ready"`
+	App                string               `json:"app"`
+	Mode               string               `json:"mode"`
+	Version            string               `json:"version"`
+	Label              string               `json:"label,omitempty"`
+	GPU                *LiveRunnerGPU       `json:"gpu,omitempty"`
+	Capacity           int                  `json:"capacity"`
+	CapacityRegistered int                  `json:"capacity_registered"`
+	CapacityUsed       int                  `json:"capacity_used"`
+	PriceInfo          *LiveRunnerPriceInfo `json:"price_info,omitempty"`
+	Tunnel             bool                 `json:"tunnel"`
+	TunnelConnected    bool                 `json:"tunnel_connected"`
+	RunnerURL          string               `json:"runner_url,omitempty"`
+	RemoteAddr         string               `json:"remote_addr"`
+	RegisteredAtMs     int64                `json:"registered_at_ms"`
+	LastHeartbeatMs    int64                `json:"last_heartbeat_ms"`
+	SessionIDs         []string             `json:"session_ids"`
+	Static             bool                 `json:"static"`
+}
+
+// poolRunnerLocked requires runner.mu.
+func (runner *liveRunner) poolRunnerLocked() LiveRunnerPoolRunner {
+	out := LiveRunnerPoolRunner{
+		RunnerID:           runner.RunnerID,
+		MemberID:           LiveRunnerOperatorMember,
+		State:              runner.stateLocked(),
+		Status:             runner.Status,
+		Ready:              runner.readyLocked(),
+		App:                runner.App,
+		Mode:               runner.Mode,
+		Version:            runner.Version,
+		Label:              runner.Label,
+		GPU:                cloneLiveRunnerGPU(runner.GPU),
+		Capacity:           runner.Capacity,
+		CapacityRegistered: runner.registeredCapacity,
+		CapacityUsed:       len(runner.sessions),
+		Tunnel:             runner.Tunnel,
+		TunnelConnected:    runner.tunnel != nil,
+		RemoteAddr:         runner.remoteAddr,
+		LastHeartbeatMs:    runner.LastHeartbeat.UnixMilli(),
+		SessionIDs:         runner.sessionIDsLocked(),
+		Static:             runner.static,
+	}
+	if runner.member != nil {
+		out.MemberID = runner.member.id
+		out.PayoutAddress = runner.member.payoutAddress
+	}
+	if out.Status == "" {
+		out.Status = "ready"
+	}
+	if out.CapacityRegistered == 0 {
+		out.CapacityRegistered = runner.Capacity
+	}
+	if runner.PriceInfo != (LiveRunnerPriceInfo{}) {
+		priceInfo := runner.PriceInfo
+		out.PriceInfo = &priceInfo
+	}
+	if !runner.Tunnel {
+		out.RunnerURL = runner.RunnerURL
+	}
+	if !runner.registeredAt.IsZero() {
+		out.RegisteredAtMs = runner.registeredAt.UnixMilli()
+	}
+	return out
+}
+
+// PoolRunners lists every registered runner in every state, oldest first.
+func (r *LiveRunnerRegistry) PoolRunners() []LiveRunnerPoolRunner {
+	r.mu.Lock()
+	heartbeatTTL := r.heartbeatTTL
+	snapshot := make([]*liveRunner, 0, len(r.runners))
+	for _, runner := range r.runners {
+		snapshot = append(snapshot, runner)
+	}
+	r.mu.Unlock()
+
+	runners := make([]LiveRunnerPoolRunner, 0, len(snapshot))
+	for _, runner := range snapshot {
+		runner.mu.Lock()
+		if !runner.removed && !liveRunnerExpiredLocked(runner, time.Now(), heartbeatTTL) {
+			runners = append(runners, runner.poolRunnerLocked())
+		}
+		runner.mu.Unlock()
+	}
+	sort.Slice(runners, func(i, j int) bool {
+		if runners[i].RegisteredAtMs != runners[j].RegisteredAtMs {
+			return runners[i].RegisteredAtMs < runners[j].RegisteredAtMs
+		}
+		return runners[i].RunnerID < runners[j].RunnerID
+	})
+	return runners
+}
+
+// lockRunnerByID finds a live runner by its runner_id and returns it with
+// runner.mu held, together with the route it is registered under. The two
+// differ only for a static runner routed by its label.
+func (r *LiveRunnerRegistry) lockRunnerByID(runnerID string) (*liveRunner, string, func(), error) {
+	type entry struct {
+		route  string
+		runner *liveRunner
+	}
+	r.mu.Lock()
+	heartbeatTTL := r.heartbeatTTL
+	entries := make([]entry, 0, 1)
+	if runner := r.runners[runnerID]; runner != nil {
+		entries = append(entries, entry{runnerID, runner})
+	} else {
+		for route, runner := range r.runners {
+			entries = append(entries, entry{route, runner})
+		}
+	}
+	r.mu.Unlock()
+
+	for _, e := range entries {
+		e.runner.mu.Lock()
+		if !e.runner.removed && e.runner.RunnerID == runnerID && !liveRunnerExpiredLocked(e.runner, time.Now(), heartbeatTTL) {
+			return e.runner, e.route, e.runner.mu.Unlock, nil
+		}
+		e.runner.mu.Unlock()
+	}
+	return nil, "", nil, &RunnerError{StatusCode: http.StatusNotFound, Message: "runner not found"}
+}
+
+// SetRunnerState moves a runner to a state. Leaving active stops new work
+// and nothing else: sessions already running finish.
+func (r *LiveRunnerRegistry) SetRunnerState(runnerID, state, reason string) error {
+	state = strings.TrimSpace(state)
+	if !validLiveRunnerState(state) {
+		return &RunnerError{StatusCode: http.StatusBadRequest, Message: "state must be probation, active, or suspended"}
+	}
+	runner, _, unlock, err := r.lockRunnerByID(runnerID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	from := runner.stateLocked()
+	runner.state = state
+	slog.Info("live runner state changed", "runner_id", runner.RunnerID, "app", runner.App, "member_id", runner.memberID(), "from", from, "to", state, "reason", reason)
+	return nil
+}
+
+// EvictRunner removes a runner: its tunnel is closed, its sessions are
+// released, and its heartbeat secret stops working. Nothing stops it from
+// registering again; a ban is the admitter's to enforce.
+func (r *LiveRunnerRegistry) EvictRunner(runnerID, reason string) error {
+	runner, route, unlock, err := r.lockRunnerByID(runnerID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if runner.static {
+		return &RunnerError{StatusCode: http.StatusBadRequest, Message: "a static runner is removed from the static runner config, not evicted"}
+	}
+	r.evictLocked(route, runner, reason)
+	return nil
+}
+
+// EvictMember evicts every runner of a member and returns how many there were.
+func (r *LiveRunnerRegistry) EvictMember(memberID, reason string) (int, error) {
+	type entry struct {
+		route  string
+		runner *liveRunner
+	}
+	r.mu.Lock()
+	entries := []entry{}
+	for route, runner := range r.runners {
+		if runner.member != nil && runner.member.id == memberID {
+			entries = append(entries, entry{route, runner})
+		}
+	}
+	r.mu.Unlock()
+
+	evicted := 0
+	for _, e := range entries {
+		e.runner.mu.Lock()
+		if !e.runner.removed {
+			r.evictLocked(e.route, e.runner, reason)
+			evicted++
+		}
+		e.runner.mu.Unlock()
+	}
+	if evicted == 0 {
+		return 0, &RunnerError{StatusCode: http.StatusNotFound, Message: "member has no runners"}
+	}
+	return evicted, nil
+}
+
+// evictLocked requires runner.mu.
+func (r *LiveRunnerRegistry) evictLocked(route string, runner *liveRunner, reason string) {
+	slog.Info("live runner evicted", "runner_id", runner.RunnerID, "app", runner.App, "member_id", runner.memberID(), "reason", reason)
+	r.mu.Lock()
+	if r.runners[route] == runner && !runner.removed {
+		r.removeRunnerWithRunnerLocked(route, runner, "evicted")
+	}
+	r.mu.Unlock()
+}
+
+// memberID is the member the runner is reported under.
+func (runner *liveRunner) memberID() string {
+	if runner.member == nil {
+		return LiveRunnerOperatorMember
+	}
+	return runner.member.id
+}

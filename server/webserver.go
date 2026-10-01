@@ -60,6 +60,7 @@ func (s *LivepeerServer) cliWebServerHandlers(bindAddr string) *http.ServeMux {
 	mux.Handle("/getAISessionPoolsInfo", s.getAIPoolsInfoHandler())
 	mux.Handle("/getNetworkCapabilities", s.getNetworkCapabilitiesHandler())
 	mux.Handle("POST /registerLiveRunners", s.registerLiveRunnersHandler())
+	s.registerLiveRunnerAdminRoutes(mux)
 
 	// Rounds
 	mux.Handle("/currentRound", currentRoundHandler(client))
