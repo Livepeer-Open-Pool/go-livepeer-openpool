@@ -308,16 +308,16 @@ Every event is a JSON object with this envelope plus the type's fields. Messages
 | `live_runner_state_changed` | `setState` | `from`, `to`, `reason` |
 | `live_runner_removed` | runner leaves the registry | `reason`: `expired`, `unregistered`, `evicted`; `evict_reason` when evicted |
 | `live_runner_session_reserved` | session reserved | `session_id`, `sender` (payer address, or `""`), `paid`, `price_info`, `via`: `runner` or `pool` |
-| `live_runner_session_released` | session released | `session_id`, `duration_ms`, `reason`: `completed`, `stopped`, `payment_failed`, `runner_removed`, `runner_unhealthy`, `error`; `units_total`, `fee_wei_total` |
+| `live_runner_session_released` | session released | `session_id`, `sender`, `paid`, `duration_ms`, `reason`: `completed` (a single-shot request finished), `stopped`, `payment_failed`, `runner_removed`, `runner_unhealthy`, `expired` (a probe nobody stopped); `units_total`, `fee_wei_total` |
 | `live_runner_fee_debited` | each successful debit for a live-runner session | `session_id`, `sender`, `units`, `fee_wei`, `balance_wei` |
 
-Notes for the implementer:
+How it is built:
 
-- `AccountPayment` has no runner context and returns without debiting when the price is zero. Emit the fee event at its two call sites in `reservePaidLiveRunnerSession` (`server/ai_http.go:403`, `:422`), which know the runner, only after a debit happened.
-- `releaseSessionLocked` (`live_runner.go:1534`) takes no reason today; the release reason has to be threaded through its callers (`live_runner.go:803`, `:1070`, `:1495`, `:1526` and the `ReleaseSession` calls in `server/ai_http.go`).
-- `units_total` and `fee_wei_total` are kept on `liveRunnerSession` and are the second copy of the session's value: if per-tick events are lost, the pool service can settle from the released event. Fees are rationals; totals are summed exactly and each emitted value is rounded once to a whole-wei decimal string.
+- Fee events are emitted after each successful debit at the two `AccountPayment` call sites in `reservePaidLiveRunnerSession`, which know the runner. Nothing is emitted when nothing was debited (an unpriced session).
+- `units_total` and `fee_wei_total` are kept on the session and are the second copy of its value: if per-tick events are lost, the pool service can settle from the released event. Fees are rationals; totals are summed exactly and each emitted value is rounded once to a whole-wei decimal string.
+- Events are emitted where the thing happens, often under a registry lock, so emitting never blocks: events wait in a queue in the registry (4096) that one goroutine drains, in order, into the Kafka producer's own queue (1000).
 
-Delivery: `SendQueueEventAsync` by default; `ReserveQueueEvent` with `-kafkaEnqueueTimeout` when `-kafkaRequireDelivery` is set (that flag's startup check must accept the orchestrator topic). A failed enqueue never fails the session or the debit, since the payment has already been received. It increments a new `livepeer_orchestrator_events_dropped_total{event_type}` counter and logs `session_id`, `runner_id`, `member_id` and `fee_wei` at error level.
+Delivery: by default an event that finds the Kafka queue full is dropped at once; with `-kafkaRequireDelivery` it waits up to `-kafkaEnqueueTimeout` for room first (that flag's startup check accepts the orchestrator topic). A dropped event never fails the session or the debit, since the payment has already been received. It increments `livepeer_orchestrator_events_dropped_total{event_type}` and the whole event is written to the log at error level, so the record can be rebuilt from logs.
 
 ## Change 7: reverse tunnel
 

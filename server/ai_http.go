@@ -13,6 +13,7 @@ import (
 	"image"
 	"io"
 	"log/slog"
+	"math/big"
 	"mime"
 	"mime/multipart"
 	"net"
@@ -129,6 +130,9 @@ type liveRunnerManager interface {
 	PaymentInfo(runnerID string) (*runner.LiveRunnerPriceInfo, error)
 	ReserveSession(runnerID string, sessionID ...string) (string, string, error)
 	ReleaseSession(runnerID, sessionID string) error
+	ReservePaidSession(runnerID, sessionID, sender string) (string, string, error)
+	ReleaseSessionWithReason(runnerID, sessionID, reason string) error
+	RecordSessionFee(runnerID, sessionID, sender string, units int64, fee, balance *big.Rat) error
 	SessionPriceInfo(runnerID, sessionID string) (runner.LiveRunnerPriceInfo, error)
 	RunnerMode(runnerID string) (string, error)
 	PoolMode() bool
@@ -438,7 +442,7 @@ func (h *lphttp) reservePaidLiveRunnerSession(
 
 	// For easier correlation across orchestrator, gateway, and signer.
 	sessionID := string(segData.ManifestID)
-	sessionID, appURL, err := manager.ReserveSession(runnerID, sessionID)
+	sessionID, appURL, err := manager.ReservePaidSession(runnerID, sessionID, getPaymentSender(payment).Hex())
 	if err != nil {
 		respondWithLiveRunnerError(w, err)
 		return "", "", false
@@ -446,7 +450,7 @@ func (h *lphttp) reservePaidLiveRunnerSession(
 	ctx = clog.AddVal(ctx, "session_id", sessionID)
 
 	if err := h.orchestrator.ProcessPayment(ctx, payment, segData.ManifestID); err != nil {
-		if releaseErr := manager.ReleaseSession(runnerID, sessionID); releaseErr != nil {
+		if releaseErr := manager.ReleaseSessionWithReason(runnerID, sessionID, runner.LiveRunnerReleasePaymentFailed); releaseErr != nil {
 			clog.Errorf(ctx, "Error releasing live runner session after payment failure err=%v", releaseErr)
 		}
 		respondWithError(w, err.Error(), http.StatusBadRequest)
@@ -455,14 +459,14 @@ func (h *lphttp) reservePaidLiveRunnerSession(
 
 	paymentReceiver := livePaymentReceiver{orchestrator: h.orchestrator}
 	if fixedPayment {
-		err := paymentReceiver.AccountPayment(ctx, &SegmentInfoReceiver{
+		err := h.accountLiveRunnerPayment(ctx, paymentReceiver, manager, runnerID, &SegmentInfoReceiver{
 			sender:    getPaymentSender(payment),
 			units:     1,
 			priceInfo: payment.GetExpectedPrice(),
 			sessionID: string(segData.ManifestID),
 		})
 		if err != nil {
-			if releaseErr := manager.ReleaseSession(runnerID, sessionID); releaseErr != nil {
+			if releaseErr := manager.ReleaseSessionWithReason(runnerID, sessionID, runner.LiveRunnerReleasePaymentFailed); releaseErr != nil {
 				clog.Errorf(ctx, "Error releasing fixed-price live runner session after accounting failure err=%v", releaseErr)
 			}
 			respondWithError(w, err.Error(), http.StatusBadRequest)
@@ -474,7 +478,7 @@ func (h *lphttp) reservePaidLiveRunnerSession(
 	// time based payments
 	monitorCtx, cancel := context.WithCancel(ctx)
 	accountPaymentFunc := func(units int64) error {
-		err := paymentReceiver.AccountPayment(monitorCtx, &SegmentInfoReceiver{
+		err := h.accountLiveRunnerPayment(monitorCtx, paymentReceiver, manager, runnerID, &SegmentInfoReceiver{
 			sender:    getPaymentSender(payment),
 			units:     units,
 			priceInfo: payment.GetExpectedPrice(),
@@ -482,7 +486,7 @@ func (h *lphttp) reservePaidLiveRunnerSession(
 		})
 		if err != nil {
 			clog.Errorf(monitorCtx, "Error accounting live runner payment, releasing session err=%v", err)
-			if releaseErr := manager.ReleaseSession(runnerID, sessionID); releaseErr != nil {
+			if releaseErr := manager.ReleaseSessionWithReason(runnerID, sessionID, runner.LiveRunnerReleasePaymentFailed); releaseErr != nil {
 				clog.Errorf(monitorCtx, "Error releasing live runner session after payment failure err=%v", releaseErr)
 			}
 			if cancelRequest != nil {
@@ -513,6 +517,27 @@ func (h *lphttp) reservePaidLiveRunnerSession(
 		}
 	}()
 	return sessionID, appURL, true
+}
+
+// accountLiveRunnerPayment debits a live runner session's fee and tells the
+// registry what was debited, which is where the session's fee event and its
+// totals come from. A failure to record never fails the debit: the payment
+// has already been received.
+func (h *lphttp) accountLiveRunnerPayment(ctx context.Context, receiver livePaymentReceiver, manager liveRunnerManager, runnerID string, info *SegmentInfoReceiver) error {
+	if err := receiver.AccountPayment(ctx, info); err != nil {
+		return err
+	}
+	if info.priceInfo == nil || info.priceInfo.PricePerUnit == 0 {
+		// AccountPayment debits nothing for an unpriced session.
+		return nil
+	}
+	fee := calculateFee(info.units, info.priceInfo)
+	balance := h.orchestrator.Balance(info.sender, core.ManifestID(info.sessionID))
+	if err := manager.RecordSessionFee(runnerID, info.sessionID, info.sender.Hex(), info.units, fee, balance); err != nil {
+		clog.Errorf(ctx, "Live runner fee debited but not recorded runner_id=%s session_id=%s sender=%s units=%d fee_wei=%s err=%v",
+			runnerID, info.sessionID, info.sender.Hex(), info.units, fee.FloatString(0), err)
+	}
+	return nil
 }
 
 func preparePaymentProcessor(unit string) (func(context.Context, time.Duration, func(int64) error) *LivePaymentProcessor, error) {
@@ -943,7 +968,7 @@ func (h *lphttp) ProxyLiveRunnerSingleShot(w http.ResponseWriter, r *http.Reques
 		}
 	}
 	defer func() {
-		if err := manager.ReleaseSession(runnerID, sessionID); err != nil {
+		if err := manager.ReleaseSessionWithReason(runnerID, sessionID, runner.LiveRunnerReleaseCompleted); err != nil {
 			slog.Error("error releasing single-shot session", "runner_id", runnerID, "session_id", sessionID, "err", err)
 		}
 	}()

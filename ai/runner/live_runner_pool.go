@@ -451,10 +451,10 @@ func (r *LiveRunnerRegistry) ProbeRunnerMode(runnerID string) (string, error) {
 func (r *LiveRunnerRegistry) ReserveProbeSession(runnerID string) (string, string, error) {
 	if r.offchain {
 		// Off-chain customer sessions are unpaid too and get a generated id.
-		return r.reserveSession(runnerID, true)
+		return r.reserveSession(runnerID, liveRunnerSessionOptions{probe: true})
 	}
 	// On-chain a customer's session id is the payment's manifest id.
-	return r.reserveSession(runnerID, true, string(core.RandomManifestID()))
+	return r.reserveSession(runnerID, liveRunnerSessionOptions{probe: true}, string(core.RandomManifestID()))
 }
 
 // releaseExpiredProbeSessions releases probe sessions nobody stopped.
@@ -470,7 +470,7 @@ func (r *LiveRunnerRegistry) releaseExpiredProbeSessions(now time.Time) {
 		for sessionID, session := range runner.sessions {
 			if session.probe && now.Sub(session.createdAt) > liveRunnerProbeSessionTTL {
 				slog.Warn("live runner probe session expired", "runner_id", runner.RunnerID, "session_id", sessionID)
-				runner.releaseSessionLocked(sessionID)
+				runner.releaseSessionForLocked(sessionID, LiveRunnerReleaseExpired)
 			}
 		}
 		runner.mu.Unlock()
@@ -627,6 +627,7 @@ func (r *LiveRunnerRegistry) SetRunnerState(runnerID, state, reason string) erro
 	defer unlock()
 	from := runner.stateLocked()
 	runner.state = state
+	runner.emitLocked(LiveRunnerEventStateChanged, map[string]interface{}{"from": from, "to": state, "reason": reason})
 	slog.Info("live runner state changed", "runner_id", runner.RunnerID, "app", runner.App, "member_id", runner.memberID(), "from", from, "to", state, "reason", reason)
 	return nil
 }
@@ -680,6 +681,7 @@ func (r *LiveRunnerRegistry) EvictMember(memberID, reason string) (int, error) {
 // evictLocked requires runner.mu.
 func (r *LiveRunnerRegistry) evictLocked(route string, runner *liveRunner, reason string) {
 	slog.Info("live runner evicted", "runner_id", runner.RunnerID, "app", runner.App, "member_id", runner.memberID(), "reason", reason)
+	runner.evictReason = reason
 	r.mu.Lock()
 	if r.runners[route] == runner && !runner.removed {
 		r.removeRunnerWithRunnerLocked(route, runner, "evicted")

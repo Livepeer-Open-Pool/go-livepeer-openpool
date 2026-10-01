@@ -161,6 +161,7 @@ func NewLivepeerConfig(fs *flag.FlagSet) LivepeerConfig {
 	cfg.KafkaUsername = fs.String("kafkaUser", *cfg.KafkaUsername, "Kafka Username")
 	cfg.KafkaPassword = fs.String("kafkaPassword", *cfg.KafkaPassword, "Kafka Password")
 	cfg.KafkaGatewayTopic = fs.String("kafkaGatewayTopic", *cfg.KafkaGatewayTopic, "Kafka Topic used to send gateway logs")
+	cfg.KafkaOrchTopic = fs.String("kafkaOrchestratorTopic", *cfg.KafkaOrchTopic, "Kafka Topic used to send orchestrator events: LiveRunner registrations, state changes, sessions and every fee debited (requires -monitor)")
 	cfg.KafkaRequireDelivery = fs.Bool("kafkaRequireDelivery", *cfg.KafkaRequireDelivery, "Refuse to sign remote payments when the Kafka event queue cannot accept the accounting event (requires -monitor and Kafka)")
 	cfg.KafkaEnqueueTimeout = fs.Duration("kafkaEnqueueTimeout", *cfg.KafkaEnqueueTimeout, "Maximum time to wait for space in the Kafka event queue when -kafkaRequireDelivery is set (default 2s)")
 

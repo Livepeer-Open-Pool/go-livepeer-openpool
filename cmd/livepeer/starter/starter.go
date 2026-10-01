@@ -196,6 +196,7 @@ type LivepeerConfig struct {
 	KafkaUsername              *string
 	KafkaPassword              *string
 	KafkaGatewayTopic          *string
+	KafkaOrchTopic             *string
 	KafkaRequireDelivery       *bool
 	KafkaEnqueueTimeout        *time.Duration
 	MediaMTXApiPassword        *string
@@ -346,6 +347,7 @@ func DefaultLivepeerConfig() LivepeerConfig {
 	defaultKafkaUsername := ""
 	defaultKafkaPassword := ""
 	defaultKafkaGatewayTopic := ""
+	defaultKafkaOrchTopic := ""
 	defaultKafkaRequireDelivery := false
 	defaultKafkaEnqueueTimeout := 2 * time.Second
 
@@ -486,6 +488,7 @@ func DefaultLivepeerConfig() LivepeerConfig {
 		KafkaUsername:         &defaultKafkaUsername,
 		KafkaPassword:         &defaultKafkaPassword,
 		KafkaGatewayTopic:     &defaultKafkaGatewayTopic,
+		KafkaOrchTopic:        &defaultKafkaOrchTopic,
 		KafkaRequireDelivery:  &defaultKafkaRequireDelivery,
 		KafkaEnqueueTimeout:   &defaultKafkaEnqueueTimeout,
 	}
@@ -813,8 +816,8 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 		}
 	}
 	if *cfg.KafkaRequireDelivery {
-		if !*cfg.Monitor || *cfg.KafkaBootstrapServers == "" || *cfg.KafkaGatewayTopic == "" {
-			exit("-kafkaRequireDelivery requires -monitor, -kafkaBootstrapServers and -kafkaGatewayTopic")
+		if !*cfg.Monitor || *cfg.KafkaBootstrapServers == "" || (*cfg.KafkaGatewayTopic == "" && *cfg.KafkaOrchTopic == "") {
+			exit("-kafkaRequireDelivery requires -monitor, -kafkaBootstrapServers and -kafkaGatewayTopic or -kafkaOrchestratorTopic")
 		}
 		if *cfg.KafkaEnqueueTimeout <= 0 {
 			exit("-kafkaEnqueueTimeout must be positive, got %v", *cfg.KafkaEnqueueTimeout)
@@ -2123,6 +2126,12 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 					glog.Exitf("invalid -liveRunnerProxyUrl: %v", err)
 				}
 			}
+			var liveRunnerEvents runner.LiveRunnerEventSink
+			if lpmon.OrchestratorEventsEnabled() {
+				liveRunnerEvents = lpmon.SendOrchestratorEvent
+			} else if admitter != nil {
+				glog.Warning("LiveRunner pool mode without orchestrator events: set -monitor, -kafkaBootstrapServers and -kafkaOrchestratorTopic to record what each member's runners earn")
+			}
 			n.LiveRunnerManager = runner.NewLiveRunnerRegistry(runner.LiveRunnerRegistryConfig{
 				Host:             liveRunnerHost{RunnerHost: orch, LivepeerNode: n},
 				Onchain:          *cfg.Network != "offchain",
@@ -2130,6 +2139,7 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 				Admitter:         admitter,
 				OrchAddress:      liveRunnerOrchAddress(orch.Address()),
 				Prices:           liveRunnerPrices,
+				Events:           liveRunnerEvents,
 			})
 			if n.OrchSecret == "" && admitter == nil {
 				glog.Warning("No -orchSecret configured; dynamic LiveRunner heartbeat registration is disabled")

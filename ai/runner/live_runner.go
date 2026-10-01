@@ -239,6 +239,7 @@ type liveRunner struct {
 	member          *liveRunnerMember // set for a runner admitted in pool mode
 	remoteAddr      string
 	registeredAt    time.Time
+	registry        *LiveRunnerRegistry // where the runner's events go
 
 	// all fields below are mutable and need to be protected by mu
 	mu sync.Mutex
@@ -256,6 +257,7 @@ type liveRunner struct {
 	// registeredCapacity is the capacity a pool runner was admitted with, the
 	// most its later heartbeats may report.
 	registeredCapacity int
+	evictReason        string // why the operator evicted the runner, for its removal event
 }
 
 type liveRunnerSession struct {
@@ -264,7 +266,11 @@ type liveRunnerSession struct {
 	priceInfo LiveRunnerPriceInfo
 	channels  map[string]*liveRunnerTrickleChannel
 	proxies   map[string]proxyTarget
-	probe     bool // an unpaid session the pool service opened to test the runner
+	probe     bool     // an unpaid session the pool service opened to test the runner
+	sender    string   // the payer's address, empty for an unpaid session
+	via       string   // how the customer reached the runner
+	units     int64    // units debited so far
+	fee       *big.Rat // wei debited so far
 }
 
 type proxyTarget struct {
@@ -292,6 +298,8 @@ type LiveRunnerRegistry struct {
 	stopRegistryOnce  sync.Once
 	admitter          LiveRunnerAdmitter // non-nil in pool mode
 	orchAddress       string
+	eventSink         LiveRunnerEventSink
+	events            chan liveRunnerEvent // nil when events are off
 
 	pricesMu sync.RWMutex
 	prices   map[string]LiveRunnerPriceInfo // the operator's price per app
@@ -326,6 +334,9 @@ type LiveRunnerRegistryConfig struct {
 	// Prices is the operator's price per app; it must already be normalized
 	// (ParseLiveRunnerPrices).
 	Prices LiveRunnerPriceTable
+	// Events publishes the registry's events: registrations, state changes,
+	// sessions and fees. Nil turns them off.
+	Events LiveRunnerEventSink
 }
 
 var liveRunnerChannelNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
@@ -367,6 +378,11 @@ func NewLiveRunnerRegistry(config LiveRunnerRegistryConfig) *LiveRunnerRegistry 
 		admitter:          config.Admitter,
 		orchAddress:       config.OrchAddress,
 		prices:            config.Prices.Apps,
+	}
+	if config.Events != nil {
+		r.eventSink = config.Events
+		r.events = make(chan liveRunnerEvent, liveRunnerEventQueueSize)
+		go r.eventLoop()
 	}
 	go r.healthLoop()
 	go r.expiryLoop()
@@ -483,6 +499,7 @@ func (r *LiveRunnerRegistry) HeartbeatFrom(req LiveRunnerHeartbeatRequest, auth,
 			member:          member,
 			remoteAddr:      remoteAddr,
 			registeredAt:    time.Now(),
+			registry:        r,
 			route:           req.RunnerID, // No label-based routing for now
 			sessions:        make(map[string]*liveRunnerSession),
 		}
@@ -507,6 +524,7 @@ func (r *LiveRunnerRegistry) HeartbeatFrom(req LiveRunnerHeartbeatRequest, auth,
 		}
 		slog.Info("live runner registered", "runner_id", runner.RunnerID, "app", runner.App, "runner_url", runner.RunnerURL)
 		runner.updatePriceConverterLocked()
+		runner.emitRegisteredLocked()
 
 		// SessionIDs in the response come from the orchestrator's authoritative
 		// active sessions and may differ from session_ids reported in the request.
@@ -859,6 +877,7 @@ func (r *LiveRunnerRegistry) RegisterStaticRunners(cfg StaticLiveRunnerConfig) (
 				seed:     newRunnerSeed(),
 				static:   true,
 				offchain: r.offchain,
+				registry: r,
 				sessions: make(map[string]*liveRunnerSession),
 			}
 			staticRunner.RunnerID = "runner_" + randomStr(liveRunnerIDRandomBytes)
@@ -884,7 +903,7 @@ func (r *LiveRunnerRegistry) RegisterStaticRunners(cfg StaticLiveRunnerConfig) (
 		} else {
 			req.Status = "unavailable"
 			for sessionID := range staticRunner.sessions {
-				staticRunner.releaseSessionLocked(sessionID)
+				staticRunner.releaseSessionForLocked(sessionID, LiveRunnerReleaseUnhealthy)
 			}
 		}
 		staticRunner.removed = false
@@ -905,6 +924,7 @@ func (r *LiveRunnerRegistry) RegisterStaticRunners(cfg StaticLiveRunnerConfig) (
 
 		if existingStatic[entry.Label] == nil {
 			slog.Info("static live runner registered", "runner_id", staticRunner.RunnerID, "app", req.App, "runner_url", req.RunnerURL, "healthy", health[i])
+			staticRunner.emitRegisteredLocked()
 		}
 
 		registrations = append(registrations, StaticLiveRunnerRegistration{
@@ -1071,10 +1091,11 @@ func (r *LiveRunnerRegistry) Unregister(runnerID, auth string) error {
 // a public app URL, while single-shot reservations return the runner endpoint
 // for internal forwarding.
 func (r *LiveRunnerRegistry) ReserveSession(runnerID string, optSessionID ...string) (string, string, error) {
-	return r.reserveSession(runnerID, false, optSessionID...)
+	return r.reserveSession(runnerID, liveRunnerSessionOptions{}, optSessionID...)
 }
 
-func (r *LiveRunnerRegistry) reserveSession(runnerID string, probe bool, optSessionID ...string) (string, string, error) {
+func (r *LiveRunnerRegistry) reserveSession(runnerID string, opts liveRunnerSessionOptions, optSessionID ...string) (string, string, error) {
+	probe := opts.probe
 	runner, unlock, err := r.lockLiveRunner(runnerID)
 	if err != nil {
 		return "", "", err
@@ -1117,6 +1138,11 @@ func (r *LiveRunnerRegistry) reserveSession(runnerID string, probe bool, optSess
 		channels:  make(map[string]*liveRunnerTrickleChannel),
 		proxies:   make(map[string]proxyTarget),
 		probe:     probe,
+		sender:    opts.sender,
+		via:       opts.via,
+	}
+	if session.via == "" {
+		session.via = LiveRunnerViaRunner
 	}
 	appURL := r.host.ServiceURI().JoinPath("apps", runner.route, "session", id, "app").String()
 	if runner.Mode == LiveRunnerModeSingleShot {
@@ -1132,6 +1158,7 @@ func (r *LiveRunnerRegistry) reserveSession(runnerID string, probe bool, optSess
 	}
 	runner.sessions[id] = session
 	runner.sendSessionEvent("reserved", id)
+	runner.emitSessionReservedLocked(id, session)
 	slog.Info("live runner session reserved", "runner_id", runner.RunnerID, "session_id", id, "app", runner.App)
 	return id, appURL, nil
 }
@@ -1175,12 +1202,18 @@ func (r *LiveRunnerRegistry) SessionPriceInfo(runnerID, sessionID string) (LiveR
 }
 
 func (r *LiveRunnerRegistry) ReleaseSession(runnerID, sessionID string) error {
+	return r.ReleaseSessionWithReason(runnerID, sessionID, LiveRunnerReleaseStopped)
+}
+
+// ReleaseSessionWithReason is ReleaseSession with the reason the session's
+// released event reports.
+func (r *LiveRunnerRegistry) ReleaseSessionWithReason(runnerID, sessionID, reason string) error {
 	runner, unlock, err := r.lockLiveRunner(runnerID)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	runner.releaseSessionLocked(sessionID)
+	runner.releaseSessionForLocked(sessionID, reason)
 	return nil
 }
 
@@ -1615,7 +1648,7 @@ func (r *LiveRunnerRegistry) checkStaticRunnerHealth() {
 			} else {
 				c.runner.Status = "unavailable"
 				for sessionID := range c.runner.sessions {
-					c.runner.releaseSessionLocked(sessionID)
+					c.runner.releaseSessionForLocked(sessionID, LiveRunnerReleaseUnhealthy)
 				}
 			}
 			if c.runner.Status != prevStatus {
@@ -1646,18 +1679,20 @@ func (r *LiveRunnerRegistry) removeRunnerWithRunnerLocked(runnerID string, runne
 	runner.closeTunnelLocked("removed")
 	runner.closeChannelsLocked()
 	for sessionID := range runner.sessions {
-		runner.releaseSessionLocked(sessionID)
+		runner.releaseSessionForLocked(sessionID, LiveRunnerReleaseRunnerRemoved)
 	}
+	runner.emitRemovedLocked(reason)
 	runner.stopPriceConverterLocked()
 	if r.runners[runnerID] == runner {
 		delete(r.runners, runnerID)
 	}
 }
 
-func (runner *liveRunner) releaseSessionLocked(sessionID string) {
-	// releaseSessionLocked requires runner.mu.
+func (runner *liveRunner) releaseSessionForLocked(sessionID, reason string) {
+	// releaseSessionForLocked requires runner.mu.
 	if session := runner.sessions[sessionID]; session != nil {
 		runner.sendSessionEvent("released", sessionID)
+		runner.emitSessionReleasedLocked(sessionID, session, reason)
 		session.closeChannelsLocked()
 		slog.Info("live runner session released", "runner_id", runner.RunnerID, "session_id", sessionID, "app", runner.App, "duration", time.Since(session.createdAt))
 	}
