@@ -1,6 +1,6 @@
 # Change request: a public GPU pool for Live Runners (revision 2)
 
-**Status:** draft, 2026-10-01. Revises the 2026-09-30 draft (`go-livepeer-live-runner-pool.md` in the BlueClaw platform repository).\
+**Status:** changes 0 to 8 are built on this branch, 2026-10-01; the pool service is not. Revises the 2026-09-30 draft (`go-livepeer-live-runner-pool.md` in the BlueClaw platform repository).\
 **Repository:** this fork, branch `feat/open-pool-enhancements`, inspected at `5ed374e6` (v0.9.3 plus the Live Runner tunnel). Line numbers refer to that commit.\
 **Reader:** the engineer building these changes in go-livepeer, and later the engineer building the pool service.
 
@@ -195,6 +195,8 @@ A `probation` runner answers `404` to a non-probe request before any other check
 - Header valid: the 402 challenge and the payment ticker are skipped; no `ProcessPayment`, no `AccountPayment`. The session is otherwise ordinary: it counts against `capacity`, gets a session token, is proxied, and is released the same ways.
 - The header is rejected with `400` on `/pool/…` routes: a probe names its runner.
 - The session event (change 6) carries `paid: false` and an empty `sender`.
+- A probe session nobody stops is released after ten minutes (released with reason `expired`), so a pool service that dies mid-test does not hold a runner's capacity.
+- On-chain, a probe's session id has the shape of a payment's manifest id, as a customer's does.
 
 **The runner must not be able to tell a probe from real work.** The proxy forwards every inbound header to the runner (`server/ai_http.go:940-953`). Before forwarding to a pool runner it must remove `Livepeer-Probe-Secret` (otherwise members learn the secret), and `Livepeer-Payment` and `Livepeer-Segment` (otherwise their absence marks a probe, and a runner could behave well only when tested).
 
@@ -215,6 +217,7 @@ Registered in `cliWebServerHandlers` (`server/webserver.go`), beside `POST /regi
       "payout_address": "0xabcd…1234",
       "state": "active",
       "status": "ready",
+      "ready": true,
       "app": "vllm/qwen2.5-7b-instruct",
       "mode": "single-shot",
       "version": "vllm-app:1.4.2",
@@ -233,6 +236,8 @@ Registered in `cliWebServerHandlers` (`server/webserver.go`), beside `POST /regi
   ]
 }
 ```
+
+`status` is what the runner reports; `ready` is whether it can take work now, which for a tunneled runner also needs its tunnel connected.
 
 `POST /liveRunner/setState` — form fields `runner_id`, `state`, optional `reason`. `204`; `404` unknown runner; `400` bad state. Leaving `active` does not release running sessions.
 
@@ -363,7 +368,7 @@ Go tests beside `ai/runner/live_runner_test.go` and `server/ai_http_test.go`, wi
 12. **Events.** A paid hour-priced session with three accounting ticks emits `reserved`, three `fee_debited` whose `fee_wei` equal the debited fees, and `released` with matching totals; all carry the same `orch_address`, `runner_id`, `member_id`, `session_id`, and distinct `event_id`s. With a full queue and `-kafkaRequireDelivery` off, the session succeeds and the drop counter increments.
 13. **App routing.** Three `active` runners for app `a` with capacities 1, 2, 2: reservations through `/pool/<a>/session` land on the least-loaded runner each time, the sixth gets `503`, the response carries `runner_id`, a `probation` fourth runner is never chosen, and a follow-up payment to the challenge's `payment_url` reaches the right session. `/discovery` lists `apps[a]` with `runners 3`, `capacity 5` and a decreasing `capacity_available`. An app with a `/` in its name round-trips through the encoded route. A bad encoding → `400`; an unconfigured app → `404`.
 14. **Command.** `livepeer_runner_tunnel -credential` registers against a pool-mode orchestrator without `-price`, logs the echoed price, logs the reason on a `403`, and keeps retrying.
-15. **Box.** The `box` tunnel harness gains a stub webhook: a runner joins in `probation`, a probe succeeds, `setState active` lists it, a paid call succeeds, and `evict` removes it.
+15. **Box.** The `box` tunnel harness gains a stub webhook: a runner joins in `probation`, a probe succeeds, `setState active` lists it, a paid call succeeds, and `evict` removes it. **Not built yet**; items 1 to 14 are covered by Go tests in `ai/runner`, `server` and `monitor`.
 
 ## Compatibility
 
