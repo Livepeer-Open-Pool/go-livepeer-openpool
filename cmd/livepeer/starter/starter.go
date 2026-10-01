@@ -106,6 +106,7 @@ type LivepeerConfig struct {
 	LiveRunnerAuthWebhookURL   *string
 	LiveRunnerAuthTimeout      *time.Duration
 	LiveRunnerPoolSecret       *string
+	LiveRunnerPrices           *string
 	Gateway                    *bool
 	Broadcaster                *bool
 	OrchSecret                 *string
@@ -257,6 +258,7 @@ func DefaultLivepeerConfig() LivepeerConfig {
 	defaultLiveRunnerAuthWebhookURL := ""
 	defaultLiveRunnerAuthTimeout := 5 * time.Second
 	defaultLiveRunnerPoolSecret := ""
+	defaultLiveRunnerPrices := ""
 	defaultAIModels := ""
 	defaultAIModelsDir := ""
 	defaultAIRunnerImage := "livepeer/ai-runner:latest"
@@ -394,6 +396,7 @@ func DefaultLivepeerConfig() LivepeerConfig {
 		LiveRunnerAuthWebhookURL: &defaultLiveRunnerAuthWebhookURL,
 		LiveRunnerAuthTimeout:    &defaultLiveRunnerAuthTimeout,
 		LiveRunnerPoolSecret:     &defaultLiveRunnerPoolSecret,
+		LiveRunnerPrices:         &defaultLiveRunnerPrices,
 		AIModels:                 &defaultAIModels,
 		AIModelsDir:              &defaultAIModelsDir,
 		AIRunnerImage:            &defaultAIRunnerImage,
@@ -2101,6 +2104,19 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 			if n.OrchSecret == "" && *cfg.LiveRunnerConfig == "" && admitter == nil {
 				glog.Exit("running with -useLiveRunners requires -orchSecret or -liveRunnerAuthWebhookUrl")
 			}
+			var liveRunnerPrices runner.LiveRunnerPriceTable
+			if *cfg.LiveRunnerPrices != "" {
+				pricesJSON, err := os.ReadFile(*cfg.LiveRunnerPrices)
+				if err != nil {
+					glog.Exitf("error reading -liveRunnerPrices: %v", err)
+				}
+				if liveRunnerPrices, err = runner.ParseLiveRunnerPrices(pricesJSON); err != nil {
+					glog.Exitf("invalid -liveRunnerPrices: %v", err)
+				}
+				glog.Infof("Loaded LiveRunner prices for %d apps from %s", len(liveRunnerPrices.Apps), *cfg.LiveRunnerPrices)
+			} else if admitter != nil {
+				glog.Warning("LiveRunner pool mode without -liveRunnerPrices: no app is offered, so every registration is refused until prices are set")
+			}
 			if cfg.LiveRunnerProxyURL != nil && *cfg.LiveRunnerProxyURL != "" {
 				if err := runner.ValidateProxyURLTemplate(*cfg.LiveRunnerProxyURL, orch.ServiceURI()); err != nil {
 					glog.Exitf("invalid -liveRunnerProxyUrl: %v", err)
@@ -2112,6 +2128,7 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 				ProxyURLTemplate: *cfg.LiveRunnerProxyURL,
 				Admitter:         admitter,
 				OrchAddress:      liveRunnerOrchAddress(orch.Address()),
+				Prices:           liveRunnerPrices,
 			})
 			if n.OrchSecret == "" && admitter == nil {
 				glog.Warning("No -orchSecret configured; dynamic LiveRunner heartbeat registration is disabled")

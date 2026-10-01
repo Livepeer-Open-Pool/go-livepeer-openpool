@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -11,6 +12,10 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/livepeer/go-livepeer/common"
+	"github.com/livepeer/go-livepeer/core"
+	"github.com/livepeer/go-livepeer/eth"
 )
 
 // fakeAdmitter records the admission requests it sees and answers them with
@@ -44,15 +49,53 @@ func admitAs(memberID, state string, maxRunners int) func(LiveRunnerAdmissionReq
 	}
 }
 
+// poolTestPrices is the operator's price table in these tests; it lists the
+// app poolTestHeartbeat registers.
+func poolTestPrices() LiveRunnerPriceTable {
+	return LiveRunnerPriceTable{Apps: map[string]LiveRunnerPriceInfo{
+		"vllm/qwen2.5-7b-instruct": {Price: "10", Currency: "usd", Unit: "hour"},
+		"echo":                     {Price: "0.001", Currency: "usd", Unit: "fixed"},
+	}}
+}
+
 func newPoolTestRegistry(t *testing.T, admitter LiveRunnerAdmitter) *LiveRunnerRegistry {
 	t.Helper()
 	registry := newLiveRunnerTestRegistryWithConfig(LiveRunnerRegistryConfig{
 		Host:        liveRunnerTestHost{},
 		Admitter:    admitter,
 		OrchAddress: "0x00000000000000000000000000000000000000AA",
+		Prices:      poolTestPrices(),
 	})
 	t.Cleanup(registry.Stop)
 	return registry
+}
+
+// newOnchainPoolTestRegistry is a pool registry that prices runners, with
+// 1 ETH at 2000 USD.
+func newOnchainPoolTestRegistry(t *testing.T, admitter LiveRunnerAdmitter) *LiveRunnerRegistry {
+	t.Helper()
+	prevWatcher := core.PriceFeedWatcher
+	core.PriceFeedWatcher = stubPriceFeedWatcher{price: eth.PriceData{Price: big.NewRat(2000, 1)}}
+	t.Cleanup(func() { core.PriceFeedWatcher = prevWatcher })
+	registry := newLiveRunnerTestRegistryWithConfig(LiveRunnerRegistryConfig{
+		Host:        liveRunnerTestHost{},
+		Onchain:     true,
+		Admitter:    admitter,
+		OrchAddress: "0x00000000000000000000000000000000000000AA",
+		Prices:      poolTestPrices(),
+	})
+	t.Cleanup(registry.Stop)
+	return registry
+}
+
+// weiPerSecond is the converted price PaymentInfo reports for an hourly USD
+// price at 2000 USD per ETH.
+func weiPerSecond(t *testing.T, usdPerHour int64) string {
+	t.Helper()
+	weiPerHour := new(big.Int).Mul(big.NewInt(usdPerHour), big.NewInt(500_000_000_000_000))
+	price, err := common.PriceToInt64(new(big.Rat).SetFrac(weiPerHour, big.NewInt(3600)))
+	require.NoError(t, err)
+	return price.Num().String()
 }
 
 func poolTestHeartbeat() LiveRunnerHeartbeatRequest {
@@ -471,4 +514,192 @@ func TestWebhookAdmitterRejectsBadURLs(t *testing.T) {
 		_, err := NewLiveRunnerWebhookAdmitter(raw, "", time.Second)
 		require.Error(t, err, raw)
 	}
+}
+
+func TestPoolRunnerIsPricedByTheOperator(t *testing.T) {
+	registry := newOnchainPoolTestRegistry(t, &fakeAdmitter{answer: admitAs("m1", LiveRunnerStateActive, 4)})
+
+	// The runner asks for 999 USD an hour; the table says 10.
+	req := poolTestHeartbeat()
+	req.PriceInfo = LiveRunnerPriceInfo{Price: "999", Unit: "720p"}
+	resp, err := registry.HeartbeatFrom(req, "c1", "")
+	require.NoError(t, err)
+	require.Equal(t, &LiveRunnerPriceInfo{Price: "10", Currency: "usd", Unit: "hour"}, resp.PriceInfo, "the response says what the runner is offered at")
+	attachPipeTunnel(t, registry, resp.RunnerID, resp.HeartbeatSecret)
+
+	paymentInfo, err := registry.PaymentInfo(resp.RunnerID)
+	require.NoError(t, err)
+	require.Equal(t, weiPerSecond(t, 10), paymentInfo.Price.String())
+	require.Equal(t, "seconds", paymentInfo.Unit)
+
+	// A later heartbeat cannot change it either, and a runner need not send a price at all.
+	req.RunnerID = resp.RunnerID
+	next, err := registry.HeartbeatFrom(req, resp.HeartbeatSecret, "")
+	require.NoError(t, err)
+	require.Equal(t, json.Number("10"), next.PriceInfo.Price)
+	unpriced := poolTestHeartbeat()
+	second, err := registry.HeartbeatFrom(unpriced, "c1", "")
+	require.NoError(t, err)
+	require.Equal(t, json.Number("10"), second.PriceInfo.Price)
+
+	paymentInfo, err = registry.PaymentInfo(resp.RunnerID)
+	require.NoError(t, err)
+	require.Equal(t, weiPerSecond(t, 10), paymentInfo.Price.String())
+}
+
+func TestPoolRunnerMayOnlyServeAnOfferedApp(t *testing.T) {
+	for name, newRegistry := range map[string]func(*testing.T, LiveRunnerAdmitter) *LiveRunnerRegistry{
+		"onchain":  newOnchainPoolTestRegistry,
+		"offchain": newPoolTestRegistry,
+	} {
+		t.Run(name, func(t *testing.T) {
+			admitter := &fakeAdmitter{}
+			registry := newRegistry(t, admitter)
+
+			req := poolTestHeartbeat()
+			req.App = "flux/schnell"
+			req.PriceInfo = LiveRunnerPriceInfo{Price: "1"}
+			_, err := registry.HeartbeatFrom(req, "c1", "")
+			requireRunnerError(t, err, http.StatusBadRequest, "app not offered")
+			require.Len(t, admitter.seen(), 1, "the pool service sees the attempt")
+
+			// Without a price of its own the answer is the same, not a complaint about the price.
+			req.PriceInfo = LiveRunnerPriceInfo{}
+			_, err = registry.HeartbeatFrom(req, "c1", "")
+			requireRunnerError(t, err, http.StatusBadRequest, "app not offered")
+		})
+	}
+}
+
+func TestConfiguredPriceOverridesAnyRunnerOfTheApp(t *testing.T) {
+	prevWatcher := core.PriceFeedWatcher
+	core.PriceFeedWatcher = stubPriceFeedWatcher{price: eth.PriceData{Price: big.NewRat(2000, 1)}}
+	defer func() { core.PriceFeedWatcher = prevWatcher }()
+	healthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer healthSrv.Close()
+
+	// No admitter: the operator's own runners, registered with the registration secret.
+	registry := newLiveRunnerTestRegistryWithConfig(LiveRunnerRegistryConfig{
+		Host: liveRunnerTestHost{}, Onchain: true, Prices: poolTestPrices(),
+	})
+	t.Cleanup(registry.Stop)
+
+	listed := liveRunnerTestHeartbeat("listed")
+	listed.App = "vllm/qwen2.5-7b-instruct"
+	listed.PriceInfo = LiveRunnerPriceInfo{Price: "999"}
+	resp := liveRunnerTestRegister(t, registry, listed)
+	require.Equal(t, json.Number("10"), resp.PriceInfo.Price)
+	paymentInfo, err := registry.PaymentInfo("listed")
+	require.NoError(t, err)
+	require.Equal(t, weiPerSecond(t, 10), paymentInfo.Price.String())
+
+	// An app the operator did not price keeps the runner's own price, as before.
+	unlisted := liveRunnerTestHeartbeat("unlisted")
+	unlisted.PriceInfo = LiveRunnerPriceInfo{Price: "20"}
+	resp = liveRunnerTestRegister(t, registry, unlisted)
+	require.Nil(t, resp.PriceInfo)
+	paymentInfo, err = registry.PaymentInfo("unlisted")
+	require.NoError(t, err)
+	require.Equal(t, weiPerSecond(t, 20), paymentInfo.Price.String())
+
+	// Static runners of a priced app take the table price too.
+	static, err := registry.RegisterStaticRunners(StaticLiveRunnerConfig{Runners: []StaticLiveRunnerConfigEntry{{
+		Label: "static", RunnerURL: "https://runner.example.com", App: "vllm/qwen2.5-7b-instruct",
+		PriceInfo: LiveRunnerPriceInfo{Price: "999"}, HealthURL: healthSrv.URL,
+	}}})
+	require.NoError(t, err)
+	paymentInfo, err = registry.PaymentInfo(static.Runners[0].RunnerID)
+	require.NoError(t, err)
+	require.Equal(t, weiPerSecond(t, 10), paymentInfo.Price.String())
+}
+
+func TestSetPricesAppliesToNewSessionsOnly(t *testing.T) {
+	prevWatcher := core.PriceFeedWatcher
+	core.PriceFeedWatcher = stubPriceFeedWatcher{price: eth.PriceData{Price: big.NewRat(2000, 1)}}
+	defer func() { core.PriceFeedWatcher = prevWatcher }()
+	healthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer healthSrv.Close()
+
+	registry := newOnchainPoolTestRegistry(t, &fakeAdmitter{answer: admitAs("m1", LiveRunnerStateActive, 4)})
+	resp := poolTestRegister(t, registry, "c1")
+	static, err := registry.RegisterStaticRunners(StaticLiveRunnerConfig{Runners: []StaticLiveRunnerConfigEntry{{
+		Label: "static", RunnerURL: "https://runner.example.com", App: "vllm/qwen2.5-7b-instruct",
+		PriceInfo: LiveRunnerPriceInfo{Price: "1"}, HealthURL: healthSrv.URL,
+	}}})
+	require.NoError(t, err)
+	staticID := static.Runners[0].RunnerID
+	running, _, err := registry.ReserveSession(resp.RunnerID)
+	require.NoError(t, err)
+
+	require.NoError(t, registry.SetPricesJSON([]byte(`{"apps":{"vllm/qwen2.5-7b-instruct":{"price":"30","currency":"usd","unit":"hour"}}}`)))
+
+	// Both runners quote the new price at once; the static one never heartbeats.
+	for _, id := range []string{resp.RunnerID, staticID} {
+		paymentInfo, err := registry.PaymentInfo(id)
+		require.NoError(t, err)
+		require.Equal(t, weiPerSecond(t, 30), paymentInfo.Price.String(), id)
+	}
+	// The session that was running keeps the price it started at.
+	sessionPrice, err := registry.SessionPriceInfo(resp.RunnerID, running)
+	require.NoError(t, err)
+	require.Equal(t, json.Number("10"), sessionPrice.Price)
+	next, _, err := registry.ReserveSession(resp.RunnerID)
+	require.NoError(t, err)
+	sessionPrice, err = registry.SessionPriceInfo(resp.RunnerID, next)
+	require.NoError(t, err)
+	require.Equal(t, json.Number("30"), sessionPrice.Price)
+}
+
+func TestSetPricesRejectsAnInvalidTableWhole(t *testing.T) {
+	registry := newOnchainPoolTestRegistry(t, &fakeAdmitter{})
+	before := registry.Prices()
+
+	for _, body := range []string{
+		`not json`,
+		`{"apps":{"echo":{"price":"0.001","unit":"fixed"},"vllm/qwen2.5-7b-instruct":{"price":"-1"}}}`,
+		`{"apps":{"echo":{"price":"1","unit":"minute"}}}`,
+		`{"apps":{"echo":{"price":"1","currency":"eur"}}}`,
+		`{"apps":{" echo":{"price":"1"}}}`,
+		`{"apps":{"":{"price":"1"}}}`,
+	} {
+		err := registry.SetPricesJSON([]byte(body))
+		requireRunnerError(t, err, http.StatusBadRequest, "")
+		require.Equal(t, before, registry.Prices(), body)
+	}
+
+	// Currency and unit default as they do for a runner's own price.
+	require.NoError(t, registry.SetPricesJSON([]byte(`{"apps":{"echo":{"price":"2"}}}`)))
+	require.Equal(t, LiveRunnerPriceTable{Apps: map[string]LiveRunnerPriceInfo{
+		"echo": {Price: "2", Currency: "usd", Unit: "hour"},
+	}}, registry.Prices())
+}
+
+func TestRemovingAnAppFromThePriceTable(t *testing.T) {
+	registry := newOnchainPoolTestRegistry(t, &fakeAdmitter{answer: admitAs("m1", LiveRunnerStateActive, 4)})
+	resp := poolTestRegister(t, registry, "c1")
+
+	require.NoError(t, registry.SetPricesJSON([]byte(`{"apps":{"echo":{"price":"0.001","unit":"fixed"}}}`)))
+
+	// The registered runner keeps heartbeating and keeps its price.
+	req := poolTestHeartbeat()
+	req.RunnerID = resp.RunnerID
+	next, err := registry.HeartbeatFrom(req, resp.HeartbeatSecret, "")
+	require.NoError(t, err)
+	require.Nil(t, next.PriceInfo)
+	paymentInfo, err := registry.PaymentInfo(resp.RunnerID)
+	require.NoError(t, err)
+	require.Equal(t, weiPerSecond(t, 10), paymentInfo.Price.String())
+
+	// New runners for the app are refused.
+	_, err = registry.HeartbeatFrom(poolTestHeartbeat(), "c1", "")
+	requireRunnerError(t, err, http.StatusBadRequest, "app not offered")
+}
+
+func TestHeartbeatResponseCarriesNoPriceWithoutATable(t *testing.T) {
+	registry := newLiveRunnerTestRegistry()
+	t.Cleanup(registry.Stop)
+	resp := liveRunnerTestRegister(t, registry, liveRunnerTestHeartbeat("runner-1"))
+	data, err := json.Marshal(resp)
+	require.NoError(t, err)
+	require.NotContains(t, string(data), "price_info")
 }

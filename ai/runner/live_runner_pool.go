@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -323,4 +324,106 @@ func (runner *liveRunner) newWorkAllowedLocked() error {
 		return &RunnerError{StatusCode: http.StatusConflict, Message: "runner suspended"}
 	}
 	return nil
+}
+
+// LiveRunnerPriceTable is the operator's price per app: the content of the
+// -liveRunnerPrices file. A runner of a listed app is priced from the table,
+// whatever its heartbeat says, and a pool runner may only serve a listed app.
+type LiveRunnerPriceTable struct {
+	Apps map[string]LiveRunnerPriceInfo `json:"apps"`
+}
+
+// ParseLiveRunnerPrices reads a price table, returning the first entry that
+// does not validate.
+func ParseLiveRunnerPrices(data []byte) (LiveRunnerPriceTable, error) {
+	var table LiveRunnerPriceTable
+	if err := json.Unmarshal(data, &table); err != nil {
+		return LiveRunnerPriceTable{}, err
+	}
+	return normalizeLiveRunnerPrices(table)
+}
+
+func normalizeLiveRunnerPrices(table LiveRunnerPriceTable) (LiveRunnerPriceTable, error) {
+	apps := make([]string, 0, len(table.Apps))
+	for app := range table.Apps {
+		apps = append(apps, app)
+	}
+	sort.Strings(apps) // so the first error reported does not depend on map order
+	normalized := LiveRunnerPriceTable{Apps: make(map[string]LiveRunnerPriceInfo, len(apps))}
+	for _, app := range apps {
+		if app == "" || app != strings.TrimSpace(app) {
+			return LiveRunnerPriceTable{}, fmt.Errorf("apps[%q]: app must be trimmed and not empty", app)
+		}
+		priceInfo, err := normalizeLiveRunnerPriceInfo(table.Apps[app])
+		if err != nil {
+			return LiveRunnerPriceTable{}, fmt.Errorf("apps[%q]: %v", app, err)
+		}
+		normalized.Apps[app] = priceInfo
+	}
+	return normalized, nil
+}
+
+// SetPricesJSON replaces the price table with the one in data, or changes
+// nothing when data does not validate.
+func (r *LiveRunnerRegistry) SetPricesJSON(data []byte) error {
+	table, err := ParseLiveRunnerPrices(data)
+	if err != nil {
+		return &RunnerError{StatusCode: http.StatusBadRequest, Message: err.Error()}
+	}
+	r.setPrices(table)
+	return nil
+}
+
+// SetPrices replaces the whole price table. Registered runners of a listed
+// app take the new price at once, which matters for static runners, which
+// never heartbeat; sessions already running keep the price they started at.
+// A runner whose app left the table keeps the price it has.
+func (r *LiveRunnerRegistry) SetPrices(table LiveRunnerPriceTable) error {
+	table, err := normalizeLiveRunnerPrices(table)
+	if err != nil {
+		return &RunnerError{StatusCode: http.StatusBadRequest, Message: err.Error()}
+	}
+	r.setPrices(table)
+	return nil
+}
+
+func (r *LiveRunnerRegistry) setPrices(table LiveRunnerPriceTable) {
+	r.pricesMu.Lock()
+	r.prices = table.Apps
+	r.pricesMu.Unlock()
+
+	r.mu.Lock()
+	snapshot := make([]*liveRunner, 0, len(r.runners))
+	for _, runner := range r.runners {
+		snapshot = append(snapshot, runner)
+	}
+	r.mu.Unlock()
+	for _, runner := range snapshot {
+		runner.mu.Lock()
+		if price, ok := table.Apps[runner.App]; ok && !runner.removed && !runner.offchain && runner.PriceInfo != price {
+			runner.PriceInfo = price
+			runner.updatePriceConverterLocked()
+		}
+		runner.mu.Unlock()
+	}
+	slog.Info("live runner prices set", "apps", len(table.Apps))
+}
+
+// Prices returns a copy of the price table.
+func (r *LiveRunnerRegistry) Prices() LiveRunnerPriceTable {
+	r.pricesMu.RLock()
+	defer r.pricesMu.RUnlock()
+	apps := make(map[string]LiveRunnerPriceInfo, len(r.prices))
+	for app, price := range r.prices {
+		apps[app] = price
+	}
+	return LiveRunnerPriceTable{Apps: apps}
+}
+
+// configuredPrice is the operator's price for an app, if it set one.
+func (r *LiveRunnerRegistry) configuredPrice(app string) (LiveRunnerPriceInfo, bool) {
+	r.pricesMu.RLock()
+	defer r.pricesMu.RUnlock()
+	price, ok := r.prices[app]
+	return price, ok
 }

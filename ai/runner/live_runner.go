@@ -190,6 +190,9 @@ type LiveRunnerHeartbeatResponse struct {
 	HeartbeatSecret   string                    `json:"heartbeat_secret,omitempty"`
 	O2R               *LiveRunnerTrickleChannel `json:"o2r,omitempty"`
 	SessionIDs        []string                  `json:"session_ids"`
+	// PriceInfo is the price the runner is offered at, set when the operator
+	// prices the runner's app and so overrides what the runner asked for.
+	PriceInfo *LiveRunnerPriceInfo `json:"price_info,omitempty"`
 }
 
 type LiveRunnerDiscoveryRunner struct {
@@ -289,6 +292,9 @@ type LiveRunnerRegistry struct {
 	admitter          LiveRunnerAdmitter // non-nil in pool mode
 	orchAddress       string
 
+	pricesMu sync.RWMutex
+	prices   map[string]LiveRunnerPriceInfo // the operator's price per app
+
 	staticRegistrationMu sync.Mutex // serializes static runner config upserts
 
 	// mu protects runner registration, route lookup, and trickle server routing.
@@ -316,6 +322,9 @@ type LiveRunnerRegistryConfig struct {
 	Admitter LiveRunnerAdmitter
 	// OrchAddress is the orchestrator's on-chain address, reported to the admitter.
 	OrchAddress string
+	// Prices is the operator's price per app; it must already be normalized
+	// (ParseLiveRunnerPrices).
+	Prices LiveRunnerPriceTable
 }
 
 var liveRunnerChannelNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
@@ -356,6 +365,7 @@ func NewLiveRunnerRegistry(config LiveRunnerRegistryConfig) *LiveRunnerRegistry 
 		proxyTemplate:     proxyTemplate,
 		admitter:          config.Admitter,
 		orchAddress:       config.OrchAddress,
+		prices:            config.Prices.Apps,
 	}
 	go r.healthLoop()
 	go r.expiryLoop()
@@ -409,15 +419,24 @@ func (r *LiveRunnerRegistry) HeartbeatFrom(req LiveRunnerHeartbeatRequest, auth,
 		req.RunnerID = "runner_" + randomStr(liveRunnerIDRandomBytes)
 	}
 
-	req, err := r.normalizeHeartbeat(req.RunnerID, req)
+	req, err := r.normalizeRunnerHeartbeat(req.RunnerID, req, r.poolMode())
 	if err != nil {
 		return nil, &RunnerError{StatusCode: http.StatusBadRequest, Message: err.Error()}
 	}
+	configuredPrice, appOffered := r.configuredPrice(req.App)
 	var member *liveRunnerMember
 	if poolRegistration {
 		if member, err = r.admit(req, auth, remoteAddr); err != nil {
 			return nil, err
 		}
+		// After admission, so the pool service sees the attempt.
+		if !appOffered {
+			return nil, &RunnerError{StatusCode: http.StatusBadRequest, Message: "app not offered"}
+		}
+	}
+	var responsePriceInfo *LiveRunnerPriceInfo
+	if appOffered && !r.offchain {
+		responsePriceInfo = &configuredPrice
 	}
 
 	// For now, only return the heartbeat secret on first registration.
@@ -498,6 +517,7 @@ func (r *LiveRunnerRegistry) HeartbeatFrom(req LiveRunnerHeartbeatRequest, auth,
 			HeartbeatSecret:   responseHeartbeatSecret,
 			O2R:               &runner.o2r.channel,
 			SessionIDs:        runner.sessionIDsLocked(),
+			PriceInfo:         responsePriceInfo,
 		}, nil
 	} else {
 		r.mu.Unlock()
@@ -522,6 +542,10 @@ func (r *LiveRunnerRegistry) HeartbeatFrom(req LiveRunnerHeartbeatRequest, auth,
 		if err := runner.frozenFieldsLocked(req); err != nil {
 			return nil, err
 		}
+		if !appOffered {
+			// The app left the price table: the runner keeps the price it has.
+			req.PriceInfo = runner.PriceInfo
+		}
 	}
 	runner.LiveRunnerHeartbeatRequest = req
 	runner.LastHeartbeat = time.Now()
@@ -537,6 +561,7 @@ func (r *LiveRunnerRegistry) HeartbeatFrom(req LiveRunnerHeartbeatRequest, auth,
 		HeartbeatTTL:      heartbeatTTL.String(),
 		HeartbeatSecret:   responseHeartbeatSecret,
 		SessionIDs:        runner.sessionIDsLocked(),
+		PriceInfo:         responsePriceInfo,
 	}, nil
 }
 
@@ -927,6 +952,13 @@ func (r *LiveRunnerRegistry) buildStaticRunner(entry StaticLiveRunnerConfigEntry
 }
 
 func (r *LiveRunnerRegistry) normalizeHeartbeat(runnerID string, req LiveRunnerHeartbeatRequest) (LiveRunnerHeartbeatRequest, error) {
+	return r.normalizeRunnerHeartbeat(runnerID, req, false)
+}
+
+// normalizeRunnerHeartbeat validates a heartbeat. poolRunner says the runner
+// does not set its own price: the operator's price for its app is the only
+// one it can have.
+func (r *LiveRunnerRegistry) normalizeRunnerHeartbeat(runnerID string, req LiveRunnerHeartbeatRequest, poolRunner bool) (LiveRunnerHeartbeatRequest, error) {
 	if req.Tunnel {
 		if strings.TrimSpace(req.RunnerURL) != "" {
 			return LiveRunnerHeartbeatRequest{}, fmt.Errorf("runner_url and tunnel are exclusive")
@@ -967,6 +999,15 @@ func (r *LiveRunnerRegistry) normalizeHeartbeat(runnerID string, req LiveRunnerH
 	req.GPU = cloneLiveRunnerGPU(req.GPU)
 
 	if r.offchain {
+		return req, nil
+	}
+
+	if price, ok := r.configuredPrice(req.App); ok {
+		req.PriceInfo = price
+	} else if poolRunner {
+		// Whatever the runner sent is not its price. The caller refuses the
+		// registration, or keeps the price of a runner already registered.
+		req.PriceInfo = LiveRunnerPriceInfo{}
 		return req, nil
 	}
 

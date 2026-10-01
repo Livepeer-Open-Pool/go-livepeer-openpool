@@ -72,6 +72,10 @@ func newPoolLiveRunnerHTTP(t *testing.T, webhook *poolWebhook) (*lphttp, *httpte
 		Host:        testLiveRunnerHost{orchestrator: lp.orchestrator},
 		Admitter:    admitter,
 		OrchAddress: "0x00000000000000000000000000000000000000AA",
+		Prices: runner.LiveRunnerPriceTable{Apps: map[string]runner.LiveRunnerPriceInfo{
+			"vllm/qwen2.5-7b-instruct": {Price: "10", Currency: "usd", Unit: "hour"},
+			"echo":                     {Price: "0.001", Currency: "usd", Unit: "fixed"},
+		}},
 	})
 	t.Cleanup(manager.Stop)
 	node.LiveRunnerManager = manager
@@ -233,6 +237,9 @@ func TestPoolRegistrationStatusCodes(t *testing.T) {
 	status, body = postHeartbeat(t, orch.URL, "c1", `{"app":"echo","runner_url":"http://127.0.0.1:7935"}`)
 	require.Equal(t, http.StatusBadRequest, status)
 	require.Equal(t, "pool runners must register with a tunnel", body)
+
+	status, body = postHeartbeat(t, orch.URL, "c1", `{"app":"flux/schnell","tunnel":true}`)
+	require.Equal(t, http.StatusForbidden, status, "the webhook is asked before the app is checked")
 
 	webhook.srv.Close()
 	status, body = postHeartbeat(t, orch.URL, "c1", registration)
