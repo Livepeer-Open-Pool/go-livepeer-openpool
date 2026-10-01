@@ -116,6 +116,7 @@ func startAIServer(lp *lphttp) error {
 	lp.transRPC.HandleFunc("POST /apps/{runner_id}/session/{session_id}/payment", lp.PaymentForLiveRunnerSession)
 	lp.transRPC.HandleFunc("/apps/{runner_id}/session/{session_id}/app/{app_path...}", lp.ProxyLiveRunnerSession)
 	lp.transRPC.HandleFunc("/apps/{runner_id}/app/{app_path...}", lp.ProxyLiveRunnerSingleShot)
+	lp.registerLiveRunnerPoolRoutes()
 
 	// Additionally, there is the '/aiResults' endpoint registered in server/rpc.go
 
@@ -133,6 +134,11 @@ type liveRunnerManager interface {
 	ReservePaidSession(runnerID, sessionID, sender string) (string, string, error)
 	ReleaseSessionWithReason(runnerID, sessionID, reason string) error
 	RecordSessionFee(runnerID, sessionID, sender string, units int64, fee, balance *big.Rat) error
+	PoolPaymentInfo(app, mode string) (*runner.LiveRunnerPriceInfo, error)
+	ReservePoolSession(app, mode string) (string, string, string, error)
+	ReservePaidPoolSession(app, mode, sessionID, sender string) (string, string, string, error)
+	RunnerForPoolSession(app, sessionID string) (string, error)
+	PoolApps() []runner.LiveRunnerDiscoveryApp
 	SessionPriceInfo(runnerID, sessionID string) (runner.LiveRunnerPriceInfo, error)
 	RunnerMode(runnerID string) (string, error)
 	PoolMode() bool
@@ -302,6 +308,9 @@ type liveRunnerSessionResponse struct {
 	SessionID  string `json:"session_id"`
 	AppURL     string `json:"app_url"`
 	ControlURL string `json:"control_url"`
+	// RunnerID is the runner the orchestrator chose, set when the session was
+	// asked for by app rather than by runner.
+	RunnerID string `json:"runner_id,omitempty"`
 }
 
 type liveRunnerPaymentChallengeResponse struct {
@@ -442,7 +451,7 @@ func (h *lphttp) reservePaidLiveRunnerSession(
 
 	// For easier correlation across orchestrator, gateway, and signer.
 	sessionID := string(segData.ManifestID)
-	sessionID, appURL, err := manager.ReservePaidSession(runnerID, sessionID, getPaymentSender(payment).Hex())
+	runnerID, sessionID, appURL, err := reservePaidLiveRunnerSessionOn(r, manager, runnerID, sessionID, getPaymentSender(payment).Hex())
 	if err != nil {
 		respondWithLiveRunnerError(w, err)
 		return "", "", false
@@ -562,7 +571,7 @@ func (h *lphttp) runnerChallenge(w http.ResponseWriter, r *http.Request, priceIn
 		respondWithError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	paymentURL := h.orchestrator.ServiceURI().JoinPath("apps", r.PathValue("runner_id"), "session", oInfo.GetAuthToken().GetSessionId(), "payment").String()
+	paymentURL := h.liveRunnerPaymentURL(r, oInfo.GetAuthToken().GetSessionId())
 	data, err := marshalLivePaymentChallengeResponse(oInfo, paymentURL)
 	if err != nil {
 		respondWithError(w, err.Error(), http.StatusInternalServerError)
@@ -1075,6 +1084,9 @@ func respondWithLiveRunnerError(w http.ResponseWriter, err error) {
 type liveRunnerDiscoveryEntry struct {
 	Address string                             `json:"address,omitempty"`
 	Runners []runner.LiveRunnerDiscoveryRunner `json:"runners,omitempty"`
+	// Apps are the apps a customer can ask for by name, leaving the choice of
+	// runner to the orchestrator.
+	Apps []runner.LiveRunnerDiscoveryApp `json:"apps,omitempty"`
 }
 
 func (h *lphttp) DiscoverLiveRunners(w http.ResponseWriter, r *http.Request) {
@@ -1154,6 +1166,9 @@ func (h *lphttp) DiscoverLiveRunners(w http.ResponseWriter, r *http.Request) {
 		Address: suri.String(),
 		Runners: runners,
 	}}
+	if ok {
+		resp[0].Apps = manager.PoolApps()
+	}
 	data, err := json.Marshal(resp)
 	if err != nil {
 		respondWithError(w, err.Error(), http.StatusInternalServerError)

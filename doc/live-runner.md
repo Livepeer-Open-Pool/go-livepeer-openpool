@@ -342,6 +342,19 @@ of `-liveRunnerPoolSecret`. It opens an unpaid session on that runner in any
 state. In pool mode the proxy does not forward the payment headers, so a
 runner cannot tell a probe from paid work.
 
+Customers need not pick a runner. For every app in the price table that
+has an active, ready runner, `GET /discovery` lists an entry in `apps` with
+the app's price, its combined capacity, and a URL under `/pool/{app}/…`,
+where `{app}` is the app name base64url-encoded without padding (app names
+contain slashes). `POST /pool/{app}/session` opens a persistent session and
+`/pool/{app}/app/…` serves one single-shot request, each on the runner with
+the fewest sessions among those that are active, ready, and have a free
+slot; `503 no capacity for app` when there is none. The session response
+names the chosen runner in `runner_id`, and its `app_url` and `control_url`
+are that runner's ordinary `/apps/{runner_id}/…` URLs. Payment works as on
+the runner routes; follow-up payments go to the `payment_url` of the
+challenge, `/pool/{app}/session/{session_id}/payment`.
+
 The pool service drives the registry through the CLI port
 (`GET /liveRunner/runners`, `POST /liveRunner/setState`,
 `POST /liveRunner/evict`, `POST /liveRunner/prices`) and reads what runners
