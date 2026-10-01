@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/livepeer/go-livepeer/ai/runner"
 	"github.com/livepeer/go-livepeer/ai/runner/tunnelclient"
 	"github.com/livepeer/go-livepeer/core"
+	"github.com/livepeer/go-livepeer/eth"
 )
 
 const poolTestSecret = "pool-secret"
@@ -54,13 +56,26 @@ func (w *poolWebhook) seen() ([]runner.LiveRunnerAdmissionRequest, []string) {
 	return append([]runner.LiveRunnerAdmissionRequest(nil), w.calls...), append([]string(nil), w.auths...)
 }
 
-// newPoolLiveRunnerHTTP is an orchestrator in pool mode, served over HTTP.
+// newPoolLiveRunnerHTTP is an off-chain orchestrator in pool mode, served over HTTP.
 func newPoolLiveRunnerHTTP(t *testing.T, webhook *poolWebhook) (*lphttp, *httptest.Server) {
+	t.Helper()
+	return newPoolLiveRunnerHTTPOn(t, webhook, false)
+}
+
+func newPoolLiveRunnerHTTPOn(t *testing.T, webhook *poolWebhook, onchain bool) (*lphttp, *httptest.Server) {
 	t.Helper()
 	node, err := core.NewLivepeerNode(nil, t.TempDir(), nil)
 	require.NoError(t, err)
+	node.LiveRunnerPoolSecret = poolTestSecret
 	orch := newStubOrchestrator()
 	orch.secret = "live-runner-secret"
+	if onchain {
+		prevWatcher := core.PriceFeedWatcher
+		core.PriceFeedWatcher = stubPriceFeedWatcher{price: eth.PriceData{Price: big.NewRat(2000, 1)}}
+		t.Cleanup(func() { core.PriceFeedWatcher = prevWatcher })
+		node.LivePaymentInterval = 5 * time.Second
+		orch.ticketParams = defaultTicketParams()
+	}
 	lp := &lphttp{
 		orchestrator: orch,
 		node:         node,
@@ -70,6 +85,7 @@ func newPoolLiveRunnerHTTP(t *testing.T, webhook *poolWebhook) (*lphttp, *httpte
 	require.NoError(t, err)
 	manager := runner.NewLiveRunnerRegistry(runner.LiveRunnerRegistryConfig{
 		Host:        testLiveRunnerHost{orchestrator: lp.orchestrator},
+		Onchain:     onchain,
 		Admitter:    admitter,
 		OrchAddress: "0x00000000000000000000000000000000000000AA",
 		Prices: runner.LiveRunnerPriceTable{Apps: map[string]runner.LiveRunnerPriceInfo{
@@ -89,17 +105,22 @@ func newPoolLiveRunnerHTTP(t *testing.T, webhook *poolWebhook) (*lphttp, *httpte
 // in front of an app that answers every request with "app".
 func startPoolRunner(t *testing.T, orchURL, credential string) *tunnelclient.Client {
 	t.Helper()
-	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return startPoolRunnerFor(t, orchURL, credential, "single-shot", 2, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "app")
 	}))
+}
+
+func startPoolRunnerFor(t *testing.T, orchURL, credential, mode string, capacity int, appHandler http.Handler) *tunnelclient.Client {
+	t.Helper()
+	app := httptest.NewServer(appHandler)
 	t.Cleanup(app.Close)
 	client, err := tunnelclient.New(tunnelclient.Config{
 		Orchestrator: orchURL,
 		OrchSecret:   credential,
 		Target:       app.URL,
 		App:          "vllm/qwen2.5-7b-instruct",
-		Mode:         "single-shot",
-		Capacity:     2,
+		Mode:         mode,
+		Capacity:     capacity,
 		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	require.NoError(t, err)
@@ -114,6 +135,49 @@ func startPoolRunner(t *testing.T, orchURL, credential string) *tunnelclient.Cli
 		}
 	})
 	return client
+}
+
+// waitPoolRunnerConnected waits until the runner is registered and its
+// tunnel carries streams, whatever state the runner is in.
+func waitPoolRunnerConnected(t *testing.T, lp *lphttp, client *tunnelclient.Client) string {
+	t.Helper()
+	manager, ok := lp.liveRunnerManager()
+	require.True(t, ok)
+	require.Eventually(t, func() bool {
+		id := client.RunnerID()
+		if id == "" {
+			return false
+		}
+		dial, tunneled := manager.TunnelDialer(id)
+		if !tunneled {
+			return false
+		}
+		conn, err := dial(context.Background(), "", "")
+		if err != nil {
+			return false
+		}
+		_ = conn.Close()
+		return true
+	}, 15*time.Second, 50*time.Millisecond)
+	return client.RunnerID()
+}
+
+// probeRequest is a request carrying the pool secret the way the pool service sends it.
+func probeRequest(t *testing.T, method, url, secret string) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(method, url, nil)
+	require.NoError(t, err)
+	req.Header.Set("Livepeer-Probe-Secret", secret)
+	return req
+}
+
+func doRequest(t *testing.T, req *http.Request) (int, string) {
+	t.Helper()
+	res, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	return res.StatusCode, strings.TrimSpace(string(body))
 }
 
 func discoveredRunnerURLs(t *testing.T, orchURL string) []string {
@@ -181,26 +245,8 @@ func TestPoolRunnerOnProbationIsInvisibleToCustomers(t *testing.T) {
 	lp, orch := newPoolLiveRunnerHTTP(t, webhook)
 	client := startPoolRunner(t, orch.URL, "member-credential")
 
-	// Wait until the runner is registered with its tunnel up, which is all that
-	// would be needed for it to be listed were it active.
-	manager, ok := lp.liveRunnerManager()
-	require.True(t, ok)
-	require.Eventually(t, func() bool {
-		id := client.RunnerID()
-		if id == "" {
-			return false
-		}
-		dial, tunneled := manager.TunnelDialer(id)
-		if !tunneled {
-			return false
-		}
-		conn, err := dial(context.Background(), "", "")
-		if err != nil {
-			return false
-		}
-		_ = conn.Close()
-		return true
-	}, 15*time.Second, 50*time.Millisecond)
+	// Registered with its tunnel up is all it would take to be listed were it active.
+	waitPoolRunnerConnected(t, lp, client)
 
 	require.Empty(t, discoveredRunnerURLs(t, orch.URL))
 	res, err := http.Get(orch.URL + "/apps/" + client.RunnerID() + "/app/v1/models")
@@ -245,4 +291,215 @@ func TestPoolRegistrationStatusCodes(t *testing.T) {
 	status, body = postHeartbeat(t, orch.URL, "c1", registration)
 	require.Equal(t, http.StatusServiceUnavailable, status)
 	require.Equal(t, "admission unavailable", body)
+}
+
+// headerRecorder is an app that remembers the headers of the last request.
+type headerRecorder struct {
+	mu     sync.Mutex
+	header http.Header
+}
+
+func (h *headerRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.mu.Lock()
+	h.header = r.Header.Clone()
+	h.mu.Unlock()
+	_, _ = io.WriteString(w, "app")
+}
+
+func (h *headerRecorder) last() http.Header {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.header.Clone()
+}
+
+func TestPoolProbeTestsARunnerOnProbationWithoutPayment(t *testing.T) {
+	webhook := newPoolWebhook(t, runner.LiveRunnerAdmissionResponse{Allow: true, MemberID: "m1"})
+	// On-chain, so that a customer would be asked to pay.
+	lp, orch := newPoolLiveRunnerHTTPOn(t, webhook, true)
+	app := &headerRecorder{}
+	client := startPoolRunnerFor(t, orch.URL, "member-credential", "single-shot", 2, app)
+	runnerID := waitPoolRunnerConnected(t, lp, client)
+	appURL := orch.URL + "/apps/" + runnerID + "/app/v1/models"
+
+	// A customer cannot see the runner at all.
+	status, _ := doRequest(t, probeRequestWithout(t, appURL))
+	require.Equal(t, http.StatusNotFound, status)
+
+	// The pool service reaches it, with no payment challenge.
+	req := probeRequest(t, http.MethodGet, appURL, poolTestSecret)
+	req.Header.Set("Authorization", "Bearer sk-app-key")
+	status, body := doRequest(t, req)
+	require.Equal(t, http.StatusOK, status, body)
+	require.Equal(t, "app", body)
+
+	// The runner sees an ordinary session, never the pool secret; what the
+	// customer sends the app still arrives.
+	seen := app.last()
+	require.Empty(t, seen.Values("Livepeer-Probe-Secret"))
+	require.Equal(t, "Bearer sk-app-key", seen.Get("Authorization"))
+	require.Equal(t, runnerID, seen.Get("Livepeer-Runner-Route"))
+	require.NotEmpty(t, seen.Get("Livepeer-Session-Token"))
+	require.NotContains(t, seen.Get("Livepeer-Session-Id"), "session_", "on-chain a probe's session id looks like a paid one")
+
+	// The session is released when the request ends.
+	manager, _ := lp.liveRunnerManager()
+	_, err := manager.RunnerEndpointForSession(runnerID, seen.Get("Livepeer-Session-Id"))
+	require.Error(t, err)
+}
+
+func probeRequestWithout(t *testing.T, url string) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	require.NoError(t, err)
+	return req
+}
+
+func TestPoolProbeNeedsThePoolSecret(t *testing.T) {
+	webhook := newPoolWebhook(t, runner.LiveRunnerAdmissionResponse{Allow: true, MemberID: "m1", State: runner.LiveRunnerStateActive})
+	lp, orch := newPoolLiveRunnerHTTP(t, webhook)
+	client := startPoolRunner(t, orch.URL, "member-credential")
+	runnerID := waitPoolRunnerConnected(t, lp, client)
+	appURL := orch.URL + "/apps/" + runnerID + "/app/v1/models"
+	sessionURL := orch.URL + "/apps/" + runnerID + "/session"
+
+	// A wrong secret is refused even though the runner is active and off-chain,
+	// where the same request without the header would be served.
+	for _, secret := range []string{"wrong", "", "live-runner-secret"} {
+		status, body := doRequest(t, probeRequest(t, http.MethodGet, appURL, secret))
+		require.Equal(t, http.StatusUnauthorized, status, secret)
+		require.Equal(t, "invalid probe authorization", body)
+		status, _ = doRequest(t, probeRequest(t, http.MethodPost, sessionURL, secret))
+		require.Equal(t, http.StatusUnauthorized, status, secret)
+	}
+	status, _ := doRequest(t, probeRequestWithout(t, appURL))
+	require.Equal(t, http.StatusOK, status)
+
+	// An orchestrator with no pool secret accepts no probe at all.
+	lp.node.LiveRunnerPoolSecret = ""
+	status, _ = doRequest(t, probeRequest(t, http.MethodGet, appURL, poolTestSecret))
+	require.Equal(t, http.StatusUnauthorized, status)
+	status, _ = doRequest(t, probeRequest(t, http.MethodGet, appURL, ""))
+	require.Equal(t, http.StatusUnauthorized, status)
+}
+
+func TestPoolProbeCountsAgainstCapacityAndReachesEveryState(t *testing.T) {
+	webhook := newPoolWebhook(t, runner.LiveRunnerAdmissionResponse{Allow: true, MemberID: "m1", State: runner.LiveRunnerStateSuspended})
+	lp, orch := newPoolLiveRunnerHTTP(t, webhook)
+	entered := make(chan struct{}, 4)
+	release := make(chan struct{})
+	client := startPoolRunnerFor(t, orch.URL, "member-credential", "single-shot", 1, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+		<-release
+		_, _ = io.WriteString(w, "app")
+	}))
+	runnerID := waitPoolRunnerConnected(t, lp, client)
+	appURL := orch.URL + "/apps/" + runnerID + "/app/slow"
+
+	// Suspended: customers are refused, the probe gets through and holds the one slot.
+	status, body := doRequest(t, probeRequestWithout(t, appURL))
+	require.Equal(t, http.StatusConflict, status)
+	require.Equal(t, "runner suspended", body)
+
+	first := make(chan int, 1)
+	go func() {
+		status, _ := doRequest(t, probeRequest(t, http.MethodGet, appURL, poolTestSecret))
+		first <- status
+	}()
+	<-entered
+	status, body = doRequest(t, probeRequest(t, http.MethodGet, appURL, poolTestSecret))
+	require.Equal(t, http.StatusServiceUnavailable, status)
+	require.Equal(t, "no capacity available for runner", body)
+	close(release)
+	require.Equal(t, http.StatusOK, <-first)
+}
+
+func TestPoolProbeOpensAPersistentSession(t *testing.T) {
+	webhook := newPoolWebhook(t, runner.LiveRunnerAdmissionResponse{Allow: true, MemberID: "m1"})
+	lp, orch := newPoolLiveRunnerHTTP(t, webhook)
+	app := &headerRecorder{}
+	client := startPoolRunnerFor(t, orch.URL, "member-credential", "persistent", 1, app)
+	runnerID := waitPoolRunnerConnected(t, lp, client)
+	sessionURL := orch.URL + "/apps/" + runnerID + "/session"
+
+	res, err := http.Post(sessionURL, "application/json", nil)
+	require.NoError(t, err)
+	res.Body.Close()
+	require.Equal(t, http.StatusNotFound, res.StatusCode, "a customer cannot open a session on a runner on probation")
+
+	status, body := doRequest(t, probeRequest(t, http.MethodPost, sessionURL, poolTestSecret))
+	require.Equal(t, http.StatusOK, status, body)
+	var session liveRunnerSessionResponse
+	require.NoError(t, json.Unmarshal([]byte(body), &session))
+	require.NotEmpty(t, session.SessionID)
+
+	// The session is used and stopped like any other, by its id.
+	base := orch.URL + "/apps/" + runnerID + "/session/" + session.SessionID
+	status, body = doRequest(t, probeRequestWithout(t, base+"/app/echo"))
+	require.Equal(t, http.StatusOK, status, body)
+	require.Equal(t, session.SessionID, app.last().Get("Livepeer-Session-Id"))
+
+	// It holds the runner's only slot until it is stopped.
+	status, _ = doRequest(t, probeRequest(t, http.MethodPost, sessionURL, poolTestSecret))
+	require.Equal(t, http.StatusServiceUnavailable, status)
+	stop, err := http.NewRequest(http.MethodPost, base+"/stop", nil)
+	require.NoError(t, err)
+	status, _ = doRequest(t, stop)
+	require.Equal(t, http.StatusNoContent, status)
+	status, _ = doRequest(t, probeRequest(t, http.MethodPost, sessionURL, poolTestSecret))
+	require.Equal(t, http.StatusOK, status)
+}
+
+func TestPoolRunnerNeverSeesPaymentHeaders(t *testing.T) {
+	webhook := newPoolWebhook(t, runner.LiveRunnerAdmissionResponse{Allow: true, MemberID: "m1", State: runner.LiveRunnerStateActive})
+	lp, orch := newPoolLiveRunnerHTTP(t, webhook)
+	app := &headerRecorder{}
+	client := startPoolRunnerFor(t, orch.URL, "member-credential", "single-shot", 2, app)
+	runnerID := waitPoolRunnerConnected(t, lp, client)
+
+	req := probeRequestWithout(t, orch.URL+"/apps/"+runnerID+"/app/v1/models")
+	req.Header.Set("Livepeer-Payment", "payment")
+	req.Header.Set("Livepeer-Segment", "segment")
+	req.Header.Set("Livepeer-Payer-Address", "0x00000000000000000000000000000000000000c1")
+	req.Header.Set("X-Request-Id", "abc")
+	status, body := doRequest(t, req)
+	require.Equal(t, http.StatusOK, status, body)
+
+	seen := app.last()
+	require.Empty(t, seen.Values("Livepeer-Payment"))
+	require.Empty(t, seen.Values("Livepeer-Segment"))
+	require.Empty(t, seen.Values("Livepeer-Payer-Address"))
+	require.Equal(t, "abc", seen.Get("X-Request-Id"))
+}
+
+func TestWithoutPoolModeRunnersStillSeeEveryHeader(t *testing.T) {
+	app := &headerRecorder{}
+	f := newTunnelFixture(t, app, 2)
+	runnerID := f.waitListed(t, "")
+
+	req := probeRequestWithout(t, f.appURL(runnerID, "/v1/models"))
+	req.Header.Set("Livepeer-Payment", "payment")
+	req.Header.Set("Livepeer-Segment", "segment")
+	status, body := doRequest(t, req)
+	require.Equal(t, http.StatusOK, status, body)
+	require.Equal(t, "payment", app.last().Get("Livepeer-Payment"))
+	require.Equal(t, "segment", app.last().Get("Livepeer-Segment"))
+
+	// Outside pool mode nobody holds a pool secret, so a probe is refused.
+	status, _ = doRequest(t, probeRequest(t, http.MethodGet, f.appURL(runnerID, "/v1/models"), "anything"))
+	require.Equal(t, http.StatusUnauthorized, status)
+}
+
+func TestPoolProbeSkipsThePaymentChallenge(t *testing.T) {
+	webhook := newPoolWebhook(t, runner.LiveRunnerAdmissionResponse{Allow: true, MemberID: "m1", State: runner.LiveRunnerStateActive})
+	lp, orch := newPoolLiveRunnerHTTPOn(t, webhook, true)
+	client := startPoolRunner(t, orch.URL, "member-credential")
+	runnerID := waitPoolRunnerConnected(t, lp, client)
+	appURL := orch.URL + "/apps/" + runnerID + "/app/v1/models"
+
+	// The same active, priced runner: a customer is asked to pay, the probe is not.
+	status, _ := doRequest(t, probeRequestWithout(t, appURL))
+	require.Equal(t, http.StatusPaymentRequired, status)
+	status, body := doRequest(t, probeRequest(t, http.MethodGet, appURL, poolTestSecret))
+	require.Equal(t, http.StatusOK, status, body)
+	require.Equal(t, "app", body)
 }

@@ -5,6 +5,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -48,6 +49,11 @@ var TrickleHTTPPath = "/ai/trickle/"
 
 const maxLiveRunnerTrickleChannelsPerRequest = 25
 const liveRunnerSenderHeader = "Livepeer-Payer-Address"
+
+// liveRunnerProbeHeader carries the pool secret on the pool service's probe:
+// an unpaid session on one named runner, in any state, to test it. It is not
+// Authorization because customers of an app send that to the app.
+const liveRunnerProbeHeader = "Livepeer-Probe-Secret"
 const maxScopeRequestBodySize = 1 << 20 // 1 MB
 
 func startAIServer(lp *lphttp) error {
@@ -125,6 +131,9 @@ type liveRunnerManager interface {
 	ReleaseSession(runnerID, sessionID string) error
 	SessionPriceInfo(runnerID, sessionID string) (runner.LiveRunnerPriceInfo, error)
 	RunnerMode(runnerID string) (string, error)
+	PoolMode() bool
+	ProbeRunnerMode(runnerID string) (string, error)
+	ReserveProbeSession(runnerID string) (string, string, error)
 	RunnerEndpointForSession(runnerID, sessionID string) (string, error)
 	SessionTokenForSession(runnerID, sessionID string) (string, error)
 	ValidSessionToken(runnerID, sessionID, token string) error
@@ -258,6 +267,33 @@ func tunnelTransport(dial runner.TunnelDialFunc) http.RoundTripper {
 	}
 }
 
+// liveRunnerProbe says whether the request is the pool service's probe. A
+// request that carries the probe header without the pool secret is refused
+// (ok is false and the response is written): it never falls through to the
+// paid path.
+func (h *lphttp) liveRunnerProbe(w http.ResponseWriter, r *http.Request) (probe, ok bool) {
+	values, present := r.Header[liveRunnerProbeHeader]
+	if !present {
+		return false, true
+	}
+	secret := ""
+	if h.node != nil {
+		secret = h.node.LiveRunnerPoolSecret
+	}
+	if secret == "" || len(values) != 1 || subtle.ConstantTimeCompare([]byte(values[0]), []byte(secret)) != 1 {
+		respondWithError(w, "invalid probe authorization", http.StatusUnauthorized)
+		return false, false
+	}
+	return true, true
+}
+
+func liveRunnerMode(manager liveRunnerManager, runnerID string, probe bool) (string, error) {
+	if probe {
+		return manager.ProbeRunnerMode(runnerID)
+	}
+	return manager.RunnerMode(runnerID)
+}
+
 type liveRunnerSessionResponse struct {
 	SessionID  string `json:"session_id"`
 	AppURL     string `json:"app_url"`
@@ -305,7 +341,11 @@ func (h *lphttp) ReserveLiveRunnerSession(w http.ResponseWriter, r *http.Request
 	}
 	runnerID := r.PathValue("runner_id")
 	ctx := clog.AddVal(context.Background(), "runner_id", runnerID)
-	mode, err := manager.RunnerMode(runnerID)
+	probe, ok := h.liveRunnerProbe(w, r)
+	if !ok {
+		return
+	}
+	mode, err := liveRunnerMode(manager, runnerID, probe)
 	if err != nil {
 		respondWithLiveRunnerError(w, err)
 		return
@@ -314,16 +354,26 @@ func (h *lphttp) ReserveLiveRunnerSession(w http.ResponseWriter, r *http.Request
 		respondWithError(w, "only persistent runners have sessions", http.StatusBadRequest)
 		return
 	}
-	priceInfo, err := manager.PaymentInfo(runnerID)
-	if err != nil {
-		respondWithLiveRunnerError(w, err)
-		return
+	var priceInfo *runner.LiveRunnerPriceInfo
+	if !probe {
+		priceInfo, err = manager.PaymentInfo(runnerID)
+		if err != nil {
+			respondWithLiveRunnerError(w, err)
+			return
+		}
 	}
 	var (
 		sessionID string
 		appURL    string
 	)
-	if priceInfo == nil {
+	if probe {
+		// The pool service's test: reserved like any session, never paid for.
+		sessionID, appURL, err = manager.ReserveProbeSession(runnerID)
+		if err != nil {
+			respondWithLiveRunnerError(w, err)
+			return
+		}
+	} else if priceInfo == nil {
 		sessionID, appURL, err = manager.ReserveSession(runnerID)
 		if err != nil {
 			respondWithLiveRunnerError(w, err)
@@ -845,7 +895,11 @@ func (h *lphttp) ProxyLiveRunnerSingleShot(w http.ResponseWriter, r *http.Reques
 	}
 
 	runnerID := r.PathValue("runner_id")
-	mode, err := manager.RunnerMode(runnerID)
+	probe, ok := h.liveRunnerProbe(w, r)
+	if !ok {
+		return
+	}
+	mode, err := liveRunnerMode(manager, runnerID, probe)
 	if err != nil {
 		respondWithLiveRunnerError(w, err)
 		return
@@ -855,10 +909,13 @@ func (h *lphttp) ProxyLiveRunnerSingleShot(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	priceInfo, err := manager.PaymentInfo(runnerID)
-	if err != nil {
-		respondWithLiveRunnerError(w, err)
-		return
+	var priceInfo *runner.LiveRunnerPriceInfo
+	if !probe {
+		priceInfo, err = manager.PaymentInfo(runnerID)
+		if err != nil {
+			respondWithLiveRunnerError(w, err)
+			return
+		}
 	}
 	var (
 		sessionID string
@@ -866,7 +923,13 @@ func (h *lphttp) ProxyLiveRunnerSingleShot(w http.ResponseWriter, r *http.Reques
 	)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	if priceInfo == nil {
+	if probe {
+		sessionID, endpoint, err = manager.ReserveProbeSession(runnerID)
+		if err != nil {
+			respondWithLiveRunnerError(w, err)
+			return
+		}
+	} else if priceInfo == nil {
 		sessionID, endpoint, err = manager.ReserveSession(runnerID)
 		if err != nil {
 			respondWithLiveRunnerError(w, err)
@@ -930,7 +993,12 @@ func (h *lphttp) proxyLiveRunner(w http.ResponseWriter, r *http.Request, runnerI
 	}
 	sessionControlURL := liveRunnerURI(h.node, h.orchestrator).JoinPath("runner", runnerID, "session", sessionID).String()
 	var transport http.RoundTripper
+	// In pool mode the runner belongs to someone else, and must not be able
+	// to tell the pool service's test from paid work: it sees neither the
+	// payment nor its absence.
+	hidePayment := false
 	if manager, ok := h.liveRunnerManager(); ok {
+		hidePayment = manager.PoolMode()
 		if dial, tunneled := manager.TunnelDialer(runnerID); tunneled {
 			// A tunneled runner's endpoint is tunnel://<runner_id> (or, for a
 			// session proxy, an http URL on that same host); the stream the
@@ -955,6 +1023,13 @@ func (h *lphttp) proxyLiveRunner(w http.ResponseWriter, r *http.Request, runnerI
 			req.Out.Header.Set("Livepeer-Session-Id", sessionID)
 			req.Out.Header.Set("Livepeer-Session-Token", sessionToken)
 			req.Out.Header.Set("Livepeer-Session-Control", sessionControlURL)
+			// The pool secret never reaches a runner.
+			req.Out.Header.Del(liveRunnerProbeHeader)
+			if hidePayment {
+				req.Out.Header.Del(paymentHeader)
+				req.Out.Header.Del(segmentHeader)
+				req.Out.Header.Del(liveRunnerSenderHeader)
+			}
 		},
 		ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
 			respondWithError(w, err.Error(), http.StatusBadGateway)

@@ -264,6 +264,7 @@ type liveRunnerSession struct {
 	priceInfo LiveRunnerPriceInfo
 	channels  map[string]*liveRunnerTrickleChannel
 	proxies   map[string]proxyTarget
+	probe     bool // an unpaid session the pool service opened to test the runner
 }
 
 type proxyTarget struct {
@@ -1070,6 +1071,10 @@ func (r *LiveRunnerRegistry) Unregister(runnerID, auth string) error {
 // a public app URL, while single-shot reservations return the runner endpoint
 // for internal forwarding.
 func (r *LiveRunnerRegistry) ReserveSession(runnerID string, optSessionID ...string) (string, string, error) {
+	return r.reserveSession(runnerID, false, optSessionID...)
+}
+
+func (r *LiveRunnerRegistry) reserveSession(runnerID string, probe bool, optSessionID ...string) (string, string, error) {
 	runner, unlock, err := r.lockLiveRunner(runnerID)
 	if err != nil {
 		return "", "", err
@@ -1078,8 +1083,10 @@ func (r *LiveRunnerRegistry) ReserveSession(runnerID string, optSessionID ...str
 	if !runner.readyLocked() {
 		return "", "", &RunnerError{StatusCode: http.StatusNotFound, Message: "runner not found"}
 	}
-	if err := runner.newWorkAllowedLocked(); err != nil {
-		return "", "", err
+	if !probe {
+		if err := runner.newWorkAllowedLocked(); err != nil {
+			return "", "", err
+		}
 	}
 	id := ""
 	if len(optSessionID) > 0 {
@@ -1109,6 +1116,7 @@ func (r *LiveRunnerRegistry) ReserveSession(runnerID string, optSessionID ...str
 		priceInfo: runner.PriceInfo,
 		channels:  make(map[string]*liveRunnerTrickleChannel),
 		proxies:   make(map[string]proxyTarget),
+		probe:     probe,
 	}
 	appURL := r.host.ServiceURI().JoinPath("apps", runner.route, "session", id, "app").String()
 	if runner.Mode == LiveRunnerModeSingleShot {
@@ -1177,6 +1185,10 @@ func (r *LiveRunnerRegistry) ReleaseSession(runnerID, sessionID string) error {
 }
 
 func (r *LiveRunnerRegistry) RunnerMode(runnerID string) (string, error) {
+	return r.runnerMode(runnerID, false)
+}
+
+func (r *LiveRunnerRegistry) runnerMode(runnerID string, probe bool) (string, error) {
 	runner, unlock, err := r.lockLiveRunner(runnerID)
 	if err != nil {
 		return "", err
@@ -1185,8 +1197,10 @@ func (r *LiveRunnerRegistry) RunnerMode(runnerID string) (string, error) {
 	if !runner.readyLocked() {
 		return "", &RunnerError{StatusCode: http.StatusNotFound, Message: "runner not found"}
 	}
-	if err := runner.newWorkAllowedLocked(); err != nil {
-		return "", err
+	if !probe {
+		if err := runner.newWorkAllowedLocked(); err != nil {
+			return "", err
+		}
 	}
 	if runner.Mode == "" {
 		return LiveRunnerModePersistent, nil
@@ -1516,6 +1530,7 @@ func (r *LiveRunnerRegistry) expiryLoop() {
 		select {
 		case <-ticker.C:
 			r.removeExpiredRunners(time.Now())
+			r.releaseExpiredProbeSessions(time.Now())
 		case <-r.stopRegistry:
 			return
 		}

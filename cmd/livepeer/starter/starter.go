@@ -2085,12 +2085,13 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 
 		if *cfg.UseLiveRunners || *cfg.LiveRunnerConfig != "" {
 			// Pool mode: the admission webhook, not -orchSecret, decides who registers.
+			poolSecret := ""
+			if *cfg.LiveRunnerPoolSecret != "" {
+				poolSecret, _ = common.ReadFromFile(*cfg.LiveRunnerPoolSecret)
+			}
+			n.LiveRunnerPoolSecret = poolSecret
 			var admitter runner.LiveRunnerAdmitter
 			if *cfg.LiveRunnerAuthWebhookURL != "" {
-				poolSecret := ""
-				if *cfg.LiveRunnerPoolSecret != "" {
-					poolSecret, _ = common.ReadFromFile(*cfg.LiveRunnerPoolSecret)
-				}
 				webhook, err := runner.NewLiveRunnerWebhookAdmitter(*cfg.LiveRunnerAuthWebhookURL, poolSecret, *cfg.LiveRunnerAuthTimeout)
 				if err != nil {
 					glog.Exitf("invalid -liveRunnerAuthWebhookUrl: %v", err)

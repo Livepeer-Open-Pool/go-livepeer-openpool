@@ -13,6 +13,8 @@ import (
 	"time"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
+
+	"github.com/livepeer/go-livepeer/core"
 )
 
 // Pool mode lets people other than the operator ("members") attach Live
@@ -35,6 +37,9 @@ const (
 )
 
 const (
+	// liveRunnerProbeSessionTTL bounds a probe session, so a pool service that
+	// dies mid-test does not hold a runner's capacity for good.
+	liveRunnerProbeSessionTTL         = 10 * time.Minute
 	defaultLiveRunnerAdmissionTimeout = 5 * time.Second
 	maxLiveRunnerAdmissionBody        = 64 << 10
 	maxLiveRunnerMemberIDBytes        = 128
@@ -426,4 +431,48 @@ func (r *LiveRunnerRegistry) configuredPrice(app string) (LiveRunnerPriceInfo, b
 	defer r.pricesMu.RUnlock()
 	price, ok := r.prices[app]
 	return price, ok
+}
+
+// PoolMode says whether registrations are decided by an admitter.
+func (r *LiveRunnerRegistry) PoolMode() bool {
+	return r.poolMode()
+}
+
+// ProbeRunnerMode is RunnerMode for the pool service's probe, which reaches a
+// runner in any state.
+func (r *LiveRunnerRegistry) ProbeRunnerMode(runnerID string) (string, error) {
+	return r.runnerMode(runnerID, true)
+}
+
+// ReserveProbeSession reserves an unpaid session for the pool service's test
+// on a runner in any state. It is an ordinary session otherwise: it counts
+// against capacity and is proxied and released the same way. Its id has the
+// shape a customer's would, so the runner cannot tell a test from real work.
+func (r *LiveRunnerRegistry) ReserveProbeSession(runnerID string) (string, string, error) {
+	if r.offchain {
+		// Off-chain customer sessions are unpaid too and get a generated id.
+		return r.reserveSession(runnerID, true)
+	}
+	// On-chain a customer's session id is the payment's manifest id.
+	return r.reserveSession(runnerID, true, string(core.RandomManifestID()))
+}
+
+// releaseExpiredProbeSessions releases probe sessions nobody stopped.
+func (r *LiveRunnerRegistry) releaseExpiredProbeSessions(now time.Time) {
+	r.mu.Lock()
+	snapshot := make([]*liveRunner, 0, len(r.runners))
+	for _, runner := range r.runners {
+		snapshot = append(snapshot, runner)
+	}
+	r.mu.Unlock()
+	for _, runner := range snapshot {
+		runner.mu.Lock()
+		for sessionID, session := range runner.sessions {
+			if session.probe && now.Sub(session.createdAt) > liveRunnerProbeSessionTTL {
+				slog.Warn("live runner probe session expired", "runner_id", runner.RunnerID, "session_id", sessionID)
+				runner.releaseSessionLocked(sessionID)
+			}
+		}
+		runner.mu.Unlock()
+	}
 }

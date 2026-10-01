@@ -129,6 +129,9 @@ type LivepeerNode struct {
 	AIProcesssingRetryTimeout time.Duration
 
 	LiveRunnerManager any // NB: kludge to avoid ai/runner circular dependency
+	// LiveRunnerPoolSecret is shared with the pool service: sent to its
+	// admission webhook, and accepted from it for unpaid probe sessions.
+	LiveRunnerPoolSecret string
 
 	// Transcoder public fields
 	SegmentChans         map[ManifestID]SegmentChan

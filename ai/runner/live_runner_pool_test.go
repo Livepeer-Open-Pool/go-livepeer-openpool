@@ -703,3 +703,58 @@ func TestHeartbeatResponseCarriesNoPriceWithoutATable(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, string(data), "price_info")
 }
+
+func TestProbeSessionReachesEveryStateAndLooksLikeACustomers(t *testing.T) {
+	for _, state := range []string{LiveRunnerStateProbation, LiveRunnerStateActive, LiveRunnerStateSuspended} {
+		t.Run(state, func(t *testing.T) {
+			registry := newPoolTestRegistry(t, &fakeAdmitter{answer: admitAs("m1", state, 1)})
+			resp := poolTestRegister(t, registry, "c1")
+
+			mode, err := registry.ProbeRunnerMode(resp.RunnerID)
+			require.NoError(t, err)
+			require.Equal(t, LiveRunnerModeSingleShot, mode)
+			sessionID, endpoint, err := registry.ReserveProbeSession(resp.RunnerID)
+			require.NoError(t, err)
+			require.Equal(t, "tunnel://"+resp.RunnerID, endpoint)
+			require.Regexp(t, liveRunnerTestGeneratedSessionIDPattern, sessionID, "off-chain a customer's session id is generated")
+
+			// It is an ordinary session: it takes a slot and is released the usual way.
+			_, _, err = registry.ReserveProbeSession(resp.RunnerID)
+			require.NoError(t, err)
+			_, _, err = registry.ReserveProbeSession(resp.RunnerID)
+			requireRunnerError(t, err, http.StatusServiceUnavailable, "no capacity available for runner")
+			require.NoError(t, registry.ReleaseSession(resp.RunnerID, sessionID))
+			_, _, err = registry.ReserveProbeSession(resp.RunnerID)
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestProbeSessionIDLooksPaidOnchain(t *testing.T) {
+	registry := newOnchainPoolTestRegistry(t, &fakeAdmitter{})
+	resp := poolTestRegister(t, registry, "c1")
+	sessionID, _, err := registry.ReserveProbeSession(resp.RunnerID)
+	require.NoError(t, err)
+	require.Regexp(t, `^[0-9a-f]+$`, sessionID, "on-chain a customer's session id is the payment's manifest id")
+	require.Len(t, sessionID, len(core.RandomManifestID()))
+}
+
+func TestProbeSessionsNobodyStoppedAreReleased(t *testing.T) {
+	registry := newPoolTestRegistry(t, &fakeAdmitter{answer: admitAs("m1", LiveRunnerStateActive, 1)})
+	resp := poolTestRegister(t, registry, "c1")
+	probeID, _, err := registry.ReserveProbeSession(resp.RunnerID)
+	require.NoError(t, err)
+	customerID, _, err := registry.ReserveSession(resp.RunnerID)
+	require.NoError(t, err)
+
+	registry.releaseExpiredProbeSessions(time.Now().Add(liveRunnerProbeSessionTTL - time.Minute))
+	_, err = registry.RunnerEndpointForSession(resp.RunnerID, probeID)
+	require.NoError(t, err, "not yet")
+
+	// Past the limit only the probe session goes; a customer's session has no such limit.
+	registry.releaseExpiredProbeSessions(time.Now().Add(liveRunnerProbeSessionTTL + time.Minute))
+	_, err = registry.RunnerEndpointForSession(resp.RunnerID, probeID)
+	requireRunnerError(t, err, http.StatusNotFound, "runner session not found")
+	_, err = registry.RunnerEndpointForSession(resp.RunnerID, customerID)
+	require.NoError(t, err)
+}
