@@ -112,16 +112,23 @@ func startPoolRunner(t *testing.T, orchURL, credential string) *tunnelclient.Cli
 
 func startPoolRunnerFor(t *testing.T, orchURL, credential, mode string, capacity int, appHandler http.Handler) *tunnelclient.Client {
 	t.Helper()
+	return startPoolRunnerLoggingTo(t, io.Discard, orchURL, credential, mode, capacity, appHandler)
+}
+
+// startPoolRunnerLoggingTo runs the command's client the way a pool member
+// does: with a credential and no price of its own.
+func startPoolRunnerLoggingTo(t *testing.T, log io.Writer, orchURL, credential, mode string, capacity int, appHandler http.Handler) *tunnelclient.Client {
+	t.Helper()
 	app := httptest.NewServer(appHandler)
 	t.Cleanup(app.Close)
 	client, err := tunnelclient.New(tunnelclient.Config{
 		Orchestrator: orchURL,
-		OrchSecret:   credential,
+		Credential:   credential,
 		Target:       app.URL,
 		App:          "vllm/qwen2.5-7b-instruct",
 		Mode:         mode,
 		Capacity:     capacity,
-		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Logger:       slog.New(slog.NewTextHandler(log, nil)),
 	})
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -502,4 +509,66 @@ func TestPoolProbeSkipsThePaymentChallenge(t *testing.T) {
 	status, body := doRequest(t, probeRequest(t, http.MethodGet, appURL, poolTestSecret))
 	require.Equal(t, http.StatusOK, status, body)
 	require.Equal(t, "app", body)
+}
+
+// syncBuffer is a log destination that can be read while it is written to.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestRunnerCommandJoinsAPoolWithACredentialAndNoPrice(t *testing.T) {
+	webhook := newPoolWebhook(t, runner.LiveRunnerAdmissionResponse{Allow: true, MemberID: "m1", State: runner.LiveRunnerStateActive})
+	// On-chain, where a runner outside a pool has to name its price.
+	lp, orch := newPoolLiveRunnerHTTPOn(t, webhook, true)
+	log := &syncBuffer{}
+	client := startPoolRunnerLoggingTo(t, log, orch.URL, "member-credential", "single-shot", 2, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "app")
+	}))
+	runnerID := waitPoolRunnerConnected(t, lp, client)
+
+	// It is told what the operator pays for the app, and says so in its log.
+	require.Contains(t, log.String(), "the orchestrator sets this app's price")
+	require.Contains(t, log.String(), "price=10 currency=usd unit=hour")
+	manager := lp.node.LiveRunnerManager.(*runner.LiveRunnerRegistry)
+	runners := manager.PoolRunners()
+	require.Len(t, runners, 1)
+	require.Equal(t, runnerID, runners[0].RunnerID)
+	require.Equal(t, json.Number("10"), runners[0].PriceInfo.Price)
+
+	// Its later heartbeats are accepted: nothing it reports has changed.
+	require.Never(t, func() bool { return client.RunnerID() != runnerID }, 2*time.Second, 100*time.Millisecond)
+}
+
+func TestRunnerCommandSaysWhyItWasRefusedAndKeepsTrying(t *testing.T) {
+	webhook := newPoolWebhook(t, runner.LiveRunnerAdmissionResponse{Allow: false, Reason: "credential revoked"})
+	lp, orch := newPoolLiveRunnerHTTP(t, webhook)
+	log := &syncBuffer{}
+	client := startPoolRunnerLoggingTo(t, log, orch.URL, "member-credential", "single-shot", 1, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	require.Eventually(t, func() bool {
+		calls, _ := webhook.seen()
+		return len(calls) >= 2
+	}, 15*time.Second, 50*time.Millisecond, "a refused runner retries")
+	require.Contains(t, log.String(), "orchestrator refused the registration")
+	require.Contains(t, log.String(), "403 credential revoked")
+	require.Empty(t, client.RunnerID())
+
+	// Once the pool service lets it in, it joins without being restarted.
+	webhook.mu.Lock()
+	webhook.answer = runner.LiveRunnerAdmissionResponse{Allow: true, MemberID: "m1"}
+	webhook.mu.Unlock()
+	waitPoolRunnerConnected(t, lp, client)
 }

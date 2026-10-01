@@ -42,7 +42,11 @@ type Config struct {
 	// Orchestrator is the orchestrator's service address, https://host:port.
 	Orchestrator string
 	// OrchSecret is the registration secret (-orchSecret on the orchestrator).
+	// An orchestrator in pool mode does not accept it; use Credential there.
 	OrchSecret string
+	// Credential is what a pool member registers with: the credential the
+	// pool service issued. Exactly one of OrchSecret and Credential is set.
+	Credential string
 	// Target is the local app, for example http://127.0.0.1:8000.
 	Target string
 	// Health is a path on Target that answers 200 while the app can take
@@ -89,6 +93,9 @@ type heartbeatResponse struct {
 	HeartbeatInterval string `json:"heartbeat_interval"`
 	HeartbeatTTL      string `json:"heartbeat_ttl"`
 	HeartbeatSecret   string `json:"heartbeat_secret,omitempty"`
+	// PriceInfo is the price the orchestrator offers the runner at, when the
+	// operator sets it rather than the runner.
+	PriceInfo *priceInfo `json:"price_info,omitempty"`
 }
 
 // Client runs one tunneled registration.
@@ -125,8 +132,12 @@ func New(cfg Config) (*Client, error) {
 	if err != nil || target.Host == "" || (target.Scheme != "http" && target.Scheme != "https") {
 		return nil, fmt.Errorf("target must be an http(s) URL")
 	}
-	if strings.TrimSpace(cfg.OrchSecret) == "" {
-		return nil, fmt.Errorf("orchSecret is required")
+	cfg.OrchSecret, cfg.Credential = strings.TrimSpace(cfg.OrchSecret), strings.TrimSpace(cfg.Credential)
+	if cfg.OrchSecret == "" && cfg.Credential == "" {
+		return nil, fmt.Errorf("credential or orchSecret is required")
+	}
+	if cfg.OrchSecret != "" && cfg.Credential != "" {
+		return nil, fmt.Errorf("credential and orchSecret are exclusive")
 	}
 	if strings.TrimSpace(cfg.App) == "" {
 		return nil, fmt.Errorf("app is required")
@@ -227,9 +238,23 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 }
 
+// registrationAuth is what the registration heartbeat presents: the pool
+// credential, or the orchestrator's registration secret outside a pool.
+func (c *Client) registrationAuth() string {
+	if c.cfg.Credential != "" {
+		return c.cfg.Credential
+	}
+	return c.cfg.OrchSecret
+}
+
 func (c *Client) register(ctx context.Context) error {
-	resp, status, err := c.heartbeat(ctx, "", c.cfg.OrchSecret)
+	resp, status, err := c.heartbeat(ctx, "", c.registrationAuth())
 	if err != nil {
+		if status != 0 {
+			// The orchestrator's answer says why: a denied credential, a runner
+			// limit, an app it does not offer, or admission being unavailable.
+			return fmt.Errorf("orchestrator refused the registration: %w", err)
+		}
 		return err
 	}
 	if status != http.StatusOK {
@@ -244,6 +269,9 @@ func (c *Client) register(ctx context.Context) error {
 	}
 	c.setRegistration(resp.RunnerID, resp.HeartbeatSecret, interval)
 	c.log.Info("registered", "runner_id", resp.RunnerID, "app", c.cfg.App, "orchestrator", c.orch.String())
+	if p := resp.PriceInfo; p != nil {
+		c.log.Info("the orchestrator sets this app's price", "app", c.cfg.App, "price", p.Price.String(), "currency", p.Currency, "unit", p.Unit)
+	}
 	return nil
 }
 
@@ -259,7 +287,8 @@ func (c *Client) registration() (string, string, time.Duration) {
 	return c.runnerID, c.secret, c.interval
 }
 
-// heartbeat posts one heartbeat; a bootstrap uses the orch secret and no id.
+// heartbeat posts one heartbeat; a registration uses the credential or the
+// orch secret and no id.
 func (c *Client) heartbeat(ctx context.Context, runnerID, auth string) (*heartbeatResponse, int, error) {
 	body := heartbeatRequest{
 		RunnerID: runnerID,

@@ -301,6 +301,52 @@ Metrics: `livepeer_live_runner_tunnels`, `livepeer_live_runner_tunnel_streams`,
 and `livepeer_live_runner_tunnel_events_total{event_type}` with `connect`,
 `closed`, `replaced`, and `removed`.
 
+### Pool mode
+
+An orchestrator can take Live Runners that belong to other people ("pool
+members"). A separate pool service decides who may join, tests their
+runners, and pays them a share of what the orchestrator earns; the
+orchestrator only admits a runner under a member's name, lets the pool
+service control it, and records what it earned. The design is in
+[live-runner-pool.md](live-runner-pool.md).
+
+Setting `-liveRunnerAuthWebhookUrl` turns pool mode on. Registration then
+works differently for every dynamic runner:
+
+- A member registers with `livepeer_runner_tunnel -credential <credential>`
+  in place of `-orchSecret`, and needs no `-price`. `-orchSecret` registers
+  no Live Runner.
+- A heartbeat without a `runner_id` is a registration. The orchestrator
+  assigns the id and asks the webhook, which answers with the member, a
+  runner limit and the state the runner starts in. A refusal is `403` with
+  the webhook's reason, `429 member runner limit`, `400 app not offered`,
+  or `503 admission unavailable` when the webhook does not answer.
+- Runners must register with a tunnel, and cannot change what they were
+  admitted as: only `status`, `session_ids`, and a `capacity` up to the
+  registered one may change on later heartbeats.
+- The runner's app must be in the operator's price table
+  (`-liveRunnerPrices`); the runner is offered at that price, which the
+  heartbeat response returns in `price_info`.
+
+A runner has a state as well as the status it reports:
+
+| State | Discovery | Customer requests | Probe |
+| --- | --- | --- | --- |
+| `probation` | hidden | `404` | reaches it |
+| `active` | listed | served | reaches it |
+| `suspended` | hidden | `409 runner suspended`; running sessions finish | reaches it |
+
+A probe is the pool service's test: a request to `/apps/{runner_id}/session`
+or `/apps/{runner_id}/app/…` carrying `Livepeer-Probe-Secret` with the value
+of `-liveRunnerPoolSecret`. It opens an unpaid session on that runner in any
+state. In pool mode the proxy does not forward the payment headers, so a
+runner cannot tell a probe from paid work.
+
+The pool service drives the registry through the CLI port
+(`GET /liveRunner/runners`, `POST /liveRunner/setState`,
+`POST /liveRunner/evict`, `POST /liveRunner/prices`) and reads what runners
+earned from the events on `-kafkaOrchestratorTopic`.
+
 ### Discovery
 
 Discovery has two layers. The orchestrator describes the applications it can
@@ -499,6 +545,11 @@ remote signer flags remain documented with their owning features.
 | `-liveRunnerProxyUrl` | `{service URI}/run/{proxy}` | Absolute HTTP(S) public proxy template containing exactly one `{proxy}` in the host or final path segment. |
 | `-orchSecret` | empty | Bootstrap `Authorization` value for dynamic registration. Static-only registration can run without it. The value can also be a path according to the general orchestrator-secret behavior. |
 | `-serviceAddr` | empty | Public orchestrator URI used in discovery and ordinary `/apps` URLs. It must be configured or otherwise available through the node's advertised service URI. |
+| `-liveRunnerAuthWebhookUrl` | empty | Pool mode: URL of the pool service's admission webhook. When set, the webhook decides every dynamic registration, `-orchSecret` registers no Live Runner, and runners must register with a tunnel. |
+| `-liveRunnerAuthWebhookTimeout` | `5s` | How long to wait for the admission webhook. A registration is refused with `503` when it does not answer. |
+| `-liveRunnerPoolSecret` | empty | Secret shared with the pool service, or the path of a file holding it. Sent as a bearer token on admission webhook calls and accepted in `Livepeer-Probe-Secret` for unpaid probe sessions. Without it no probe is accepted. |
+| `-liveRunnerPrices` | empty | Path of a JSON file with the operator's price per app, `{"apps":{"<app>":{"price":"0.50","currency":"usd","unit":"hour"}}}`. A runner of a listed app is offered at that price whatever it asks for; in pool mode a runner may only register a listed app. |
+| `-kafkaOrchestratorTopic` | empty | Kafka topic for orchestrator events: Live Runner registrations, state changes, sessions and every fee debited. Requires `-monitor` and `-kafkaBootstrapServers`. `-kafkaRequireDelivery` makes an event wait up to `-kafkaEnqueueTimeout` for room in a full queue instead of being dropped at once. |
 
 Remote signer aggregation, webhook discovery, price filtering, and Ethereum
 configuration use the normal discovery, pricing, and remote signer flags. See
@@ -555,13 +606,18 @@ The **orchestrator HTTP server** normally uses port 8935. The **orchestrator CLI
 server** defaults to `127.0.0.1:7935`. A **remote signer HTTP server** defaults
 to `127.0.0.1:8935`. Explicit listener configuration overrides these defaults.
 
-#### Orchestrator CLI endpoint
+#### Orchestrator CLI endpoints
 
-This endpoint runs on the orchestrator CLI server and is intended for operators.
+These endpoints run on the orchestrator CLI server and are intended for
+operators and, in pool mode, the pool service.
 
 | Method and path | Authentication | Description | Principal responses |
 | --- | --- | --- | --- |
 | `POST /registerLiveRunners` | No application-level auth; protect the CLI listener | Atomically validates and upserts a static configuration document. Returns runner IDs and initial health results. | `200`, `400`, `404` when live runners are disabled, `405` |
+| `GET /liveRunner/runners` | Same | Lists every registered runner in every state, including those discovery hides, with its member, payout address, state, capacity in use, price, tunnel status and session ids. Runners outside a pool are listed under the member `operator`. | `200`, `404` when live runners are disabled |
+| `POST /liveRunner/setState` | Same | Form fields `runner_id`, `state` (`probation`, `active` or `suspended`) and optional `reason`. Leaving `active` stops new work; running sessions finish. | `204`, `400`, `404` |
+| `POST /liveRunner/evict` | Same | Form field `runner_id` or `member_id`, and optional `reason`. Removes the runner, or every runner of the member: tunnel closed, sessions released, heartbeat secret invalid. A static runner is refused. | `204`, `400`, `404` when nothing matched |
+| `POST /liveRunner/prices` | Same | Body is the `-liveRunnerPrices` JSON; replaces the whole price table, or changes nothing when it does not validate. A new price applies to new sessions only. | `204`, `400` |
 
 #### Remote signer endpoint
 
