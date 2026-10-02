@@ -1,3 +1,4 @@
+import { brand } from "@openpool/ui/brand"
 import { defineConfig, type Plugin } from "vite"
 
 /**
@@ -36,7 +37,16 @@ const pages = (): Plugin => ({
 // page as an HTML file that references them. The result is plain files.
 export default defineConfig({
   appType: "custom",
-  plugins: [pages()],
+  plugins: [
+    // The pages are written by src/document.ts, which puts the brand's head tags there itself.
+    brand({
+      name: "Open Pool",
+      description: "A pool of GPU machines serving AI and video apps on the Livepeer network, paying members in ETH.",
+      display: "browser",
+      head: false,
+    }),
+    pages(),
+  ],
   server: { port: 5173, strictPort: true },
   preview: { port: 5173, strictPort: true },
   build: {

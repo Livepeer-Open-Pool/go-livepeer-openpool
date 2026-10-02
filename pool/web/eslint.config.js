@@ -37,6 +37,11 @@ export default tseslint.config(
     },
   },
   {
+    // The theme script runs in the page, from each page's head; it is plain JavaScript.
+    files: ["packages/ui/brand/theme.js"],
+    languageOptions: { globals: { document: "readonly", localStorage: "readonly", window: "readonly" } },
+  },
+  {
     files: ["**/test/**/*.ts", "e2e/**/*.ts", "**/scripts/**/*.ts", "**/*.config.ts"],
     rules: { "@typescript-eslint/no-non-null-assertion": "off" },
   },

@@ -1,3 +1,4 @@
+import { brand } from "@openpool/ui/brand"
 import { defineConfig, type Plugin } from "vite"
 
 /**
@@ -21,7 +22,10 @@ const notFoundIsTheApp = (): Plugin => ({
 // styles, and config.json, which names the pool's regions and is read when
 // the site starts. Any web server can host them.
 export default defineConfig({
-  plugins: [notFoundIsTheApp()],
+  plugins: [
+    brand({ name: "Open Pool admin", shortName: "Pool admin", description: "The operator's site for Open Pool: applications, members, machines, the catalog, runners and payouts." }),
+    notFoundIsTheApp(),
+  ],
   server: { port: 5175, strictPort: true },
   preview: { port: 5175, strictPort: true },
   build: { target: "es2022", sourcemap: true },
