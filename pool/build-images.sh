@@ -16,16 +16,31 @@
 # The orchestrator and the tunnel are go-livepeer, built from this branch,
 # and are tagged with its version and commit. The public site's pages carry
 # the two addresses above, so its image is built for them.
+#
+# Everything is built from a clean copy of the commit that is checked out,
+# not from the working directory: an image is exactly the commit its tag
+# names, whatever else is lying in the directory, and go-livepeer does not
+# report its version as "dirty".
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
+if ! git diff --quiet HEAD --; then
+  echo "note: changes that are not committed are not in what is built; the images are of commit $(git rev-parse --short=8 HEAD)" >&2
+fi
+commit="$(git rev-parse --short=8 HEAD)"
+clean="$(mktemp -d)"
+trap 'rm -rf "$clean"' EXIT
+# Images in the repository are stored with Git LFS and no build needs them.
+GIT_LFS_SKIP_SMUDGE=1 git clone --quiet --local "$root" "$clean/src"
+cd "$clean/src"
+
 REGISTRY="${REGISTRY:-tztcloud}"
 VERSION="${VERSION:-0.1.0}"
 OPENPOOL_SITE_URL="${OPENPOOL_SITE_URL:-https://open-pool.com}"
 OPENPOOL_MEMBER_URL="${OPENPOOL_MEMBER_URL:-https://app.open-pool.com}"
-node_version="v$(cat VERSION)-$(git rev-parse --short=8 HEAD)"
+node_version="v$(cat VERSION)-$commit"
 
 declare -A image=(
   [orchestrator]="$REGISTRY/go-livepeer:$node_version"
