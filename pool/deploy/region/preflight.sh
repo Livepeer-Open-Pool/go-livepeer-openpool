@@ -134,6 +134,20 @@ if [ -n "$used_resolvers" ]; then
   case " $used_resolvers" in *" ${TRAEFIK_CERTRESOLVER:-} "*) ok "certificate resolver ${TRAEFIK_CERTRESOLVER} is the one other services here use" ;;
     *) warn "certificate resolver ${TRAEFIK_CERTRESOLVER:-(unset)} is not one other services here use ($used_resolvers)" ;; esac
 fi
+# A resolver that is named but cannot issue leaves Traefik serving its own
+# self-signed certificate. Ask it for a name another service here has.
+if [ -n "${traefik:-}" ] && command -v openssl >/dev/null 2>&1; then
+  traefik_ip="$(docker inspect -f "{{(index .NetworkSettings.Networks \"${TRAEFIK_NETWORK}\").IPAddress}}" "${traefik%% *}" 2>/dev/null)"
+  known="$(for c in $others; do labels_of "$c"; done | grep -E '^traefik\.http\.routers\..*\.rule = ' | grep -o 'Host(`[^`]*`)' | head -1 | cut -d'`' -f2)"
+  if [ -n "$traefik_ip" ] && [ -n "$known" ]; then
+    issuer="$(echo | timeout 10 openssl s_client -connect "$traefik_ip:443" -servername "$known" 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null)"
+    case "$issuer" in
+      *"TRAEFIK DEFAULT CERT"*) warn "Traefik answers for $known with its own self-signed certificate, so it is not issuing certificates. Browsers will refuse ${POOL_API_HOST:-the pool API} unless a proxy that accepts that certificate, such as Cloudflare's, is in front of it" ;;
+      "") ;;
+      *) ok "Traefik serves an issued certificate for $known" ;;
+    esac
+  fi
+fi
 if [ -n "$used_entrypoints" ]; then
   case " $used_entrypoints" in *" ${TRAEFIK_ENTRYPOINT:-} "*) ok "entrypoint ${TRAEFIK_ENTRYPOINT} is the one other services here use" ;;
     *) warn "entrypoint ${TRAEFIK_ENTRYPOINT:-(unset)} is not one other services here use ($used_entrypoints)" ;; esac

@@ -105,6 +105,8 @@ curl -k https://<ORCH_HOST>/discovery              # the orchestrator, through T
 | pool service | HTTP router for `POOL_API_HOST`, with a certificate from your resolver, to port 8090 | browsers call it from the three sites |
 | orchestrator | TCP router for `ORCH_HOST` with TLS passed through, to port 8935 | an orchestrator serves its own self-signed certificate, which Livepeer gateways and the tunnel expect; Traefik forwards the connection without ending TLS |
 
+The pool service's name needs a certificate browsers accept: either `TRAEFIK_CERTRESOLVER` names a resolver that issues one, or a proxy that accepts Traefik's own certificate, such as Cloudflare's, is in front of that name. `./preflight.sh` warns when your Traefik is serving its self-signed certificate. The orchestrator's name is never proxied.
+
 Both use the same HTTPS entrypoint. If you would rather publish the orchestrator's port directly, remove its labels, add `ports: ["8935:8935"]`, and set `ORCH_PUBLIC_PORT=8935` in `.env`.
 
 The orchestrator's CLI port, which controls the node, listens only on the compose file's inner network at a fixed address. It is not reachable from the Traefik network or from outside.
