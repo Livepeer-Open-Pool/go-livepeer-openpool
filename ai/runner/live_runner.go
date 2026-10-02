@@ -300,6 +300,10 @@ type LiveRunnerRegistry struct {
 	orchAddress       string
 	eventSink         LiveRunnerEventSink
 	events            chan liveRunnerEvent // nil when events are off
+	round             func() int64
+
+	refusalsMu sync.Mutex
+	refusals   map[string]int // requests refused for lack of capacity, per app, since the last report
 
 	pricesMu sync.RWMutex
 	prices   map[string]LiveRunnerPriceInfo // the operator's price per app
@@ -337,6 +341,9 @@ type LiveRunnerRegistryConfig struct {
 	// Events publishes the registry's events: registrations, state changes,
 	// sessions and fees. Nil turns them off.
 	Events LiveRunnerEventSink
+	// Round reports the current Livepeer round, which every event is stamped
+	// with. Nil, or a round of zero, leaves the stamp out.
+	Round func() int64
 }
 
 var liveRunnerChannelNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
@@ -381,8 +388,11 @@ func NewLiveRunnerRegistry(config LiveRunnerRegistryConfig) *LiveRunnerRegistry 
 	}
 	if config.Events != nil {
 		r.eventSink = config.Events
+		r.round = config.Round
 		r.events = make(chan liveRunnerEvent, liveRunnerEventQueueSize)
+		r.refusals = make(map[string]int)
 		go r.eventLoop()
+		go r.refusalLoop()
 	}
 	go r.healthLoop()
 	go r.expiryLoop()
@@ -1091,7 +1101,9 @@ func (r *LiveRunnerRegistry) Unregister(runnerID, auth string) error {
 // a public app URL, while single-shot reservations return the runner endpoint
 // for internal forwarding.
 func (r *LiveRunnerRegistry) ReserveSession(runnerID string, optSessionID ...string) (string, string, error) {
-	return r.reserveSession(runnerID, liveRunnerSessionOptions{}, optSessionID...)
+	sessionID, appURL, err := r.reserveSession(runnerID, liveRunnerSessionOptions{}, optSessionID...)
+	r.noteRunnerRefusal(runnerID, err)
+	return sessionID, appURL, err
 }
 
 func (r *LiveRunnerRegistry) reserveSession(runnerID string, opts liveRunnerSessionOptions, optSessionID ...string) (string, string, error) {

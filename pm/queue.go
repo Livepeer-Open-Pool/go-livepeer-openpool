@@ -152,6 +152,9 @@ func (q *ticketQueue) handleBlockEvent(latestL1Block *big.Int) {
 						continue
 					}
 				}
+				if res.err == nil {
+					reportTicketRedeemed(nextTicket, res.txHash, q.tm.LastInitializedRound())
+				}
 				if err := q.store.MarkWinningTicketRedeemed(nextTicket, res.txHash); err != nil {
 					glog.Error(err)
 					continue

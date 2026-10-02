@@ -22,6 +22,7 @@
 - Orchestrator events: with `-kafkaOrchestratorTopic` set, the orchestrator publishes `live_runner_registered`, `live_runner_state_changed`, `live_runner_removed`, `live_runner_session_reserved`, `live_runner_session_released` and `live_runner_fee_debited` events, each naming the runner, its member and its app, so a pool service can record what each member's runners earn. A session's released event carries the totals of its fee events. Dropped events are counted in `livepeer_orchestrator_events_dropped_total`; `-kafkaRequireDelivery` makes an event wait up to `-kafkaEnqueueTimeout` for room in a full queue.
 - `livepeer_runner_tunnel` joins a pool with `-credential` in place of `-orchSecret` and needs no `-price` there; it logs the price the orchestrator offers the runner at, and the orchestrator's reason when a registration is refused.
 - Live Runner app-level routing: a customer can ask for an app instead of a runner. `POST /pool/{app}/session` and `/pool/{app}/app/…`, where `{app}` is the app name base64url-encoded, pick the least-loaded active runner of an app the operator has priced; the session response names the chosen runner in `runner_id`, and `GET /discovery` lists the apps with their URL, price and capacity in `apps`.
+- Orchestrator events carry `round`, the current round. Two new events on `-kafkaOrchestratorTopic`: `orchestrator_ticket_redeemed`, emitted when the node redeems a winning ticket, with its face value, and `live_runner_requests_refused`, a count per app of requests answered `503` for lack of capacity.
 
 #### Transcoder
 

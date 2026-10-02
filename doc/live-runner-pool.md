@@ -305,7 +305,7 @@ Every event is a JSON object with this envelope plus the type's fields. Messages
 }
 ```
 
-`event_id` is a UUID, so the pool service can drop a redelivered message.
+`event_id` is a UUID, so the pool service can drop a redelivered message. On-chain, every event also carries `round`, the Livepeer round current when it happened, which is what the pool service counts its payout windows by.
 
 | `event_type` | Emitted when | Fields |
 | --- | --- | --- |
@@ -315,6 +315,8 @@ Every event is a JSON object with this envelope plus the type's fields. Messages
 | `live_runner_session_reserved` | session reserved | `session_id`, `sender` (payer address, or `""`), `paid`, `price_info`, `via`: `runner` or `pool` |
 | `live_runner_session_released` | session released | `session_id`, `sender`, `paid`, `duration_ms`, `reason`: `completed` (a single-shot request finished), `stopped`, `payment_failed`, `runner_removed`, `runner_unhealthy`, `expired` (a probe nobody stopped); `units_total`, `fee_wei_total` |
 | `live_runner_fee_debited` | each successful debit for a live-runner session | `session_id`, `sender`, `units`, `fee_wei`, `balance_wei` |
+| `live_runner_requests_refused` | at most every ten seconds per app, when customer requests were answered `503` for lack of capacity | `app`, `count`. It has no `runner_id` or `member_id`. Probes are not counted |
+| `orchestrator_ticket_redeemed` | this node redeemed a winning ticket | `sender`, `face_value_wei`, `tx_hash`, `round` (when redeemed), `creation_round`. Not emitted for a ticket the node gave up on. The sum of `face_value_wei` over a span of rounds is what the node earned in it, which is the pot a pool pays members from |
 
 How it is built:
 

@@ -296,3 +296,85 @@ func TestWithoutASinkNoEventsAreQueued(t *testing.T) {
 	require.NoError(t, registry.RecordSessionFee(resp.RunnerID, sessionID, "0xc1", 1, big.NewRat(1, 1), nil))
 	require.NoError(t, registry.EvictRunner(resp.RunnerID, ""))
 }
+
+func TestEventsAreStampedWithTheCurrentRound(t *testing.T) {
+	recorder := &eventRecorder{}
+	round := int64(4100)
+	var roundMu sync.Mutex
+	registry := newLiveRunnerTestRegistryWithConfig(LiveRunnerRegistryConfig{
+		Host: liveRunnerTestHost{}, Admitter: &fakeAdmitter{answer: admitAs("m1", LiveRunnerStateActive, 4)},
+		Prices: poolTestPrices(), Events: recorder.sink,
+		Round: func() int64 {
+			roundMu.Lock()
+			defer roundMu.Unlock()
+			return round
+		},
+	})
+	t.Cleanup(registry.Stop)
+
+	resp := poolTestRegister(t, registry, "c1")
+	sessionID, _, err := registry.ReservePaidSession(resp.RunnerID, "manifest-1", "0xc1")
+	require.NoError(t, err)
+	require.NoError(t, registry.RecordSessionFee(resp.RunnerID, sessionID, "0xc1", 1, big.NewRat(5, 1), nil))
+	// The round turns over while the session runs: each event carries the
+	// round it happened in, which is what a pool counts its windows by.
+	roundMu.Lock()
+	round = 4101
+	roundMu.Unlock()
+	require.NoError(t, registry.RecordSessionFee(resp.RunnerID, sessionID, "0xc1", 1, big.NewRat(5, 1), nil))
+	require.NoError(t, registry.ReleaseSession(resp.RunnerID, sessionID))
+
+	events := recorder.wait(t, 5)
+	rounds := []interface{}{}
+	for _, event := range events {
+		rounds = append(rounds, event.fields["round"])
+	}
+	require.Equal(t, []interface{}{int64(4100), int64(4100), int64(4100), int64(4101), int64(4101)}, rounds)
+}
+
+func TestEventsCarryNoRoundOffchain(t *testing.T) {
+	registry, recorder := newEventTestRegistry(t, false, &fakeAdmitter{})
+	poolTestRegister(t, registry, "c1")
+	require.NotContains(t, recorder.wait(t, 1)[0].fields, "round")
+}
+
+func TestRefusedRequestsAreCountedPerApp(t *testing.T) {
+	registry, recorder := newEventTestRegistry(t, false, &fakeAdmitter{answer: admitAs("m1", LiveRunnerStateActive, 4)})
+	req := poolTestHeartbeat()
+	req.Capacity = 1
+	resp, err := registry.HeartbeatFrom(req, "c1", "")
+	require.NoError(t, err)
+	attachPipeTunnel(t, registry, resp.RunnerID, resp.HeartbeatSecret)
+	_, _, err = registry.ReserveSession(resp.RunnerID)
+	require.NoError(t, err)
+
+	// The runner is full. Customers asking for it by id, or for its app, are turned away.
+	_, _, err = registry.ReserveSession(resp.RunnerID)
+	requireRunnerError(t, err, http.StatusServiceUnavailable, "no capacity available for runner")
+	_, _, err = registry.ReservePaidSession(resp.RunnerID, "manifest-1", "0xc1")
+	requireRunnerError(t, err, http.StatusServiceUnavailable, "no capacity available for runner")
+	_, _, _, err = registry.ReservePoolSession(routingTestApp, LiveRunnerModeSingleShot)
+	requireRunnerError(t, err, http.StatusServiceUnavailable, "no capacity for app")
+	_, err = registry.PoolPaymentInfo(routingTestApp, LiveRunnerModeSingleShot)
+	requireRunnerError(t, err, http.StatusServiceUnavailable, "no capacity for app")
+	// The pool service's own probe is not a customer and is not counted.
+	_, _, err = registry.ReserveProbeSession(resp.RunnerID)
+	requireRunnerError(t, err, http.StatusServiceUnavailable, "no capacity available for runner")
+	// Neither is a request for an app that is not offered at all.
+	_, _, _, err = registry.ReservePoolSession("flux/schnell", LiveRunnerModeSingleShot)
+	requireRunnerError(t, err, http.StatusNotFound, "app not offered")
+
+	registry.reportRefusals()
+	events := recorder.wait(t, 3)
+	refused := events[2]
+	require.Equal(t, LiveRunnerEventRequestsRefused, refused.eventType)
+	require.Equal(t, routingTestApp, refused.key)
+	require.Equal(t, routingTestApp, refused.fields["app"])
+	require.Equal(t, 4, refused.fields["count"])
+	require.NotContains(t, refused.fields, "runner_id", "the count is about an app, not a runner")
+
+	// Nothing refused since: nothing reported.
+	registry.reportRefusals()
+	require.NoError(t, registry.SetRunnerState(resp.RunnerID, LiveRunnerStateSuspended, ""))
+	require.Equal(t, LiveRunnerEventStateChanged, recorder.wait(t, 4)[3].eventType)
+}

@@ -1,8 +1,10 @@
 package runner
 
 import (
+	"errors"
 	"log/slog"
 	"math/big"
+	"net/http"
 	"time"
 
 	"github.com/livepeer/go-livepeer/monitor"
@@ -21,7 +23,16 @@ const (
 	LiveRunnerEventSessionReserved = "live_runner_session_reserved"
 	LiveRunnerEventSessionReleased = "live_runner_session_released"
 	LiveRunnerEventFeeDebited      = "live_runner_fee_debited"
+	// LiveRunnerEventRequestsRefused counts, per app, the customer requests
+	// answered 503 because no runner had a free slot: demand the pool could
+	// not serve.
+	LiveRunnerEventRequestsRefused = "live_runner_requests_refused"
 )
+
+// liveRunnerRefusalInterval is how often refused requests are reported. They
+// are counted and reported together because an overloaded app refuses many
+// requests a second.
+const liveRunnerRefusalInterval = 10 * time.Second
 
 // Why a session was released, as its released event reports it.
 const (
@@ -93,20 +104,92 @@ func (runner *liveRunner) emitLocked(eventType string, fields map[string]interfa
 		return
 	}
 	event := map[string]interface{}{
-		"orch_address": r.orchAddress,
-		"ts_ms":        time.Now().UnixMilli(),
-		"runner_id":    runner.RunnerID,
-		"member_id":    runner.memberID(),
-		"app":          runner.App,
+		"runner_id": runner.RunnerID,
+		"member_id": runner.memberID(),
+		"app":       runner.App,
 	}
 	for k, v := range fields {
 		event[k] = v
 	}
+	r.emit(eventType, runner.RunnerID, event)
+}
+
+// emit queues an event, adding who emitted it and when: the orchestrator's
+// address, the time, and the current round. It never blocks.
+func (r *LiveRunnerRegistry) emit(eventType, key string, event map[string]interface{}) {
+	if r.events == nil {
+		return
+	}
+	event["orch_address"] = r.orchAddress
+	event["ts_ms"] = time.Now().UnixMilli()
+	if r.round != nil {
+		if round := r.round(); round > 0 {
+			event["round"] = round
+		}
+	}
 	select {
-	case r.events <- liveRunnerEvent{eventType: eventType, key: runner.RunnerID, fields: event}:
+	case r.events <- liveRunnerEvent{eventType: eventType, key: key, fields: event}:
 	default:
 		monitor.OrchestratorEventDropped(eventType)
 		slog.Error("live runner event dropped, event queue full", "event_type", eventType, "event", event)
+	}
+}
+
+// noteRefusal counts a customer request for the app that was refused for
+// lack of capacity.
+func (r *LiveRunnerRegistry) noteRefusal(app string) {
+	if r.refusals == nil || app == "" {
+		return
+	}
+	r.refusalsMu.Lock()
+	r.refusals[app]++
+	r.refusalsMu.Unlock()
+}
+
+// noteRunnerRefusal counts err against the runner's app when err says the
+// runner had no free slot.
+func (r *LiveRunnerRegistry) noteRunnerRefusal(runnerID string, err error) {
+	if r.refusals == nil || !isNoCapacity(err) {
+		return
+	}
+	runner, unlock, lockErr := r.lockLiveRunner(runnerID)
+	if lockErr != nil {
+		return
+	}
+	app := runner.App
+	unlock()
+	r.noteRefusal(app)
+}
+
+func isNoCapacity(err error) bool {
+	var runnerErr *RunnerError
+	return errors.As(err, &runnerErr) && runnerErr.StatusCode == http.StatusServiceUnavailable &&
+		(runnerErr.Message == "no capacity available for runner" || runnerErr.Message == "no capacity for app")
+}
+
+func (r *LiveRunnerRegistry) refusalLoop() {
+	ticker := time.NewTicker(liveRunnerRefusalInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			r.reportRefusals()
+		case <-r.stopRegistry:
+			r.reportRefusals()
+			return
+		}
+	}
+}
+
+// reportRefusals emits one event per app that refused requests since the
+// last report.
+func (r *LiveRunnerRegistry) reportRefusals() {
+	r.refusalsMu.Lock()
+	refusals := r.refusals
+	r.refusals = make(map[string]int)
+	r.refusalsMu.Unlock()
+	for app, count := range refusals {
+		r.emit(LiveRunnerEventRequestsRefused, app, map[string]interface{}{"app": app, "count": count})
 	}
 }
 
@@ -190,7 +273,9 @@ func weiString(amount *big.Rat) string {
 // ReservePaidSession is ReserveSession for a session a customer pays for;
 // sender is the payer's address, which the session's events carry.
 func (r *LiveRunnerRegistry) ReservePaidSession(runnerID, sessionID, sender string) (string, string, error) {
-	return r.reserveSession(runnerID, liveRunnerSessionOptions{sender: sender}, sessionID)
+	sessionID, appURL, err := r.reserveSession(runnerID, liveRunnerSessionOptions{sender: sender}, sessionID)
+	r.noteRunnerRefusal(runnerID, err)
+	return sessionID, appURL, err
 }
 
 // RecordSessionFee notes a fee debited for a session: it adds to the totals

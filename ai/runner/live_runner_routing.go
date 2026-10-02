@@ -105,6 +105,7 @@ func (r *LiveRunnerRegistry) reservePoolSession(app, mode string, opts liveRunne
 	for {
 		candidates := r.poolCandidates(app, mode, exclude)
 		if len(candidates) == 0 {
+			r.noteRefusal(app)
 			return "", "", "", &RunnerError{StatusCode: http.StatusServiceUnavailable, Message: "no capacity for app"}
 		}
 		chosen := pickPoolCandidate(candidates)
@@ -147,6 +148,7 @@ func (r *LiveRunnerRegistry) PoolPaymentInfo(app, mode string) (*LiveRunnerPrice
 			return priceInfo, nil
 		}
 	}
+	r.noteRefusal(app)
 	return nil, &RunnerError{StatusCode: http.StatusServiceUnavailable, Message: "no capacity for app"}
 }
 

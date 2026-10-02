@@ -2140,6 +2140,16 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 				OrchAddress:      liveRunnerOrchAddress(orch.Address()),
 				Prices:           liveRunnerPrices,
 				Events:           liveRunnerEvents,
+				Round: func() int64 {
+					// Off-chain there is no time watcher and no round.
+					if timeWatcher == nil {
+						return 0
+					}
+					if round := timeWatcher.LastInitializedRound(); round != nil {
+						return round.Int64()
+					}
+					return 0
+				},
 			})
 			if n.OrchSecret == "" && admitter == nil {
 				glog.Warning("No -orchSecret configured; dynamic LiveRunner heartbeat registration is disabled")
