@@ -1,0 +1,11 @@
+{
+  "regions": [
+    { "id": "us-east", "name": "US East", "api": "https://us-east.api.open-pool.com" }
+  ],
+  "sites": {
+    "marketing": "https://open-pool.com",
+    "member": "https://app.open-pool.com",
+    "admin": "https://admin.open-pool.com"
+  },
+  "explorer": "https://arbiscan.io"
+}

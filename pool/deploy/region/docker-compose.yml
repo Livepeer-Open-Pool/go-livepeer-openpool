@@ -1,0 +1,183 @@
+# One region of Open Pool: an orchestrator in pool mode, Kafka, and the pool
+# service. It builds nothing; every image comes from a registry, by the tags
+# in .env. Traefik, which is not part of this file, routes to the
+# orchestrator and the pool service by the labels below.
+#
+#   cp .env.example .env    and fill it in
+#   put the secrets in ./secrets (see ../README.md)
+#   docker compose up -d
+name: openpool-${REGION_ID}
+
+services:
+  # Kafka, as one Redpanda node. Only the orchestrator and the pool service
+  # reach it: it is on the inner network and publishes no port.
+  redpanda:
+    image: ${REDPANDA_IMAGE}
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=${REDPANDA_MEMORY:-1G}
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+      - --rpc-addr=0.0.0.0:33145
+      - --advertise-rpc-addr=redpanda:33145
+    volumes:
+      - redpanda:/var/lib/redpanda/data
+    networks: [inner]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health", "--exit-when-healthy"]
+      interval: 10s
+      timeout: 15s
+      retries: 12
+
+  # Makes the topic the orchestrator's events go to, once. Events are kept
+  # thirty days, so a pool service that was down for a while catches up.
+  redpanda-topic:
+    image: ${REDPANDA_IMAGE}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        rpk topic describe "$$TOPIC" --brokers redpanda:9092 >/dev/null 2>&1
+        || rpk topic create "$$TOPIC" --brokers redpanda:9092 --partitions 1 --replicas 1 --topic-config retention.ms=2592000000
+    environment:
+      TOPIC: ${KAFKA_TOPIC}
+    networks: [inner]
+    depends_on:
+      redpanda: { condition: service_healthy }
+    restart: "no"
+
+  # The Livepeer orchestrator, on-chain, in pool mode. It serves customers
+  # and members' tunnels on 8935 with its own certificate, as orchestrators
+  # do, so Traefik passes its connections through without ending TLS.
+  orchestrator:
+    image: ${ORCHESTRATOR_IMAGE}
+    command:
+      - -orchestrator
+      - -useLiveRunners
+      - -network=${LIVEPEER_NETWORK:-arbitrum-one-mainnet}
+      - -ethUrl=${ETH_RPC_URL}
+      - -ethAcctAddr=${ORCH_ETH_ADDRESS}
+      - -ethKeystorePath=/keystore
+      - -ethPassword=/run/secrets/orch_eth_password
+      - -dataDir=/data
+      - -orchSecret=/run/secrets/orch_secret
+      - -pricePerUnit=${ORCH_PRICE_PER_UNIT:-1}
+      # Where customers and members' tunnels reach it, through Traefik.
+      - -serviceAddr=${ORCH_HOST}:${ORCH_PUBLIC_PORT:-443}
+      - -liveRunnerAddr=https://${ORCH_HOST}:${ORCH_PUBLIC_PORT:-443}
+      - -httpAddr=0.0.0.0:8935
+      # The CLI port controls the node. It listens on the inner network only.
+      - -cliAddr=${ORCH_INNER_IP:-172.31.250.10}:7935
+      # Pool mode: the pool service decides who may register, and is told what happens.
+      - -liveRunnerAuthWebhookUrl=http://openpool:8090/v1/orchestrator/admit
+      - -liveRunnerPoolSecret=/run/secrets/pool_secret
+      - -monitor
+      - -kafkaBootstrapServers=redpanda:9092
+      - -kafkaOrchestratorTopic=${KAFKA_TOPIC}
+      - -v=${ORCH_LOG_LEVEL:-4}
+    volumes:
+      - orchestrator:/data
+      - ${ORCH_KEYSTORE_DIR:-./secrets/orch_keystore}:/keystore:ro
+    secrets: [orch_eth_password, orch_secret, pool_secret]
+    networks:
+      inner:
+        ipv4_address: ${ORCH_INNER_IP:-172.31.250.10}
+      traefik: {}
+    depends_on:
+      redpanda-topic: { condition: service_completed_successfully }
+    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${TRAEFIK_NETWORK}
+      - traefik.tcp.routers.openpool-orch-${REGION_ID}.rule=HostSNI(`${ORCH_HOST}`)
+      - traefik.tcp.routers.openpool-orch-${REGION_ID}.entrypoints=${TRAEFIK_ENTRYPOINT}
+      - traefik.tcp.routers.openpool-orch-${REGION_ID}.tls.passthrough=true
+      - traefik.tcp.routers.openpool-orch-${REGION_ID}.service=openpool-orch-${REGION_ID}
+      - traefik.tcp.services.openpool-orch-${REGION_ID}.loadbalancer.server.port=8935
+
+  # The pool service: this region's API for the three sites and for members'
+  # agents. Its database and its compose signing key are in the volume.
+  openpool:
+    image: ${OPENPOOL_IMAGE}
+    environment:
+      OPENPOOL_REGION_ID: ${REGION_ID}
+      OPENPOOL_REGION_NAME: ${REGION_NAME}
+      OPENPOOL_PUBLIC_URL: https://${POOL_API_HOST}
+      OPENPOOL_ORCHESTRATOR_URL: https://${ORCH_HOST}:${ORCH_PUBLIC_PORT:-443}
+      # The orchestrator answers with its own certificate, which no authority signed.
+      OPENPOOL_ORCHESTRATOR_INSECURE_TLS: "true"
+      OPENPOOL_ORCHESTRATOR_CLI_URL: http://${ORCH_INNER_IP:-172.31.250.10}:7935
+      OPENPOOL_POOL_SECRET_FILE: /run/secrets/pool_secret
+      OPENPOOL_SESSION_SECRET_FILE: /run/secrets/session_secret
+      OPENPOOL_SIGN_IN_DOMAINS: ${MEMBER_SITE_HOST}
+      OPENPOOL_ALLOWED_ORIGINS: https://${MARKETING_SITE_HOST},https://${MEMBER_SITE_HOST},https://${ADMIN_SITE_HOST}
+      OPENPOOL_ADMIN_URL: https://${ADMIN_SITE_HOST}
+      OPENPOOL_ADMIN_EMAIL: ${ADMIN_EMAIL}
+      OPENPOOL_MAIL_FROM: ${MAIL_FROM}
+      OPENPOOL_RESEND_BASE_URL: ${RESEND_BASE_URL:-}
+      OPENPOOL_RESEND_API_KEY_FILE: /run/secrets/resend_api_key
+      OPENPOOL_AGENT_IMAGE: ${AGENT_IMAGE}
+      OPENPOOL_TUNNEL_IMAGE: ${TUNNEL_IMAGE}
+      OPENPOOL_KAFKA_BROKERS: redpanda:9092
+      OPENPOOL_KAFKA_TOPIC: ${KAFKA_TOPIC}
+      OPENPOOL_CHAIN_ID: ${CHAIN_ID:-42161}
+      OPENPOOL_ETH_RPC_URL: ${ETH_RPC_URL}
+      OPENPOOL_PAYOUT_KEYSTORE: /run/secrets/payout_keystore
+      OPENPOOL_PAYOUT_PASSWORD_FILE: /run/secrets/payout_password
+    volumes:
+      - openpool:/data
+    secrets: [pool_secret, session_secret, resend_api_key, payout_keystore, payout_password]
+    networks: [inner, traefik]
+    depends_on:
+      redpanda-topic: { condition: service_completed_successfully }
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8090 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q ' 200 ' <&3"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      # Traefik routes to it only once it is healthy: check often while it
+      # starts, so a restart is seconds of absence and not a whole interval.
+      start_period: 30s
+      start_interval: 1s
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${TRAEFIK_NETWORK}
+      - traefik.http.routers.openpool-api-${REGION_ID}.rule=Host(`${POOL_API_HOST}`)
+      - traefik.http.routers.openpool-api-${REGION_ID}.entrypoints=${TRAEFIK_ENTRYPOINT}
+      - traefik.http.routers.openpool-api-${REGION_ID}.tls=true
+      - traefik.http.routers.openpool-api-${REGION_ID}.tls.certresolver=${TRAEFIK_CERTRESOLVER}
+      - traefik.http.routers.openpool-api-${REGION_ID}.service=openpool-api-${REGION_ID}
+      - traefik.http.services.openpool-api-${REGION_ID}.loadbalancer.server.port=8090
+
+secrets:
+  pool_secret: { file: ./secrets/pool_secret }
+  session_secret: { file: ./secrets/session_secret }
+  orch_secret: { file: ./secrets/orch_secret }
+  orch_eth_password: { file: ./secrets/orch_eth_password }
+  payout_keystore: { file: ./secrets/payout_keystore }
+  payout_password: { file: ./secrets/payout_password }
+  resend_api_key: { file: ./secrets/resend_api_key }
+
+volumes:
+  redpanda:
+  orchestrator:
+  openpool:
+
+networks:
+  # Between the three services. The orchestrator has a fixed address on it,
+  # which is the only one its CLI port listens on.
+  inner:
+    ipam:
+      config:
+        - subnet: ${INNER_SUBNET:-172.31.250.0/24}
+  # The network your Traefik watches.
+  traefik:
+    external: true
+    name: ${TRAEFIK_NETWORK}

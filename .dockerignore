@@ -1,0 +1,8 @@
+# Kept out of image builds: none of it is Go source, and the web workspace's
+# dependencies alone are hundreds of megabytes.
+**/node_modules
+pool/web/apps/*/dist
+pool/web/e2e/.bin
+pool/web/e2e/test-results
+pool/.e2e
+.idea

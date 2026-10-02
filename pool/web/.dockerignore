@@ -1,0 +1,6 @@
+**/node_modules
+**/dist
+**/.vite
+e2e/.bin
+e2e/test-results
+e2e/playwright-report
