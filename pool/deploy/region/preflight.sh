@@ -53,6 +53,10 @@ case "${TUNNEL_IMAGE:-}" in
 esac
 case "${ORCH_ETH_ADDRESS:-}" in 0x0000000000000000000000000000000000000000|"") bad "ORCH_ETH_ADDRESS is still the placeholder" ;; esac
 case "${ADMIN_EMAIL:-}${MAIL_FROM:-}" in *example.com*) bad "ADMIN_EMAIL or MAIL_FROM is still an example address" ;; esac
+case "${RESEND_BASE_URL:-}" in
+  ""|http://?*|https://?*) ;;
+  *) bad "RESEND_BASE_URL must be a full address starting with https://, or empty for Resend itself; the pool service will not start with \"$RESEND_BASE_URL\"" ;;
+esac
 [ "${ORCH_CLI_TX_ROUTES:-false}" = "false" ] || warn "ORCH_CLI_TX_ROUTES is on: livepeer_cli may send transactions. Turn it off once the orchestrator is activated"
 [ "${ORCH_HOST:-a}" != "${POOL_API_HOST:-b}" ] || bad "ORCH_HOST and POOL_API_HOST are the same name; Traefik tells them apart by name"
 
