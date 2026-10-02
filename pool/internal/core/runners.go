@@ -1,0 +1,234 @@
+package core
+
+import (
+	"context"
+	"database/sql"
+	"strings"
+	"time"
+)
+
+// OrchRunner is a registered runner as the orchestrator reports it on
+// GET /liveRunner/runners.
+type OrchRunner struct {
+	RunnerID           string   `json:"runner_id"`
+	MemberID           string   `json:"member_id"`
+	PayoutAddress      string   `json:"payout_address"`
+	State              string   `json:"state"`
+	Status             string   `json:"status"`
+	Ready              bool     `json:"ready"`
+	App                string   `json:"app"`
+	Mode               string   `json:"mode"`
+	Version            string   `json:"version"`
+	Capacity           int      `json:"capacity"`
+	CapacityRegistered int      `json:"capacity_registered"`
+	CapacityUsed       int      `json:"capacity_used"`
+	Tunnel             bool     `json:"tunnel"`
+	TunnelConnected    bool     `json:"tunnel_connected"`
+	RemoteAddr         string   `json:"remote_addr"`
+	RegisteredAtMs     int64    `json:"registered_at_ms"`
+	LastHeartbeatMs    int64    `json:"last_heartbeat_ms"`
+	SessionIDs         []string `json:"session_ids"`
+	Static             bool     `json:"static"`
+}
+
+// Runner is a runner on the orchestrator together with what the pool knows
+// about it: the machine it runs on and whose that is.
+type Runner struct {
+	OrchRunner
+	MachineID    string `json:"machine_id,omitempty"`
+	MachineLabel string `json:"machine_label,omitempty"`
+	MemberName   string `json:"member_name,omitempty"`
+	// Unknown marks a runner the pool did not admit, such as a static runner
+	// left in the orchestrator's configuration.
+	Unknown bool `json:"unknown,omitempty"`
+}
+
+// runnerGrace is how long a runner this service admitted may be missing from
+// the orchestrator's list before it is taken for gone. The orchestrator
+// creates the runner only after the admission answer reaches it.
+const runnerGrace = 2 * time.Minute
+
+// Runners lists the runners registered on the orchestrator; memberID filters
+// when not empty. It also notes which runners this service admitted are gone.
+func (s *Service) Runners(ctx context.Context, memberID string) ([]Runner, error) {
+	if s.orch == nil {
+		return nil, unavailablef("this service is not connected to an orchestrator")
+	}
+	listed, err := s.orch.Runners(ctx)
+	if err != nil {
+		return nil, unavailablef("the orchestrator did not answer: %v", err)
+	}
+	type known struct{ machineID, label, memberID, memberName string }
+	admitted := map[string]known{}
+	rows, err := s.db.QueryContext(ctx, `SELECT r.runner_id, m.id, m.label, b.id, b.display_name
+		FROM runners r JOIN machines m ON m.id = r.machine_id JOIN members b ON b.id = m.member_id WHERE r.gone_at = 0`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var runnerID string
+		var k known
+		if err := rows.Scan(&runnerID, &k.machineID, &k.label, &k.memberID, &k.memberName); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		admitted[runnerID] = k
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	present := map[string]bool{}
+	runners := []Runner{}
+	for _, r := range listed {
+		present[r.RunnerID] = true
+		view := Runner{OrchRunner: r}
+		if k, ok := admitted[r.RunnerID]; ok {
+			view.MachineID, view.MachineLabel, view.MemberName = k.machineID, k.label, k.memberName
+		} else {
+			view.Unknown = true
+		}
+		if memberID == "" || r.MemberID == memberID {
+			runners = append(runners, view)
+		}
+	}
+	// Runners that left the orchestrator by themselves: expired or unregistered.
+	cutoff := s.now().Add(-runnerGrace).UnixMilli()
+	for runnerID := range admitted {
+		if !present[runnerID] {
+			if _, err := s.db.ExecContext(ctx, `UPDATE runners SET gone_at = ? WHERE runner_id = ? AND gone_at = 0 AND admitted_at < ?`,
+				s.nowMs(), runnerID, cutoff); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return runners, nil
+}
+
+// SetRunnerState moves a runner between probation, active and suspended.
+func (s *Service) SetRunnerState(ctx context.Context, actor, runnerID, state, reason string) error {
+	if state != StateProbation && state != StateActive && state != StateSuspended {
+		return invalidf("state must be probation, active, or suspended")
+	}
+	if s.orch == nil {
+		return unavailablef("this service is not connected to an orchestrator")
+	}
+	if err := s.orch.SetState(ctx, runnerID, state, reason); err != nil {
+		return orchError(err)
+	}
+	return s.audit(ctx, s.db, actor, "runner.state", runnerID, strings.TrimSpace(state+" "+reason))
+}
+
+// EvictRunner removes a runner from the orchestrator. Its machine may
+// register again unless its assignment, credential or membership has ended.
+func (s *Service) EvictRunner(ctx context.Context, actor, runnerID, reason string) error {
+	if s.orch == nil {
+		return unavailablef("this service is not connected to an orchestrator")
+	}
+	if err := s.orch.EvictRunner(ctx, runnerID, reason); err != nil {
+		return orchError(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE runners SET gone_at = ? WHERE runner_id = ? AND gone_at = 0`, s.nowMs(), runnerID); err != nil {
+		return err
+	}
+	return s.audit(ctx, s.db, actor, "runner.evict", runnerID, reason)
+}
+
+// orchError passes on an error the orchestrator client already classified
+// and treats anything else as the orchestrator being unreachable.
+func orchError(err error) error {
+	if _, ok := err.(*Error); ok {
+		return err
+	}
+	return unavailablef("the orchestrator did not answer: %v", err)
+}
+
+// liveRunners are the runners this service admitted for a machine that it
+// has not seen leave; app narrows to one app when not empty.
+func (s *Service) liveRunners(ctx context.Context, machineID, app string) ([]string, error) {
+	query, args := `SELECT runner_id FROM runners WHERE machine_id = ? AND gone_at = 0`, []any{machineID}
+	if app != "" {
+		query, args = query+` AND app = ?`, append(args, app)
+	}
+	return s.queryRunnerIDs(ctx, s.db, query, args...)
+}
+
+type queryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func (s *Service) queryRunnerIDs(ctx context.Context, db queryer, query string, args ...any) ([]string, error) {
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// evictOnOrchestrator removes a runner, logging a failure: the caller has
+// already ended whatever let the runner register, so one that survives is
+// refused the next time it registers.
+func (s *Service) evictOnOrchestrator(ctx context.Context, runnerID, reason string) {
+	if s.orch == nil {
+		return
+	}
+	if err := s.orch.EvictRunner(ctx, runnerID, reason); err != nil {
+		var e *Error
+		if asError(err, &e) && e.Kind == NotFound {
+			return // already gone
+		}
+		s.log.Warn("runner not evicted from the orchestrator", "runner_id", runnerID, "reason", reason, "err", err)
+	}
+}
+
+func asError(err error, target **Error) bool {
+	e, ok := err.(*Error)
+	if ok {
+		*target = e
+	}
+	return ok
+}
+
+// evictMachineRunners removes a machine's runners from the orchestrator; app
+// narrows to one app when not empty.
+func (s *Service) evictMachineRunners(ctx context.Context, machineID, app, reason string) {
+	ids, err := s.liveRunners(ctx, machineID, app)
+	if err != nil {
+		s.log.Error("listing a machine's runners", "machine_id", machineID, "err", err)
+		return
+	}
+	for _, id := range ids {
+		s.evictOnOrchestrator(ctx, id, reason)
+		if _, err := s.db.ExecContext(ctx, `UPDATE runners SET gone_at = ? WHERE runner_id = ?`, s.nowMs(), id); err != nil {
+			s.log.Error("marking a runner gone", "runner_id", id, "err", err)
+		}
+	}
+}
+
+// evictMemberRunners removes every runner of a member from the orchestrator.
+func (s *Service) evictMemberRunners(ctx context.Context, memberID, reason string) {
+	if _, err := s.db.ExecContext(ctx, `UPDATE runners SET gone_at = ? WHERE gone_at = 0 AND machine_id IN (SELECT id FROM machines WHERE member_id = ?)`,
+		s.nowMs(), memberID); err != nil {
+		s.log.Error("marking a member's runners gone", "member_id", memberID, "err", err)
+	}
+	if s.orch == nil {
+		return
+	}
+	if err := s.orch.EvictMember(ctx, memberID, reason); err != nil {
+		var e *Error
+		if asError(err, &e) && e.Kind == NotFound {
+			return // the member had no runners registered
+		}
+		s.log.Warn("member's runners not evicted from the orchestrator", "member_id", memberID, "err", err)
+	}
+}

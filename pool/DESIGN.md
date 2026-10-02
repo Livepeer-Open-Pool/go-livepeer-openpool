@@ -1,6 +1,6 @@
 # Open Pool: design of the pool service
 
-**Status:** design, 2026-10-01. Nothing here is built yet.\
+**Status:** steps 1 and 2 of the [build order](#build-order) are built, 2026-10-01; the rest is design.\
 **Companion:** `doc/live-runner-pool.md` describes the orchestrator side, which is built (changes 0 to 8 on `feat/open-pool-enhancements`).\
 **Reader:** Mike, who made these decisions in conversation and is checking them before the build; later, whoever builds or operates the pool.
 
@@ -111,19 +111,20 @@ pool/
   cmd/openpool/         the pool service
   cmd/openpool-agent/   the member agent
   internal/
-    store/              SQLite schema, migrations, queries
+    config/             deployment settings from the environment
+    store/              SQLite schema and migrations
+    core/               the pool's rules: catalog (GPUs, apps, terms, settings), applications,
+                        members, machines, assignments, credentials, admission, runners, audit
     auth/               wallet sign-in, admin code, session tokens
-    catalog/            supported GPUs, apps, tests, terms
-    members/            applications, members, machines, assignments, credentials
-    admission/          the orchestrator's webhook
-    orchestrator/       CLI-port client, probe client, price push
-    tests/              test runs, promotion, suspension, version deadlines, draining
-    ledger/             Kafka consumer, earnings per member per round, pot per round
-    payouts/            windows, batches, approval, sending
-    compose/            compose generation and signing
-    mail/               the two admin emails and the sign-in code
+    orchestrator/       CLI-port client
+    mail/               the admin emails and the sign-in code
     api/                HTTP handlers
-  web/                  the three sites
+    testkit/            what the tests share
+    tests/              (step 3) test runs, promotion, suspension, version deadlines, draining
+    ledger/             (step 4) Kafka consumer, earnings per member per round, pot per round
+    payouts/            (step 4) windows, batches, approval, sending
+    compose/            (step 5) compose generation and signing
+  web/                  (step 6) the three sites
 ```
 
 ### Configuration
@@ -199,6 +200,8 @@ Deployment settings come from a config file or environment. Pool policy lives in
 ### Applying and approval
 
 An application carries: the signer's address, a display name for the leaderboard **(assumed)**, one or more machines each with a label and its GPUs (model and count, from the supported list), and the terms version in force. It is sent to each region the applicant chose; each region decides separately.
+
+Submitting takes a second wallet signature, over a short text the service composes from the application: the region, the address, the display name, the number of machines, and the version and hash of the terms in force. That signature is the applicant's acceptance of those terms and is stored with the application. If the terms change between composing the text and submitting, the signature no longer matches and the applicant is asked to sign again.
 
 The operator sees pending applications across regions and approves or rejects each with a reason. Apps can be assigned to the applicant's machines at approval or later. The applicant's site shows the status and the reason.
 
@@ -364,7 +367,7 @@ Per region, under `/v1`. JSON throughout. Errors are `{"error": "<text>"}` with 
 | Agent | machine credential | `GET /agent/desired`, `POST /agent/report` |
 | Public | none | `GET /public/pool`, `GET /public/apps`, `GET /public/gpus`, `GET /public/terms`, `GET /public/leaderboard` |
 | Sign-in | none | `POST /auth/wallet/nonce`, `POST /auth/wallet/verify`, `POST /auth/admin/code`, `POST /auth/admin/verify` |
-| Member | wallet session | `POST /applications`, `GET /me`, `GET /me/machines`, `POST /me/machines`, `DELETE /me/machines/{id}`, `POST /me/machines/{id}/credential`, `DELETE /me/machines/{id}/credential`, `GET /me/runners`, `GET /me/tests`, `GET /me/earnings`, `GET /me/payouts` |
+| Member | wallet session | `POST /applications/message`, `POST /applications`, `GET /me`, `GET /me/machines`, `POST /me/machines`, `DELETE /me/machines/{id}`, `POST /me/machines/{id}/credential`, `DELETE /me/machines/{id}/credential`, `GET /me/runners`, `GET /me/tests`, `GET /me/earnings`, `GET /me/payouts` |
 | Admin: people | admin session | `GET /admin/applications`, `POST /admin/applications/{id}/approve`, `POST /admin/applications/{id}/reject`, `GET /admin/members`, `GET /admin/members/{id}`, `POST /admin/members/{id}/ban`, `POST /admin/members/{id}/unban` |
 | Admin: machines | admin session | `GET /admin/machines`, `POST /admin/machines/{id}/approve`, `PUT /admin/machines/{id}/assignments`, `GET /admin/demand` |
 | Admin: catalog | admin session | `GET/POST/PUT /admin/gpus`, `GET/POST/PUT /admin/apps`, `POST /admin/apps/{id}/version`, `POST /admin/apps/{id}/pause`, `GET/POST /admin/terms` |
@@ -413,8 +416,8 @@ A ticket the node gives up on is also marked redeemed in its database; the event
 
 | Step | Work | Done when |
 | --- | --- | --- |
-| 1 | go-livepeer additions | events carry rounds; a redeemed ticket and refused requests produce events; Go tests |
-| 2 | Pool service core: store, catalog, applications, members, machines, assignments, credentials, admission, orchestrator control, both sign-ins, the API for these | a runner started with a machine credential is admitted on probation only for its assigned app; everything else is refused with a reason; Go tests against a real orchestrator in-process |
+| 1 | go-livepeer additions | **Built.** Events carry rounds; a redeemed ticket and refused requests produce events; Go tests |
+| 2 | Pool service core: store, catalog, applications, members, machines, assignments, credentials, admission, orchestrator control, both sign-ins, the API for these | **Built.** A runner started with a machine credential is admitted on probation only for its assigned app; everything else is refused with a reason. Covered by the module's own tests and by a test in go-livepeer (`server/ai_http_openpool_test.go`) that runs the real pool service as a process beside a real orchestrator. Until step 3, removing or reassigning a machine evicts its runner at once instead of letting sessions finish, and nothing promotes a runner off probation but the operator |
 | 3 | Tests, promotion and suspension, holds, version deadlines, draining | a passing runner goes active by itself; a failing one is suspended; reassigning lets sessions finish |
 | 4 | Ledger, windows, batches, approval, sending, emails | a window of events produces the batch the formula predicts; an approved batch pays each member once on a test chain, also across a restart mid-send |
 | 5 | Member agent and signed compose files | one command on a GPU box brings its assigned app online; changing the assignment switches it with no action from the member |

@@ -1,0 +1,5 @@
+/openpool
+/openpool-agent
+*.db
+*.db-shm
+*.db-wal
