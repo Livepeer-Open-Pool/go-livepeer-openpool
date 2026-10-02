@@ -4,6 +4,8 @@ The pool service for one region of Open Pool. It runs beside one go-livepeer orc
 
 It is its own Go module and shares no code with go-livepeer.
 
+The three web sites (public, member, admin) are in [`web/`](web/README.md), a TypeScript workspace of their own. They are plain files that call this service from the browser.
+
 ## Build and test
 
 ```bash

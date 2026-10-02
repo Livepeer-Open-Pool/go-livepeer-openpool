@@ -8,6 +8,8 @@ const site = (name: string, port: number) => ({
   url: `http://localhost:${port}`,
   reuseExistingServer: true,
   timeout: 120_000,
+  // The public site's pages are written with the addresses of the sites they link to.
+  env: { OPENPOOL_SITE_URL: "http://localhost:5173", OPENPOOL_MEMBER_URL: "http://localhost:5174" },
 })
 
 const ports = { marketing: 5173, member: 5174, admin: 5175 }

@@ -1,0 +1,29 @@
+{
+  "name": "@openpool/marketing",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && tsx scripts/prerender.ts",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@lit-labs/signals": "0.3.0",
+    "@lit-labs/ssr": "^4.1.0",
+    "@lit/context": "^1.1.6",
+    "@lit/task": "^1.0.3",
+    "@openpool/core": "workspace:*",
+    "@openpool/ui": "workspace:*",
+    "effect": "3.22.2",
+    "lit": "^3.3.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "~5.9.3",
+    "vite": "^7.3.6",
+    "vitest": "^3.2.7"
+  }
+}

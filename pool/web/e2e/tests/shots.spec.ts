@@ -44,4 +44,19 @@ test.describe("pictures of the sites", () => {
     await page.waitForTimeout(1000)
     await page.screenshot({ path: `${dir}/admin-app.png`, fullPage: true })
   })
+
+  test("public pages", async ({ page, pool }) => {
+    void pool
+    await page.setViewportSize({ width: 1280, height: 900 })
+    for (const [name, path] of [["home", "/"], ["how", "/how-it-works/"], ["connect", "/connect/"], ["apps", "/apps/"], ["leaderboard", "/leaderboard/"], ["terms", "/terms/"], ["join", "/join/"]] as const) {
+      await page.goto(`${sites.marketing}${path}`)
+      await page.waitForTimeout(1200)
+      await page.screenshot({ path: `${dir}/public-${name}.png`, fullPage: true })
+    }
+    await page.emulateMedia({ colorScheme: "dark" })
+    await page.setViewportSize({ width: 390, height: 844 })
+    await page.goto(sites.marketing)
+    await page.waitForTimeout(1200)
+    await page.screenshot({ path: `${dir}/public-home-dark-phone.png`, fullPage: true })
+  })
 })

@@ -1,6 +1,6 @@
 # Open Pool: design of the pool service
 
-**Status:** steps 1 to 5 of the [build order](#build-order) are built, 2026-10-01; the sites and the end-to-end harness are design.\
+**Status:** steps 1 to 6 of the [build order](#build-order) are built, 2026-10-01; the end-to-end harness is design.\
 **Companion:** `doc/live-runner-pool.md` describes the orchestrator side, which is built (changes 0 to 8 on `feat/open-pool-enhancements`).\
 **Reader:** Mike, who made these decisions in conversation and is checking them before the build; later, whoever builds or operates the pool.
 
@@ -127,7 +127,7 @@ pool/
     compose/            the compose file a machine runs: generating it, signing it, and the
                         allowlist an agent checks it against. Shared by the service and the agent
     agent/              the member agent: fetch, verify, apply with Docker, report
-  web/                  (step 6) the three sites
+  web/                  the three sites, a pnpm workspace of its own; see web/README.md
 ```
 
 ### Configuration
@@ -423,9 +423,13 @@ Three separate UI apps, one per domain, in one TypeScript workspace in `pool/web
 | `app.open-pool.com` | sign in; apply; application status; machines with install command; runners with test results; earnings; payouts | in the browser; not indexed |
 | `admin.open-pool.com` | sign in; overview with each region's health; applications; members; machines and assignments with the demand table; catalog (GPUs, apps, tests); runners; payout batches and wallet; terms; settings; audit log | in the browser; not indexed |
 
-Each app builds into plain files (HTML, JavaScript, CSS) that any web server or CDN can host. No server process of ours runs behind them: the app runs in the visitor's browser and calls each region's pool service directly **(assumed)**.
+Each app is a standalone Vite build into plain files (HTML, JavaScript, CSS) that any web server or CDN can host. No server process of ours runs behind them: the app runs in the visitor's browser and calls each region's pool service directly. How to build, configure and host them is in [`web/README.md`](web/README.md).
 
-**Regions.** The sites are configured with the list of regions and their API addresses. Every view that spans regions asks all of them at once with a time limit and shows what answered. A region that did not answer is named as unavailable, and the rest of the page works. Actions go to the region they concern.
+**Regions.** Each site reads `config.json` from beside its pages when it starts: the regions with their API addresses, and the addresses of its sister sites. Adding a region is editing that file. Every view that spans regions asks all of them at once, gives each 15 seconds, and shows what answered under each region's name. A region that did not answer is named on the page with the reason, and the rest of the page works. Actions go to the region they concern; what is done in several regions at once, such as publishing the pool's terms, reports each region's outcome.
+
+**Sessions.** A session is a bearer token kept in the browser's storage and sent in the `Authorization` header. Because the regions share the signing secret, one sign-in is good in all of them: a wallet signs in at the first region that answers, and the operator's code is checked by the region that emailed it. A region that no longer accepts the session ends it everywhere on the site.
+
+**The public site and search engines.** Its pages are written as HTML when it is built, each with its own title, description, canonical address and structured data, and listed in a sitemap. The parts that show live data are filled in by the browser; in the file each holds a sentence saying what loads there, so a page reads without scripts.
 
 **Stack**, from the skills named for this work: Lit components with its reactive state, context and routing on platform APIs; Vite and Vitest; Effect for everything that is not a component, with every API response decoded by a schema before it is used; modern CSS without a utility framework; semantic HTML; Google's guidance for the public pages (titles, descriptions, structured data, sitemap, canonical URLs).
 
@@ -458,7 +462,7 @@ A ticket the node gives up on is also marked redeemed in its database; the event
 | 3 | Tests, promotion and suspension, holds, version deadlines, draining | **Built.** A passing runner goes active by itself; a failing one is suspended and comes back after passing again; reassigning lets sessions finish. The go-livepeer test shows all of it against a real orchestrator and runner |
 | 4 | Ledger, windows, batches, approval, sending, emails | **Built.** A window of events produces the batch the formula predicts; an approved batch pays each member once, also across a restart mid-send. The go-livepeer test feeds a real orchestrator's events to the pool service and sees the batch built and approved. Not exercised yet: a real Kafka broker (the tests upload events over HTTP, and the consumer loop is untested) and a real chain (the tests pay on an in-memory one that follows a node's nonce, receipt and error behaviour) |
 | 5 | Member agent and signed compose files | **Built.** One command on a box brings its assigned app online beside its tunnel; changing the assignment or the app's version switches it with no action from the member; unassigning takes it down. Shown by running the agent's real image against the service and a real Docker daemon (`TestAgentImageOnRealDocker`, run on request), with the allowlist, the signature, the rollout and the agent's failure handling covered by the module's tests. Not exercised yet: a tunnel started by the agent registering with a real orchestrator, which is the harness (step 7), and a machine with NVIDIA GPUs (the test box has none, so the GPU reservation and `nvidia-smi` listing are untested on hardware) |
-| 6 | The three sites | each page listed above works against two regions, and with one of them stopped |
+| 6 | The three sites | **Built.** Every page listed above works against two regions, and with one of them stopped: 31 end-to-end tests drive the three sites in a browser against two real pool services, with real wallet signatures and the operator's emailed code, and end by stopping each region in turn. Under them are the unit tests of the shared packages (the service's JSON decoded by schema, the workflows against stand-in regions, components in a real browser) and of the public site's rendered pages. Not exercised yet: a real orchestrator behind the regions (the tests use a stand-in for its CLI and service ports), a real browser wallet extension (the tests inject the same interface one provides), and a real payout wallet (payout batches are approved and shown, and nothing is sent) |
 | 7 | End-to-end harness | one command runs an orchestrator, Kafka, a pool service, an agent and an echo app locally, through signup, approval, a paid call and a payout |
 
 ## Assumptions to confirm
@@ -471,4 +475,4 @@ These were not decided in conversation. Each is what the design above does unles
 4. **Members are not asked to accept new terms again**; a new version applies when published.
 5. **Global terms and the GPU list are copied to every region** and the admin site keeps the regions level.
 6. **Ordinary wallets only** for sign-in in this version.
-7. **The three apps are served as plain files** and call the regions from the browser, so each region's API must be reachable from the internet over HTTPS.
+7. **The three apps are served as plain files** and call the regions from the browser, so each region's API must be reachable from the internet over HTTPS. *Confirmed 2026-10-01: three standalone Vite builds.*
