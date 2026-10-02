@@ -103,3 +103,30 @@ func TestPayoutAndKafkaSettings(t *testing.T) {
 	require.Equal(t, []string{"kafka-1:9092", "kafka-2:9092"}, cfg.KafkaBrokers)
 	require.Equal(t, "secret", cfg.PayoutPassword)
 }
+
+func TestAgentSettings(t *testing.T) {
+	setRequired(t)
+	cfg, err := FromEnv()
+	require.NoError(t, err)
+	require.False(t, cfg.AgentConfigured(), "without a tunnel image machines are not run by the agent")
+	require.Equal(t, "tztcloud/openpool-agent:latest", cfg.AgentImage)
+	require.Equal(t, "openpool-compose.key", cfg.ComposeKeyFile)
+
+	const pinned = "tztcloud/livepeer-runner-tunnel@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	t.Setenv("OPENPOOL_TUNNEL_IMAGE", pinned)
+	t.Setenv("OPENPOOL_AGENT_IMAGE", "registry.example.com/openpool-agent:1.2.0")
+	cfg, err = FromEnv()
+	require.NoError(t, err)
+	require.True(t, cfg.AgentConfigured())
+	require.Equal(t, pinned, cfg.TunnelImage)
+	require.Equal(t, "registry.example.com/openpool-agent:1.2.0", cfg.AgentImage)
+
+	t.Setenv("OPENPOOL_TUNNEL_IMAGE", "tztcloud/livepeer-runner-tunnel:latest")
+	_, err = FromEnv()
+	require.ErrorContains(t, err, "OPENPOOL_TUNNEL_IMAGE must be pinned by digest")
+
+	t.Setenv("OPENPOOL_TUNNEL_IMAGE", "")
+	t.Setenv("OPENPOOL_REGION_ID", "US East")
+	_, err = FromEnv()
+	require.ErrorContains(t, err, "OPENPOOL_REGION_ID must be lowercase letters, digits and dashes")
+}

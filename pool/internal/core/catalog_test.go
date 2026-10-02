@@ -144,21 +144,21 @@ func TestRaisingAnAppVersionGivesTheOldOneADeadline(t *testing.T) {
 	f := newFixture(t)
 	app := f.app("echo")
 
-	updated, err := f.svc.SetAppVersion(f.ctx, operator, app.ID, "2.0.0", nil)
+	updated, err := f.svc.SetAppVersion(f.ctx, operator, app.ID, "2.0.0", nil, nil)
 	require.NoError(t, err)
 	require.Equal(t, "2.0.0", updated.RequiredVersion)
 	require.Equal(t, "1.0.0", updated.PreviousVersion)
 	require.Equal(t, f.clock.Now().Add(24*time.Hour), *updated.PreviousVersionDeadline, "the pool's default deadline")
 
 	deadline := f.clock.Now().Add(2 * time.Hour)
-	updated, err = f.svc.SetAppVersion(f.ctx, operator, app.ID, "3.0.0", &deadline)
+	updated, err = f.svc.SetAppVersion(f.ctx, operator, app.ID, "3.0.0", nil, &deadline)
 	require.NoError(t, err)
 	require.Equal(t, "2.0.0", updated.PreviousVersion)
 	require.Equal(t, deadline, *updated.PreviousVersionDeadline)
 
-	_, err = f.svc.SetAppVersion(f.ctx, operator, app.ID, "3.0.0", nil)
+	_, err = f.svc.SetAppVersion(f.ctx, operator, app.ID, "3.0.0", nil, nil)
 	requireKind(t, err, core.Conflict, "")
-	_, err = f.svc.SetAppVersion(f.ctx, operator, app.ID, " ", nil)
+	_, err = f.svc.SetAppVersion(f.ctx, operator, app.ID, " ", nil, nil)
 	requireKind(t, err, core.Invalid, "")
 }
 

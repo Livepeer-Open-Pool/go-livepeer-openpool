@@ -268,14 +268,17 @@ func (s *Server) updateApp(w http.ResponseWriter, r *http.Request, actor string)
 
 func (s *Server) setAppVersion(w http.ResponseWriter, r *http.Request, actor string) {
 	var req struct {
-		Version  string     `json:"version"`
-		Deadline *time.Time `json:"deadline"`
+		Version string `json:"version"`
+		// Container is the image and settings that are this version; left
+		// out, the app keeps the container it has.
+		Container *core.Container `json:"container"`
+		Deadline  *time.Time      `json:"deadline"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		s.writeError(w, r, err)
 		return
 	}
-	app, err := s.core.SetAppVersion(r.Context(), actor, r.PathValue("id"), req.Version, req.Deadline)
+	app, err := s.core.SetAppVersion(r.Context(), actor, r.PathValue("id"), req.Version, req.Container, req.Deadline)
 	if err != nil {
 		s.writeError(w, r, err)
 		return

@@ -170,7 +170,7 @@ func TestRunnerLeftOnAnOldVersionIsSuspendedAtTheDeadline(t *testing.T) {
 	require.Equal(t, core.StateActive, f.state("runner_old"))
 
 	deadline := f.clock.Now().Add(2 * time.Hour)
-	updated, err := f.svc.SetAppVersion(f.ctx, operator, app.ID, "2.0.0", &deadline)
+	updated, err := f.svc.SetAppVersion(f.ctx, operator, app.ID, "2.0.0", nil, &deadline)
 	require.NoError(t, err)
 	f.runner(member, credential, "runner_new", updated) // replaces runner_old in the pool's books
 	// Put the old one back as if a second machine still ran it.

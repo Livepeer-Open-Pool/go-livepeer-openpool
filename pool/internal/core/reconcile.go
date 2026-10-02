@@ -56,11 +56,13 @@ type tracked struct {
 	suspendReason                          string
 	failures, passes                       int
 	lastTestAt                             int64
+	// deployedVersion is the version the pool told the machine to run.
+	deployedVersion string
 }
 
 func (s *Service) trackedRunners(ctx context.Context) (map[string]*tracked, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT r.runner_id, r.machine_id, r.assignment_id, r.app, a.status,
-		r.hold, r.suspend_reason, r.failures, r.passes, r.last_test_at
+		r.hold, r.suspend_reason, r.failures, r.passes, r.last_test_at, a.deployed_version
 		FROM runners r JOIN assignments a ON a.id = r.assignment_id WHERE r.gone_at = 0`)
 	if err != nil {
 		return nil, err
@@ -70,7 +72,7 @@ func (s *Service) trackedRunners(ctx context.Context) (map[string]*tracked, erro
 	for rows.Next() {
 		t := &tracked{}
 		if err := rows.Scan(&t.runnerID, &t.machineID, &t.assignmentID, &t.app, &t.assignmentStatus,
-			&t.hold, &t.suspendReason, &t.failures, &t.passes, &t.lastTestAt); err != nil {
+			&t.hold, &t.suspendReason, &t.failures, &t.passes, &t.lastTestAt, &t.deployedVersion); err != nil {
 			return nil, err
 		}
 		out[t.runnerID] = t
@@ -80,8 +82,9 @@ func (s *Service) trackedRunners(ctx context.Context) (map[string]*tracked, erro
 
 // Reconcile is one pass of what the pool does with registered runners by
 // itself: it drains runners whose assignment ended, suspends runners left on
-// a version whose deadline passed, and tests the rest, promoting those that
-// pass and suspending those that keep failing. A runner the operator put on
+// a version whose deadline passed, tests the rest, promoting those that pass
+// and suspending those that keep failing, and moves machines to their apps'
+// current versions a few at a time. A runner the operator put on
 // hold is tested and otherwise left alone. The service runs it on a timer;
 // it is safe to call at any time.
 func (s *Service) Reconcile(ctx context.Context) error {
@@ -113,11 +116,15 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		app    *App
 	}
 	var toTest []due
+	live := map[string]liveRunner{}
 	for _, r := range listed {
 		present[r.RunnerID] = true
 		t, ok := known[r.RunnerID]
 		if !ok {
 			continue // not one the pool admitted
+		}
+		if t.assignmentStatus == AssignmentActive {
+			live[t.assignmentID] = liveRunner{r, t}
 		}
 		app := apps[t.app]
 		if app == nil {
@@ -134,7 +141,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				}
 				continue
 			}
-			if !app.versionAdmitted(r.Version, now) {
+			// Outdated means it runs neither what its machine was told to run
+			// nor a version the app still admits.
+			if r.Version != t.deployedVersion && !app.versionAdmitted(r.Version, now) {
 				if r.State != StateSuspended || t.suspendReason != SuspendedByVersion {
 					reason := fmt.Sprintf("runs version %s; %s requires %s", r.Version, app.Name, app.RequiredVersion)
 					if err := s.suspend(ctx, r.RunnerID, SuspendedByVersion, reason); err != nil {
@@ -184,6 +193,12 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				s.log.Warn("recording a test", "runner_id", d.runner.RunnerID, "err", err)
 			}
 		}
+	}
+
+	// Last, so that a runner a test just promoted is still stopped if its
+	// machine's turn to move has come.
+	if err := s.rollOut(ctx, live); err != nil {
+		return err
 	}
 
 	_, err = s.db.ExecContext(ctx, `DELETE FROM test_results WHERE at < ?`, now.Add(-testResultRetention).UnixMilli())

@@ -1,6 +1,6 @@
 # Open Pool: design of the pool service
 
-**Status:** steps 1 to 4 of the [build order](#build-order) are built, 2026-10-01; the agent, the sites and the end-to-end harness are design.\
+**Status:** steps 1 to 5 of the [build order](#build-order) are built, 2026-10-01; the sites and the end-to-end harness are design.\
 **Companion:** `doc/live-runner-pool.md` describes the orchestrator side, which is built (changes 0 to 8 on `feat/open-pool-enhancements`).\
 **Reader:** Mike, who made these decisions in conversation and is checking them before the build; later, whoever builds or operates the pool.
 
@@ -110,6 +110,7 @@ pool/
   go.mod
   cmd/openpool/         the pool service
   cmd/openpool-agent/   the member agent
+  docker/               Dockerfile.agent, the agent's image
   internal/
     config/             deployment settings from the environment
     store/              SQLite schema and migrations
@@ -123,7 +124,9 @@ pool/
     testkit/            what the tests share
     ledger/             Kafka consumer, earnings per member per round, pot per round, demand
     payouts/            windows, batches, approval, the payout wallet, sending
-    compose/            (step 5) compose generation and signing
+    compose/            the compose file a machine runs: generating it, signing it, and the
+                        allowlist an agent checks it against. Shared by the service and the agent
+    agent/              the member agent: fetch, verify, apply with Docker, report
   web/                  (step 6) the three sites
 ```
 
@@ -141,7 +144,8 @@ Deployment settings come from a config file or environment. Pool policy lives in
 | Ethereum RPC URL, chain id | Arbitrum One, for sending payments |
 | Payout keystore and password file | this region's payout wallet |
 | Session signing secret | shared by all regions, so a session from one is accepted by the others |
-| Compose signing key | signs the files agents apply |
+| Compose signing key file | signs the files agents apply; created on first start. Agents trust the key they were installed with, so it must be kept: losing it means every member installs again |
+| Agent image, tunnel image | the agent's image, shown in the install command, and the image holding `livepeer_runner_tunnel`, pinned by digest. Without a tunnel image the agent is not offered and members start their runners by hand |
 | Admin email | the one operator address |
 | Resend base URL, API key, from address | email |
 | Allowed web origins | the three sites |
@@ -165,8 +169,8 @@ Deployment settings come from a config file or environment. Pool policy lives in
 | `terms` | each published version of the global terms and of this region's terms, its text and hash |
 | `applications` | address, display name, machines, global and regional terms versions, signature, status, reason |
 | `members` | address, display name, status (active, banned, left), reason |
-| `machines` | member, label, declared GPUs, GPUs the agent reported, status, last seen |
-| `assignments` | machine, app, capacity cap, status (active, draining, removed) |
+| `machines` | member, label, declared GPUs, the agent's last report (containers, GPUs found, agent version, error), status, last seen |
+| `assignments` | machine, app, capacity cap, status (active, draining, removed), the app version and container the machine was last told to run, whether it is being moved to a new one |
 | `credentials` | machine, hash of the secret, created, revoked |
 | `runners` | what the orchestrator reports per runner, joined to its machine: state, status, hold, last test |
 | `test_results` | runner, time, pass or fail, latency, detail |
@@ -184,6 +188,7 @@ Deployment settings come from a config file or environment. Pool policy lives in
 - Read the orchestrator's events from Kafka into the ledger.
 - Poll the orchestrator's runner list and current round.
 - Run tests on schedule and apply promotion, suspension, version deadlines and draining.
+- Move machines to their apps' current versions, a few at a time.
 - Push the price table to the orchestrator when the catalog changes and whenever the orchestrator comes back.
 - Close windows, build batches, send approved payments, confirm them.
 
@@ -219,7 +224,7 @@ A member whose application is approved in two regions is two independent members
 | Mode | single-shot or persistent |
 | Price | amount, USD, per hour, per 720p, or fixed. Becomes the orchestrator's price for the app |
 | Container | image pinned by digest, arguments, environment, the port the app listens on, its health path, GPU count, shared memory, a cache volume for model files |
-| Required version | the string runners must report; changing it starts a deadline for runners on the old one |
+| Required version | the string runners must report. A version is the string and the container together and they change in one action, which starts a [rollout](#tests-promotion-and-suspension) |
 | Eligible GPUs | which supported models may be assigned it |
 | Capacity | default and maximum concurrent sessions per machine |
 | Test | see [Tests](#tests-promotion-and-suspension) |
@@ -232,7 +237,7 @@ Apps and prices are per region. The admin site can copy an app to another region
 
 - A machine belongs to one member in one region and is approved by the operator, at application or when the member requests it later. A member removes their own machine freely; its runners are drained and removed.
 - The operator assigns apps to a machine, each with a session cap no higher than the app's maximum. The site only offers apps whose eligible GPUs match the machine.
-- A machine has one credential. The member creates it on the machine's page, where it is shown once together with the install command. Creating a new one revokes the old.
+- A machine has one credential. The member creates it on the machine's page, where it is shown once together with the install command. Creating a new one revokes the old, and the member starts the agent again with the new one.
 - Changing or removing an assignment drains it first: the runner stops taking new work, its sessions finish, then it is removed and the machine's compose file changes.
 
 **What the operator sees when deciding.** Per app in the region: runners online, slots busy out of total, sessions and fees in the last 24 hours, and requests turned away for lack of capacity. This table will be adjusted once it shows real data.
@@ -244,7 +249,7 @@ The orchestrator calls `POST /v1/orchestrator/admit` when a runner registers, wi
 1. The credential belongs to a machine, is not revoked, and the machine's member is active.
 2. The machine has an active assignment for the runner's app, and the app is offered.
 3. The runner's mode matches the app's.
-4. The runner's version is the app's required version, or the previous one while its deadline has not passed.
+4. The runner's version is the one the machine was last told to run, or the app's required version, or the previous one while its deadline has not passed.
 5. The runner's capacity is within the assignment's cap.
 
 It answers with the member, the payout address, and the state `probation`. A refusal carries a reason the member's agent logs, for example `this machine is not assigned flux/schnell`.
@@ -253,22 +258,38 @@ One runner per machine and app. If that machine already has a runner for the app
 
 ### The member agent
 
-The agent is one container the member starts once:
+The agent is one container the member starts once, with the command the machine's page shows when the credential is created:
 
 ```text
-docker run -d --restart unless-stopped \
+docker run -d --name openpool-agent-us-east --restart unless-stopped --gpus all \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e OPENPOOL_CREDENTIAL=<shown once> \
-  <agent image> --pool https://us-east.api.open-pool.com --key <compose public key>
+  tztcloud/openpool-agent --pool https://us-east.api.open-pool.com --key <compose public key>
 ```
 
-It repeats three steps:
+`--gpus all` is what lets the agent list the machine's GPUs, and it fails at once on a box without the NVIDIA container toolkit, which is the first thing a member needs to know. With rootless Docker the socket to mount is the one `DOCKER_HOST` names.
 
-1. **Fetch** the machine's desired state: a compose file, its signature and a generation number.
-2. **Verify and apply.** It checks the signature against the public key it was started with and refuses anything else. It also refuses a file that asks for privileged mode, host networking, host process space, added capabilities, or mounts of host paths, whoever signed it. Then it runs `docker compose up` for that file and removes containers no longer in it.
-3. **Report** which containers are running, their health, the GPUs the box really has, and its own version.
+Every 30 seconds it repeats three steps:
 
-The compose file has, per assignment, the app's container and a `livepeer_runner_tunnel` container on a private network. The app's port is never published on the host. The credential is not in the file; the agent passes it to the tunnel containers from its own environment, so the signed file contains no secret.
+1. **Fetch** `GET /v1/agent/desired`: the machine's compose file, the machine id, when it was issued, and the pool's Ed25519 signature over all three.
+2. **Verify and apply.** It checks the signature against the public key it was started with and refuses anything else, a file issued for another machine, and a file older than one it already applied. It then checks the file against its own allowlist, whoever signed it: decoding is strict, so a key the agent does not know is refused, and privileged mode, host networking, host process space, added capabilities, devices, published ports, secrets, includes and volume or network drivers are keys it does not know. Images must be pinned by digest; a mount must be a named volume declared in the file; a network must be one declared in the file; only NVIDIA GPUs may be reserved. Then it runs `docker compose up --detach --remove-orphans` when the file changed, and again every five minutes, which brings back a container removed by hand.
+3. **Report** `POST /v1/agent/report`: the containers and their state and health, the GPUs `nvidia-smi` lists, its own version, the file it applied, and the error if it could not apply it. Member and operator see the report on the machine's page, so "why is nothing running" has an answer there.
+
+The compose file has, per assignment, the app's container and a `livepeer_runner_tunnel` container on a private network of their own. The app's port is never published on the host. The credential is not in the file: the file says `${OPENPOOL_CREDENTIAL}` and the agent supplies the value from its own environment when it applies it, so the signed file contains no secret. A `$` in anything the operator wrote is escaped, so it cannot become a variable. Model files go in a named volume per app, which a new version of the app keeps.
+
+A draining assignment stays in the file until its runner is gone, which is what lets its sessions finish. Containers are kept in a Compose project named after the pool's address, so a machine that joined two regions runs one agent for each without either removing the other's containers.
+
+What the agent does when things go wrong:
+
+| Situation | The agent |
+| --- | --- |
+| The pool is unreachable or answers with an error | keeps running what it was last told, and tries again |
+| The file fails the signature or the allowlist | leaves Docker alone, logs why, and reports the reason to the pool |
+| Docker refuses the file (an image cannot be pulled, no GPU) | reports Docker's error and tries again on the next round |
+| The pool refuses the credential (machine removed, member banned, credential replaced) | leaves everything running for an hour, so sessions of a removed machine can finish, then stops what the pool had it start. Volumes stay |
+| The agent itself stops | the containers keep running and restart by themselves; the agent picks them up when it is back |
+
+The tunnel image is built from go-livepeer's `docker/Dockerfile.runner-tunnel` (the tunnel binary alone, a few megabytes) and the agent's from `docker/Dockerfile.agent` (the agent, the Docker CLI and its compose plugin).
 
 What this gives: a member installs once; version changes and reassignments need nothing from them; the operator sees real hardware.
 
@@ -292,7 +313,15 @@ A runner is tested when it registers and then on the test interval, while it rep
 
 **Holds.** When the operator sets a runner's state by hand, that is a hold: the pool stops promoting, suspending and draining that runner. Lifting the hold hands it back; if it is suspended at that point, three passes bring it back. An app with no test defined is never promoted by the pool: its runners wait on probation for the operator.
 
-**Version deadline.** When the operator raises an app's required version, the agents pull the new file and their runners re-register on the new version. A runner still on the old version when the deadline passes is suspended, and passing tests do not bring it back. Rolling a new version out machine by machine, so an app is never without runners, belongs to the agent (step 5).
+**New versions.** A version of an app is its version string and its container, and the operator changes both in one action. The new version then reaches machines a few at a time, so the app is never without runners: at most a quarter of the machines running it, and always at least one, are being moved at once. Idle machines go first. A machine being moved:
+
+1. stops taking new work (its runner is suspended, reason "upgrade") and finishes its sessions;
+2. is then told the new version: its compose file changes, its agent replaces the containers, and the new runner registers, replacing the old one;
+3. counts as moved once the new runner has passed its test and is active. If that has not happened after 15 minutes the pool moves on to the next machine anyway, and a runner it had stopped goes back to the tests.
+
+A machine with nothing running is told the new version at once. A runner the operator put on hold is not moved until the hold is lifted.
+
+**Version deadline.** Until its turn comes, a machine keeps running the version it was last told to run, and is admitted on it, whatever the deadline says: the deadline is for machines that were told and did not follow, which in practice means runners started by hand. Such a runner still on the old version when the deadline passes is suspended, and passing tests do not bring it back.
 
 **Draining.** Unassigning an app, or removing a machine, does not cut its runner off. The runner is suspended so it takes no new work, and it is removed once the sessions it was running have finished. Assigning the app again before then keeps the runner. A ban is the exception: it removes a member's runners at once.
 
@@ -428,7 +457,7 @@ A ticket the node gives up on is also marked redeemed in its database; the event
 | 2 | Pool service core: store, catalog, applications, members, machines, assignments, credentials, admission, orchestrator control, both sign-ins, the API for these | **Built.** A runner started with a machine credential is admitted on probation only for its assigned app; everything else is refused with a reason. Covered by the module's own tests and by a test in go-livepeer (`server/ai_http_openpool_test.go`) that runs the real pool service as a process beside a real orchestrator. |
 | 3 | Tests, promotion and suspension, holds, version deadlines, draining | **Built.** A passing runner goes active by itself; a failing one is suspended and comes back after passing again; reassigning lets sessions finish. The go-livepeer test shows all of it against a real orchestrator and runner |
 | 4 | Ledger, windows, batches, approval, sending, emails | **Built.** A window of events produces the batch the formula predicts; an approved batch pays each member once, also across a restart mid-send. The go-livepeer test feeds a real orchestrator's events to the pool service and sees the batch built and approved. Not exercised yet: a real Kafka broker (the tests upload events over HTTP, and the consumer loop is untested) and a real chain (the tests pay on an in-memory one that follows a node's nonce, receipt and error behaviour) |
-| 5 | Member agent and signed compose files | one command on a GPU box brings its assigned app online; changing the assignment switches it with no action from the member |
+| 5 | Member agent and signed compose files | **Built.** One command on a box brings its assigned app online beside its tunnel; changing the assignment or the app's version switches it with no action from the member; unassigning takes it down. Shown by running the agent's real image against the service and a real Docker daemon (`TestAgentImageOnRealDocker`, run on request), with the allowlist, the signature, the rollout and the agent's failure handling covered by the module's tests. Not exercised yet: a tunnel started by the agent registering with a real orchestrator, which is the harness (step 7), and a machine with NVIDIA GPUs (the test box has none, so the GPU reservation and `nvidia-smi` listing are untested on hardware) |
 | 6 | The three sites | each page listed above works against two regions, and with one of them stopped |
 | 7 | End-to-end harness | one command runs an orchestrator, Kafka, a pool service, an agent and an echo app locally, through signup, approval, a paid call and a payout |
 

@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/Livepeer-Open-Pool/pool/internal/api"
 	"github.com/Livepeer-Open-Pool/pool/internal/auth"
+	"github.com/Livepeer-Open-Pool/pool/internal/compose"
 	"github.com/Livepeer-Open-Pool/pool/internal/config"
 	"github.com/Livepeer-Open-Pool/pool/internal/core"
 	"github.com/Livepeer-Open-Pool/pool/internal/ledger"
@@ -73,12 +75,27 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	var agent *api.AgentOptions
+	composeKey := ""
+	if cfg.AgentConfigured() {
+		key, err := compose.LoadOrCreateKey(cfg.ComposeKeyFile)
+		if err != nil {
+			return err
+		}
+		agent = &api.AgentOptions{Key: key, Image: cfg.AgentImage, TunnelImage: cfg.TunnelImage, OrchestratorURL: cfg.OrchestratorURL}
+		composeKey = compose.EncodePublicKey(key.Public().(ed25519.PublicKey))
+		log.Info("member agent ready", "agent_image", cfg.AgentImage, "tunnel_image", cfg.TunnelImage, "compose_key", composeKey)
+	} else {
+		log.Warn("no tunnel image configured: members start their runners by hand, and the agent is not offered. Set OPENPOOL_TUNNEL_IMAGE")
+	}
 	service := core.New(db, orch, sender, core.Config{
 		RegionID:        cfg.RegionID,
 		RegionName:      cfg.RegionName,
 		PublicURL:       cfg.PublicURL,
 		OrchestratorURL: cfg.OrchestratorURL,
 		AdminURL:        cfg.AdminURL,
+		AgentImage:      cfg.AgentImage,
+		ComposeKey:      composeKey,
 		RecoverSigner:   auth.RecoverSigner,
 	}, log)
 	books := ledger.New(db, nil, log)
@@ -111,6 +128,7 @@ func run(log *slog.Logger) error {
 		PoolSecret:     cfg.PoolSecret,
 		AllowedOrigins: cfg.AllowedOrigins,
 		SignIn:         api.SignInInfo{Domains: cfg.SignInDomains, ChainID: cfg.ChainID},
+		Agent:          agent,
 		Logger:         log,
 	})
 

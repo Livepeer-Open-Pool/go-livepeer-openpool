@@ -339,8 +339,8 @@ func (s *Service) ApproveApplication(ctx context.Context, actor, id string, assi
 				return err
 			}
 			for _, a := range resolved[index] {
-				if _, err := tx.ExecContext(ctx, `INSERT INTO assignments (id, machine_id, app_id, capacity, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-					newID("asg"), machineID, a.app.ID, a.capacity, AssignmentActive, now, now); err != nil {
+				if _, err := tx.ExecContext(ctx, insertAssignment,
+					newID("asg"), machineID, a.app.ID, a.capacity, AssignmentActive, a.app.RequiredVersion, mustJSON(a.app.Container), now, now); err != nil {
 					return err
 				}
 			}

@@ -76,8 +76,9 @@ func TestAdmissionFollowsTheCatalog(t *testing.T) {
 	// After a version change the new version is admitted at once, and the
 	// old one only until its deadline.
 	deadline := f.clock.Now().Add(time.Hour)
-	updated, err := f.svc.SetAppVersion(f.ctx, operator, echo.ID, "2.0.0", &deadline)
+	updated, err := f.svc.SetAppVersion(f.ctx, operator, echo.ID, "2.0.0", nil, &deadline)
 	require.NoError(t, err)
+	require.NoError(t, f.svc.Reconcile(f.ctx)) // nothing is running there, so the machine is told at once
 	require.True(t, f.admit(credential, "runner_new", updated).Allow)
 	onOld := func(r *core.AdmissionRunner) { r.Version = "1.0.0" }
 	require.True(t, f.admit(credential, "runner_old", updated, onOld).Allow)

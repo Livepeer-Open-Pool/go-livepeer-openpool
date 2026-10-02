@@ -9,7 +9,16 @@ It is its own Go module and shares no code with go-livepeer.
 ```bash
 cd pool
 go build -o openpool ./cmd/openpool
+CGO_ENABLED=0 go build -o openpool-agent ./cmd/openpool-agent
 go test ./...
+```
+
+Two tests drive a real Docker daemon and run only when asked to. The second runs the agent's real image, so it needs the two images below, the tunnel image pushed to a registry so that it has a digest:
+
+```bash
+OPENPOOL_DOCKER_TEST=1 go test ./internal/agent -run RealDocker
+OPENPOOL_DOCKER_TEST=1 OPENPOOL_TEST_AGENT_IMAGE=<agent image> OPENPOOL_TEST_TUNNEL_IMAGE=<tunnel image>@sha256:<digest> \
+  go test ./internal/api -run AgentImageOnRealDocker
 ```
 
 `server/ai_http_openpool_test.go` in go-livepeer runs this service as a process beside a real orchestrator and takes a member from application to serving work. Run it from the repository root with `go test ./server/ -run OpenPoolServiceAndOrchestratorAgree`.
@@ -20,7 +29,7 @@ Configuration comes from `OPENPOOL_*` environment variables. Any of them can be 
 
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
-| `OPENPOOL_REGION_ID` | yes | | Short id of this region, e.g. `us-east` |
+| `OPENPOOL_REGION_ID` | yes | | Short id of this region, e.g. `us-east`: lowercase letters, digits and dashes |
 | `OPENPOOL_REGION_NAME` | | the id | Name shown to people, e.g. `US East` |
 | `OPENPOOL_LISTEN` | | `127.0.0.1:8090` | Address the API listens on |
 | `OPENPOOL_PUBLIC_URL` | yes | | This API's address as the sites and agents reach it |
@@ -40,6 +49,9 @@ Configuration comes from `OPENPOOL_*` environment variables. Any of them can be 
 | `OPENPOOL_RESEND_BASE_URL` | | Resend's own | Base URL of a Resend-compatible API |
 | `OPENPOOL_MAIL_FROM` | | | From address of the emails |
 | `OPENPOOL_ALLOWED_ORIGINS` | | the three Open Pool sites | Sites whose pages may call this API, comma-separated |
+| `OPENPOOL_TUNNEL_IMAGE` | | | The image holding `livepeer_runner_tunnel` that member machines run beside each app, pinned by digest (`name@sha256:…`). Without it the agent is not offered and members start their runners by hand |
+| `OPENPOOL_AGENT_IMAGE` | | `tztcloud/openpool-agent:latest` | The member agent's image, shown in the install command |
+| `OPENPOOL_COMPOSE_KEY_FILE` | | `openpool-compose.key` | The key that signs the compose files agents apply. Created on first start. Keep it: agents trust the key they were installed with |
 | `OPENPOOL_KAFKA_BROKERS` | | | Kafka brokers the orchestrator's events are read from, comma-separated |
 | `OPENPOOL_KAFKA_TOPIC` | | | The orchestrator's `-kafkaOrchestratorTopic`. One topic per region |
 | `OPENPOOL_KAFKA_GROUP` | | `openpool-<region id>` | Consumer group, which is how the service remembers where it stopped reading |
@@ -65,3 +77,23 @@ livepeer -orchestrator -useLiveRunners \
 ```
 
 It needs no `-liveRunnerPrices` file: the pool service sends the orchestrator the prices of the apps in its catalog, when the catalog changes and once a minute.
+
+## The member agent
+
+A member's machine runs one agent per region it joined. The agent fetches the machine's compose file from this service, checks the pool's signature and its own allowlist, applies the file with Docker, and reports back. The member starts it once with the command their machine's page shows; [DESIGN.md](DESIGN.md#the-member-agent) describes what it accepts and what it does when things go wrong.
+
+The pool needs two images in a registry its members can pull from:
+
+```bash
+# The agent, from this directory.
+docker build -f docker/Dockerfile.agent --build-arg VERSION=0.1.0 -t tztcloud/openpool-agent:0.1.0 .
+docker push tztcloud/openpool-agent:0.1.0
+
+# The tunnel, whose context is the repository root. Pushing prints the digest OPENPOOL_TUNNEL_IMAGE needs.
+docker build -f ../docker/Dockerfile.runner-tunnel -t tztcloud/livepeer-runner-tunnel:0.9.3 ..
+docker push tztcloud/livepeer-runner-tunnel:0.9.3
+```
+
+Then set `OPENPOOL_AGENT_IMAGE=tztcloud/openpool-agent:0.1.0` and `OPENPOOL_TUNNEL_IMAGE=tztcloud/livepeer-runner-tunnel@sha256:<digest>`. Changing the tunnel image changes every machine's compose file, so every agent restarts its tunnels on its next round; sessions in progress on them end.
+
+The agent takes `--pool` (this service's public address), `--key` (the compose public key, which the service logs at start and `GET /v1/public/pool` returns), and `--interval` (default `30s`), and reads the machine's credential from `OPENPOOL_CREDENTIAL` or the file named by `OPENPOOL_CREDENTIAL_FILE`.

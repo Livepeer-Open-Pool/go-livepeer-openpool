@@ -49,6 +49,12 @@ type Config struct {
 	OrchestratorURL string
 	// AdminURL is the admin site, for links in emails.
 	AdminURL string
+	// AgentImage is the member agent's image and ComposeKey the public half
+	// of the key its compose files are signed with; both go into the install
+	// command a member is shown. An empty ComposeKey means this pool's
+	// machines are not run by the agent.
+	AgentImage string
+	ComposeKey string
 	// RecoverSigner returns the address that signed message, or an error.
 	RecoverSigner func(message, signature string) (string, error)
 	// Now is the clock; nil means time.Now.

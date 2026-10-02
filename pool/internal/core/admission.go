@@ -78,11 +78,11 @@ func (s *Service) Admit(ctx context.Context, req AdmissionRequest) (AdmissionRes
 	}
 
 	app, err := s.appByName(ctx, req.Runner.App)
-	var assignmentID string
+	var assignmentID, deployedVersion string
 	var capacity int
 	if err == nil {
-		err = s.db.QueryRowContext(ctx, `SELECT id, capacity FROM assignments WHERE machine_id = ? AND app_id = ? AND status = ?`,
-			machineID, app.ID, AssignmentActive).Scan(&assignmentID, &capacity)
+		err = s.db.QueryRowContext(ctx, `SELECT id, capacity, deployed_version FROM assignments WHERE machine_id = ? AND app_id = ? AND status = ?`,
+			machineID, app.ID, AssignmentActive).Scan(&assignmentID, &capacity, &deployedVersion)
 	}
 	var notFound *Error
 	if errors.Is(err, sql.ErrNoRows) || (errors.As(err, &notFound) && notFound.Kind == NotFound) {
@@ -97,7 +97,9 @@ func (s *Service) Admit(ctx context.Context, req AdmissionRequest) (AdmissionRes
 	if req.Runner.Mode != app.Mode {
 		return deny("%s runs in %s mode", app.Name, app.Mode), nil
 	}
-	if !app.versionAdmitted(req.Runner.Version, s.now()) {
+	// The version the machine was told to run is always admitted: a machine
+	// waiting its turn in a rollout still runs the one before.
+	if req.Runner.Version != deployedVersion && !app.versionAdmitted(req.Runner.Version, s.now()) {
 		return deny("%s requires version %s", app.Name, app.RequiredVersion), nil
 	}
 	if req.Runner.Capacity > capacity {

@@ -6,6 +6,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -56,6 +57,14 @@ type Config struct {
 	KafkaGroup    string
 	KafkaUser     string
 	KafkaPassword string
+
+	// The member agent. ComposeKeyFile holds the key that signs the compose
+	// files agents apply, and is created when missing. AgentImage is the
+	// agent's image and TunnelImage the image holding livepeer_runner_tunnel,
+	// pinned by digest. Without a TunnelImage machines are not run by the agent.
+	ComposeKeyFile string
+	AgentImage     string
+	TunnelImage    string
 
 	// The payout wallet: an Ethereum node, a keystore file and its password.
 	EthRPCURL      string
@@ -133,11 +142,20 @@ func FromEnv() (*Config, error) {
 	cfg.KafkaGroup = get("KAFKA_GROUP", "openpool-"+cfg.RegionID, false)
 	cfg.KafkaUser = get("KAFKA_USER", "", false)
 	cfg.KafkaPassword = get("KAFKA_PASSWORD", "", false)
+	cfg.ComposeKeyFile = get("COMPOSE_KEY_FILE", "openpool-compose.key", false)
+	cfg.AgentImage = get("AGENT_IMAGE", "tztcloud/openpool-agent:latest", false)
+	cfg.TunnelImage = get("TUNNEL_IMAGE", "", false)
+	if cfg.TunnelImage != "" && !pinnedImage.MatchString(cfg.TunnelImage) {
+		problems = append(problems, "OPENPOOL_TUNNEL_IMAGE must be pinned by digest, as name@sha256:<64 hex digits>")
+	}
 	cfg.EthRPCURL = get("ETH_RPC_URL", "", false)
 	cfg.PayoutKeystore = get("PAYOUT_KEYSTORE", "", false)
 	cfg.PayoutPassword = get("PAYOUT_PASSWORD", "", false)
 	if (cfg.EthRPCURL == "") != (cfg.PayoutKeystore == "") {
 		problems = append(problems, "OPENPOOL_ETH_RPC_URL and OPENPOOL_PAYOUT_KEYSTORE go together: set both to pay out, or neither")
+	}
+	if cfg.RegionID != "" && !regionID.MatchString(cfg.RegionID) {
+		problems = append(problems, "OPENPOOL_REGION_ID must be lowercase letters, digits and dashes, such as us-east")
 	}
 	if cfg.RegionName == "" {
 		cfg.RegionName = cfg.RegionID
@@ -173,6 +191,13 @@ func FromEnv() (*Config, error) {
 	}
 	return cfg, nil
 }
+
+var regionID = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
+
+var pinnedImage = regexp.MustCompile(`^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$`)
+
+// AgentConfigured says whether machines are run by the member agent.
+func (c *Config) AgentConfigured() bool { return c.TunnelImage != "" }
 
 // PayoutsConfigured says whether the service has a wallet to pay from.
 func (c *Config) PayoutsConfigured() bool {

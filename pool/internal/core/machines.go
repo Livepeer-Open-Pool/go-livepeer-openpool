@@ -26,12 +26,17 @@ const (
 
 // Assignment is the operator's decision that a machine runs an app.
 type Assignment struct {
-	ID        string    `json:"id"`
-	MachineID string    `json:"machine_id"`
-	AppID     string    `json:"app_id"`
-	AppName   string    `json:"app_name"`
-	Capacity  int       `json:"capacity"`
-	Status    string    `json:"status"`
+	ID        string `json:"id"`
+	MachineID string `json:"machine_id"`
+	AppID     string `json:"app_id"`
+	AppName   string `json:"app_name"`
+	Capacity  int    `json:"capacity"`
+	Status    string `json:"status"`
+	// Version is the app version the machine is told to run. It trails the
+	// app's required version while a new one is being rolled out; Upgrading
+	// is set while this machine is the one being moved.
+	Version   string    `json:"version"`
+	Upgrading bool      `json:"upgrading"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -42,6 +47,11 @@ type AssignmentInput struct {
 	AppID    string `json:"app_id"`
 	Capacity int    `json:"capacity"`
 }
+
+// insertAssignment adds an assignment whose machine is told to run the
+// app's current version and container.
+const insertAssignment = `INSERT INTO assignments (id, machine_id, app_id, capacity, status, deployed_version, deployed_container, created_at, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 type resolvedAssignment struct {
 	app      *App
@@ -62,6 +72,8 @@ type Machine struct {
 	// CredentialCreatedAt is set while the machine has a credential that has
 	// not been revoked. The secret itself is never stored or shown again.
 	CredentialCreatedAt *time.Time `json:"credential_created_at,omitempty"`
+	// Reported is what the machine's agent last said about it, if it runs one.
+	Reported *AgentReport `json:"reported,omitempty"`
 }
 
 // resolveAssignments checks the apps the operator wants on a machine: each
@@ -102,17 +114,21 @@ func (s *Service) resolveAssignments(ctx context.Context, spec MachineSpec, inpu
 	return resolved, nil
 }
 
-const machineColumns = `id, member_id, label, gpus, status, created_at, last_seen_at`
+const machineColumns = `id, member_id, label, gpus, status, created_at, last_seen_at, reported`
 
 func scanMachine(row rowScanner) (*Machine, error) {
 	var m Machine
-	var gpus string
+	var gpus, reported string
 	var created, seen int64
-	if err := row.Scan(&m.ID, &m.MemberID, &m.Label, &gpus, &m.Status, &created, &seen); err != nil {
+	if err := row.Scan(&m.ID, &m.MemberID, &m.Label, &gpus, &m.Status, &created, &seen, &reported); err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal([]byte(gpus), &m.GPUs); err != nil {
 		return nil, err
+	}
+	var report AgentReport
+	if err := json.Unmarshal([]byte(reported), &report); err == nil && report.ReportedAt != nil {
+		m.Reported = &report
 	}
 	m.CreatedAt, m.LastSeenAt = fromMs(created), optionalTime(seen)
 	m.Assignments = []Assignment{}
@@ -121,7 +137,8 @@ func scanMachine(row rowScanner) (*Machine, error) {
 
 // fillMachine adds a machine's assignments and credential status.
 func (s *Service) fillMachine(ctx context.Context, m *Machine) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT a.id, a.machine_id, a.app_id, p.name, a.capacity, a.status, a.created_at, a.updated_at
+	rows, err := s.db.QueryContext(ctx, `SELECT a.id, a.machine_id, a.app_id, p.name, a.capacity, a.status,
+		CASE WHEN a.deployed_version = '' THEN p.required_version ELSE a.deployed_version END, a.upgrading_since != 0, a.created_at, a.updated_at
 		FROM assignments a JOIN apps p ON p.id = a.app_id WHERE a.machine_id = ? AND a.status != ? ORDER BY p.name`, m.ID, AssignmentRemoved)
 	if err != nil {
 		return err
@@ -130,7 +147,7 @@ func (s *Service) fillMachine(ctx context.Context, m *Machine) error {
 	for rows.Next() {
 		var a Assignment
 		var created, updated int64
-		if err := rows.Scan(&a.ID, &a.MachineID, &a.AppID, &a.AppName, &a.Capacity, &a.Status, &created, &updated); err != nil {
+		if err := rows.Scan(&a.ID, &a.MachineID, &a.AppID, &a.AppName, &a.Capacity, &a.Status, &a.Version, &a.Upgrading, &created, &updated); err != nil {
 			return err
 		}
 		a.CreatedAt, a.UpdatedAt = fromMs(created), fromMs(updated)
@@ -337,8 +354,8 @@ func (s *Service) SetAssignments(ctx context.Context, actor, machineID string, i
 			delete(wanted, current.AppID)
 		}
 		for _, want := range wanted {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO assignments (id, machine_id, app_id, capacity, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-				newID("asg"), machineID, want.app.ID, want.capacity, AssignmentActive, now, now); err != nil {
+			if _, err := tx.ExecContext(ctx, insertAssignment,
+				newID("asg"), machineID, want.app.ID, want.capacity, AssignmentActive, want.app.RequiredVersion, mustJSON(want.app.Container), now, now); err != nil {
 				return err
 			}
 		}
@@ -354,12 +371,15 @@ func (s *Service) SetAssignments(ctx context.Context, actor, machineID string, i
 }
 
 // NewCredential is a machine's credential at the one moment its secret is
-// known. Commands are how to start each assigned app's runner by hand with
-// livepeer_runner_tunnel, for a machine that does not use the agent.
+// known. AgentCommand starts the agent, which then runs whatever the machine
+// is assigned. Commands are how to start each assigned app's runner by hand
+// with livepeer_runner_tunnel instead, for a machine that does not use the
+// agent.
 type NewCredential struct {
-	MachineID string   `json:"machine_id"`
-	Secret    string   `json:"secret"`
-	Commands  []string `json:"commands"`
+	MachineID    string   `json:"machine_id"`
+	Secret       string   `json:"secret"`
+	AgentCommand string   `json:"agent_command,omitempty"`
+	Commands     []string `json:"commands"`
 }
 
 // CreateCredential gives a member's machine a new credential and revokes
@@ -390,6 +410,16 @@ func (s *Service) CreateCredential(ctx context.Context, member *Member, machineI
 		return nil, err
 	}
 	credential := &NewCredential{MachineID: machineID, Secret: secret, Commands: []string{}}
+	if s.cfg.ComposeKey != "" {
+		credential.AgentCommand = strings.Join([]string{
+			"docker run -d --name openpool-agent-" + s.cfg.RegionID + " --restart unless-stopped --gpus all",
+			"-v /var/run/docker.sock:/var/run/docker.sock",
+			"-e OPENPOOL_CREDENTIAL=" + secret,
+			s.cfg.AgentImage,
+			"--pool " + s.cfg.PublicURL,
+			"--key " + s.cfg.ComposeKey,
+		}, " ")
+	}
 	for _, a := range m.Assignments {
 		app, err := s.App(ctx, a.AppID)
 		if err != nil {

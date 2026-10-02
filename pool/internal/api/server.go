@@ -31,6 +31,7 @@ type Server struct {
 	poolSecret string
 	origins    map[string]bool
 	signIn     SignInInfo
+	agent      *AgentOptions
 	log        *slog.Logger
 }
 
@@ -57,7 +58,9 @@ type Options struct {
 	// AllowedOrigins are the sites whose pages may call this API from a browser.
 	AllowedOrigins []string
 	SignIn         SignInInfo
-	Logger         *slog.Logger
+	// Agent is nil for a pool whose machines are not run by the agent.
+	Agent  *AgentOptions
+	Logger *slog.Logger
 }
 
 // New returns a Server.
@@ -77,7 +80,7 @@ func New(opts Options) *Server {
 	return &Server{
 		core: opts.Core, ledger: opts.Ledger, payouts: opts.Payouts, now: now,
 		tokens: opts.Tokens, wallet: opts.Wallet, admin: opts.Admin,
-		poolSecret: opts.PoolSecret, origins: origins, signIn: opts.SignIn, log: log,
+		poolSecret: opts.PoolSecret, origins: origins, signIn: opts.SignIn, agent: opts.Agent, log: log,
 	}
 }
 
@@ -90,6 +93,8 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("POST /v1/orchestrator/admit", s.admit)
 	mux.HandleFunc("POST /v1/orchestrator/events", s.orchestratorEvents)
+	mux.HandleFunc("GET /v1/agent/desired", s.agentDesired)
+	mux.HandleFunc("POST /v1/agent/report", s.agentReport)
 
 	mux.HandleFunc("GET /v1/public/pool", s.publicPool)
 	mux.HandleFunc("GET /v1/public/apps", s.publicApps)

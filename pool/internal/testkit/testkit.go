@@ -8,6 +8,7 @@ import (
 	"crypto/ecdsa"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +18,8 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Livepeer-Open-Pool/pool/internal/agent"
+	"github.com/Livepeer-Open-Pool/pool/internal/compose"
 	"github.com/Livepeer-Open-Pool/pool/internal/core"
 	"github.com/Livepeer-Open-Pool/pool/internal/store"
 )
@@ -346,4 +349,68 @@ func (o *Orchestrator) Update(runnerID string, change func(*core.OrchRunner)) {
 			change(&o.List[i])
 		}
 	}
+}
+
+// Docker stands in for Docker on a member's machine: it remembers the
+// compose file it was last told to run.
+type Docker struct {
+	mu sync.Mutex
+	// File is the compose file now applied; nil when everything is down.
+	File []byte
+	// Credential is what the file's credential variable was set to.
+	Credential string
+	Ups, Downs int
+	// Fail makes Up fail with this error.
+	Fail error
+}
+
+func (d *Docker) Up(ctx context.Context, file []byte, credential string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.Fail != nil {
+		return d.Fail
+	}
+	d.File, d.Credential = append([]byte(nil), file...), credential
+	d.Ups++
+	return nil
+}
+
+func (d *Docker) Down(ctx context.Context) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.File = nil
+	d.Downs++
+	return nil
+}
+
+// Containers reports every service of the applied file as running.
+func (d *Docker) Containers(ctx context.Context) ([]agent.Container, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.File == nil {
+		return nil, nil
+	}
+	file, err := compose.Parse(d.File)
+	if err != nil {
+		return nil, err
+	}
+	containers := []agent.Container{}
+	for name := range file.Services {
+		containers = append(containers, agent.Container{Service: name, State: "running"})
+	}
+	sort.Slice(containers, func(i, j int) bool { return containers[i].Service < containers[j].Service })
+	return containers, nil
+}
+
+// Running is the applied compose file, or nil when everything is down.
+func (d *Docker) Running(t *testing.T) *compose.File {
+	t.Helper()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.File == nil {
+		return nil
+	}
+	file, err := compose.Parse(d.File)
+	require.NoError(t, err)
+	return file
 }

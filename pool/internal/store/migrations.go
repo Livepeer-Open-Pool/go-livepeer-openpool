@@ -272,4 +272,14 @@ CREATE TABLE batch_items (
 	PRIMARY KEY (batch_id, member_id)
 );
 `,
+	// 4: what each machine is told to run. An assignment remembers the
+	// version and container its machine was last told to run, so a new
+	// version of an app reaches machines a few at a time, each after its
+	// sessions have finished.
+	`
+ALTER TABLE assignments ADD COLUMN deployed_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE assignments ADD COLUMN deployed_container TEXT NOT NULL DEFAULT '';
+-- Set while the machine is being moved to the app's current version.
+ALTER TABLE assignments ADD COLUMN upgrading_since INTEGER NOT NULL DEFAULT 0;
+`,
 }

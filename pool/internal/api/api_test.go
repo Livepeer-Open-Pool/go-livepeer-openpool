@@ -3,11 +3,13 @@ package api_test
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/Livepeer-Open-Pool/pool/internal/api"
 	"github.com/Livepeer-Open-Pool/pool/internal/auth"
+	"github.com/Livepeer-Open-Pool/pool/internal/compose"
 	"github.com/Livepeer-Open-Pool/pool/internal/core"
 	"github.com/Livepeer-Open-Pool/pool/internal/ledger"
 	"github.com/Livepeer-Open-Pool/pool/internal/payouts"
@@ -39,7 +42,15 @@ type env struct {
 	clock   *testkit.Clock
 	payouts *payouts.Service
 	round   *roundCounter
+	core    *core.Service
+	// composeKey is the public half of the key compose files are signed with.
+	composeKey ed25519.PublicKey
 }
+
+const (
+	agentImage  = "tztcloud/openpool-agent:test"
+	tunnelImage = "tztcloud/livepeer-runner-tunnel@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+)
 
 // roundCounter is the Livepeer round the tests say it is.
 type roundCounter struct {
@@ -59,20 +70,29 @@ func (r *roundCounter) set(round int64) {
 	r.round = round
 }
 
-func newEnv(t *testing.T) *env {
+func newEnv(t *testing.T) *env { return newEnvWithTunnel(t, tunnelImage) }
+
+// newEnvWithTunnel is newEnv with the image machines run the tunnel from.
+func newEnvWithTunnel(t *testing.T, tunnelImage string) *env {
 	t.Helper()
 	e := &env{t: t, orch: &testkit.Orchestrator{}, mail: &testkit.Mailbox{}, clock: testkit.NewClock(), round: &roundCounter{round: 4100}}
 	db := testkit.OpenDB(t)
 	tokens, err := auth.NewTokens(sessionSecret, 12*time.Hour, e.clock.Now)
 	require.NoError(t, err)
+	composeKey, err := compose.LoadOrCreateKey(filepath.Join(t.TempDir(), "compose.key"))
+	require.NoError(t, err)
+	e.composeKey = composeKey.Public().(ed25519.PublicKey)
 	service := core.New(db, e.orch, e.mail, core.Config{
 		RegionID: "us-east", RegionName: "US East",
 		PublicURL:       "https://us-east.api.open-pool.com",
 		OrchestratorURL: "https://orch.us-east.open-pool.com:8935",
 		AdminURL:        "https://admin.open-pool.com",
+		AgentImage:      agentImage,
+		ComposeKey:      compose.EncodePublicKey(e.composeKey),
 		RecoverSigner:   auth.RecoverSigner,
 		Now:             e.clock.Now,
 	}, nil)
+	e.core = service
 	books := ledger.New(db, e.clock.Now, nil)
 	e.payouts = payouts.New(db, books, service.Settings, e.round, nil, e.mail, payouts.Config{
 		RegionName: "US East", AdminURL: "https://admin.open-pool.com", SettleDelay: 10 * time.Minute, Now: e.clock.Now,
@@ -88,6 +108,9 @@ func newEnv(t *testing.T) *env {
 		PoolSecret:     poolSecret,
 		AllowedOrigins: []string{"https://open-pool.com", appOrigin, "https://admin.open-pool.com"},
 		SignIn:         api.SignInInfo{Domains: []string{"app.open-pool.com"}, ChainID: 42161},
+		Agent: &api.AgentOptions{
+			Key: composeKey, Image: agentImage, TunnelImage: tunnelImage, OrchestratorURL: "https://orch.us-east.open-pool.com:8935",
+		},
 	})
 	srv := httptest.NewServer(server.Handler())
 	t.Cleanup(srv.Close)

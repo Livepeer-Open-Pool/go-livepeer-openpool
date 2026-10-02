@@ -38,6 +38,8 @@ type Container struct {
 	HealthPath string `json:"health_path"`
 	// GPUs is how many of the machine's GPUs the app gets; 0 means all.
 	GPUs int `json:"gpus"`
+	// NoGPU is for an app that needs no GPU at all.
+	NoGPU bool `json:"no_gpu,omitempty"`
 	// ShmSize is the container's shared memory, e.g. "8g"; empty leaves Docker's default.
 	ShmSize string `json:"shm_size,omitempty"`
 	// CachePath is where the app keeps model files; a volume is mounted there
@@ -86,10 +88,10 @@ type App struct {
 	UpdatedAt       time.Time `json:"updated_at"`
 }
 
-// AppInput is what the operator supplies for an app. Name and
-// RequiredVersion are set at creation; the version changes through
-// SetAppVersion, which gives runners on the old one a deadline, and the name
-// never does, since runners and prices are known by it.
+// AppInput is what the operator supplies for an app. Name, RequiredVersion
+// and Container are set at creation. The version and the container change
+// together through SetAppVersion, which rolls the change out to machines,
+// and the name never changes, since runners and prices are known by it.
 type AppInput struct {
 	Name            string    `json:"name"`
 	Mode            string    `json:"mode"`
@@ -120,6 +122,29 @@ func validatePrice(p Price) (Price, error) {
 	return p, nil
 }
 
+func validateContainer(c Container) (Container, error) {
+	c.Image = strings.TrimSpace(c.Image)
+	if !pinnedImagePattern.MatchString(c.Image) {
+		return c, invalidf("container image must be pinned by digest, as name@sha256:<64 hex digits>")
+	}
+	if c.Port < 1 || c.Port > 65535 {
+		return c, invalidf("container port must be between 1 and 65535")
+	}
+	if c.HealthPath != "" && !strings.HasPrefix(c.HealthPath, "/") {
+		return c, invalidf("health path must start with /")
+	}
+	if c.GPUs < 0 {
+		return c, invalidf("container GPU count must not be negative")
+	}
+	if c.NoGPU && c.GPUs != 0 {
+		return c, invalidf("a container that needs no GPU cannot also ask for some")
+	}
+	if c.CachePath != "" && !strings.HasPrefix(c.CachePath, "/") {
+		return c, invalidf("cache path must be an absolute path inside the container")
+	}
+	return c, nil
+}
+
 func (s *Service) validateApp(ctx context.Context, in AppInput) (AppInput, error) {
 	in.Name = strings.TrimSpace(in.Name)
 	if in.Name == "" || len(in.Name) > 200 || strings.IndexFunc(in.Name, unicode.IsControl) >= 0 {
@@ -138,22 +163,8 @@ func (s *Service) validateApp(ctx context.Context, in AppInput) (AppInput, error
 		return in, invalidf("required version must be 1 to 100 characters")
 	}
 
-	c := &in.Container
-	c.Image = strings.TrimSpace(c.Image)
-	if !pinnedImagePattern.MatchString(c.Image) {
-		return in, invalidf("container image must be pinned by digest, as name@sha256:<64 hex digits>")
-	}
-	if c.Port < 1 || c.Port > 65535 {
-		return in, invalidf("container port must be between 1 and 65535")
-	}
-	if c.HealthPath != "" && !strings.HasPrefix(c.HealthPath, "/") {
-		return in, invalidf("health path must start with /")
-	}
-	if c.GPUs < 0 {
-		return in, invalidf("container GPU count must not be negative")
-	}
-	if c.CachePath != "" && !strings.HasPrefix(c.CachePath, "/") {
-		return in, invalidf("cache path must be an absolute path inside the container")
+	if in.Container, err = validateContainer(in.Container); err != nil {
+		return in, err
 	}
 
 	if in.DefaultCapacity < 1 || in.MaxCapacity < in.DefaultCapacity {
@@ -282,7 +293,8 @@ func (s *Service) CreateApp(ctx context.Context, actor string, in AppInput) (*Ap
 	return s.App(ctx, id)
 }
 
-// UpdateApp changes an app. Its name and required version stay as they are.
+// UpdateApp changes an app. Its name, required version and container stay
+// as they are.
 func (s *Service) UpdateApp(ctx context.Context, actor, id string, in AppInput) (*App, error) {
 	current, err := s.App(ctx, id)
 	if err != nil {
@@ -295,6 +307,10 @@ func (s *Service) UpdateApp(ctx context.Context, actor, id string, in AppInput) 
 		return nil, invalidf("change the required version with the version action, which gives runners on the old one a deadline")
 	}
 	in.Name, in.RequiredVersion = current.Name, current.RequiredVersion
+	if in.Container.Image != "" && mustJSON(in.Container) != mustJSON(current.Container) {
+		return nil, invalidf("change the container with the version action: an app's image and version change together")
+	}
+	in.Container = current.Container
 	if in.Mode != current.Mode {
 		return nil, invalidf("an app's mode cannot change; create another app")
 	}
@@ -302,9 +318,9 @@ func (s *Service) UpdateApp(ctx context.Context, actor, id string, in AppInput) 
 	if err != nil {
 		return nil, err
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE apps SET price = ?, price_unit = ?, container = ?, eligible_gpus = ?, default_capacity = ?,
+	_, err = s.db.ExecContext(ctx, `UPDATE apps SET price = ?, price_unit = ?, eligible_gpus = ?, default_capacity = ?,
 		max_capacity = ?, test = ?, discovery = ?, description = ?, updated_at = ? WHERE id = ?`,
-		in.Price.Amount, in.Price.Unit, mustJSON(in.Container), mustJSON(in.EligibleGPUs), in.DefaultCapacity,
+		in.Price.Amount, in.Price.Unit, mustJSON(in.EligibleGPUs), in.DefaultCapacity,
 		in.MaxCapacity, mustJSON(in.Test), in.Discovery, in.Description, s.nowMs(), id)
 	if err != nil {
 		return nil, err
@@ -316,10 +332,13 @@ func (s *Service) UpdateApp(ctx context.Context, actor, id string, in AppInput) 
 	return s.App(ctx, id)
 }
 
-// SetAppVersion raises the version runners must report. New registrations
-// must match at once; the version it replaces stays admitted until deadline,
-// which defaults to the pool's version deadline from now.
-func (s *Service) SetAppVersion(ctx context.Context, actor, id, version string, deadline *time.Time) (*App, error) {
+// SetAppVersion releases a new version of an app: the version runners must
+// report and the container that is that version, together. Machines are
+// moved to it a few at a time, each after its sessions have finished. A
+// runner that registers by itself must match at once; the version it
+// replaces stays admitted until deadline, which defaults to the pool's
+// version deadline from now. A nil container keeps the one the app has.
+func (s *Service) SetAppVersion(ctx context.Context, actor, id, version string, container *Container, deadline *time.Time) (*App, error) {
 	current, err := s.App(ctx, id)
 	if err != nil {
 		return nil, err
@@ -331,6 +350,12 @@ func (s *Service) SetAppVersion(ctx context.Context, actor, id, version string, 
 	if version == current.RequiredVersion {
 		return nil, conflictf("%s already requires version %s", current.Name, version)
 	}
+	next := current.Container
+	if container != nil {
+		if next, err = validateContainer(*container); err != nil {
+			return nil, err
+		}
+	}
 	until := s.now()
 	if deadline != nil {
 		until = deadline.UTC()
@@ -341,8 +366,8 @@ func (s *Service) SetAppVersion(ctx context.Context, actor, id, version string, 
 		}
 		until = until.Add(time.Duration(settings.VersionDeadlineHours) * time.Hour)
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE apps SET required_version = ?, previous_version = ?, previous_version_deadline = ?, updated_at = ? WHERE id = ?`,
-		version, current.RequiredVersion, until.UnixMilli(), s.nowMs(), id); err != nil {
+	if _, err := s.db.ExecContext(ctx, `UPDATE apps SET required_version = ?, container = ?, previous_version = ?, previous_version_deadline = ?, updated_at = ? WHERE id = ?`,
+		version, mustJSON(next), current.RequiredVersion, until.UnixMilli(), s.nowMs(), id); err != nil {
 		return nil, err
 	}
 	if err := s.audit(ctx, s.db, actor, "app.version", id, current.RequiredVersion+" -> "+version); err != nil {

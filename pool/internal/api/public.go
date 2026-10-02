@@ -23,6 +23,8 @@ type publicPoolBody struct {
 	TakingApplications bool       `json:"taking_applications"`
 	AppsOffered        int        `json:"apps_offered"`
 	SignIn             SignInInfo `json:"sign_in"`
+	// Agent is how machines join, when the pool runs them with the agent.
+	Agent *publicAgent `json:"agent,omitempty"`
 }
 
 func (s *Server) publicPool(w http.ResponseWriter, r *http.Request) {
@@ -37,7 +39,7 @@ func (s *Server) publicPool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, publicPoolBody{
-		Region: s.region(), TakingApplications: terms.Global != nil, AppsOffered: len(apps), SignIn: s.signIn,
+		Region: s.region(), TakingApplications: terms.Global != nil, AppsOffered: len(apps), SignIn: s.signIn, Agent: s.publicAgent(),
 	})
 }
 
