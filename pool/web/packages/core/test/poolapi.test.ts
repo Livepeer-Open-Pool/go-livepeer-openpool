@@ -35,6 +35,9 @@ describe("the pool service over HTTP", () => {
       expect(seen[0]?.headers["authorization"]).toBe("Bearer the-token")
       expect(seen[1]?.method).toBe("POST")
       expect(seen[1]?.headers["authorization"]).toBeUndefined()
+      // Only headers the regions let a browser send: anything else fails the request before it leaves.
+      const allowed = ["accept", "authorization", "content-type", "content-length"]
+      expect(seen.flatMap((call) => Object.keys(call.headers)).filter((name) => !allowed.includes(name))).toEqual([])
       expect(JSON.parse(seen[1]?.body ?? "")).toEqual({ email: "ops@open-pool.com" })
     }).pipe(Effect.provide(api(({ url }) => (url.includes("/me/tests") ? reply(200, { tests: null }) : reply(204, undefined)), seen)))
   })

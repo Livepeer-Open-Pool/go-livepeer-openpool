@@ -44,7 +44,9 @@ const refusal = (status: number): string =>
 export const PoolApiLive = Layer.effect(
   PoolApi,
   Effect.gen(function* () {
-    const client = yield* HttpClient.HttpClient
+    // No tracing headers: a browser would have to ask the region's permission
+    // for each one, and the regions allow only Authorization and Content-Type.
+    const client = (yield* HttpClient.HttpClient).pipe(HttpClient.withTracerPropagation(false))
 
     const send = <A, I>(region: RegionConfig, request: ApiRequest, answer: Schema.Schema<A, I>): Effect.Effect<A, ApiError> =>
       Effect.gen(function* () {

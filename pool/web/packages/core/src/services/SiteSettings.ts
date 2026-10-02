@@ -26,7 +26,7 @@ const decodeConfig = Schema.decodeUnknown(SiteConfig)
 /** Loads the settings file at url. */
 export const loadSiteConfig = (url: string): Effect.Effect<SiteConfig, ConfigUnavailable, HttpClient.HttpClient> =>
   Effect.gen(function* () {
-    const client = yield* HttpClient.HttpClient
+    const client = (yield* HttpClient.HttpClient).pipe(HttpClient.withTracerPropagation(false))
     const response = yield* client.get(url)
     if (response.status !== 200) {
       return yield* new ConfigUnavailable({ detail: `${url} answered ${response.status}` })
