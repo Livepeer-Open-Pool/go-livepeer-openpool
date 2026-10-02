@@ -323,6 +323,19 @@ func TestAMemberJoinsAndTheirMachineIsAdmittedForItsAssignedAppOnly(t *testing.T
 
 	// Once the orchestrator lists the runner, member and operator both see it.
 	e.orch.Register(core.OrchRunner{RunnerID: "runner_aaaa", MemberID: member.ID, App: "vllm/qwen2.5-7b-instruct", State: core.StateProbation})
+	// Anyone can see how many machines are connected for each app.
+	var serving struct {
+		Apps []struct {
+			Name    string `json:"name"`
+			Runners int    `json:"runners"`
+		} `json:"apps"`
+	}
+	e.ok(http.StatusOK, "GET", "/v1/public/apps", "", nil, &serving)
+	counts := map[string]int{}
+	for _, a := range serving.Apps {
+		counts[a.Name] = a.Runners
+	}
+	require.Equal(t, map[string]int{"vllm/qwen2.5-7b-instruct": 1, "flux/schnell": 0}, counts)
 	var runners struct {
 		Runners []core.Runner `json:"runners"`
 	}

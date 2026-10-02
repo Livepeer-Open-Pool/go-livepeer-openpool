@@ -1,0 +1,23 @@
+{
+  "name": "@openpool/core",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@effect/platform": "0.97.2",
+    "@noble/hashes": "^1.8.0",
+    "effect": "3.22.2"
+  },
+  "devDependencies": {
+    "@effect/vitest": "0.30.0",
+    "typescript": "~5.9.3",
+    "vitest": "^3.2.7"
+  }
+}

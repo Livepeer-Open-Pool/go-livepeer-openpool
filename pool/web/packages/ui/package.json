@@ -1,0 +1,28 @@
+{
+  "name": "@openpool/ui",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./global.css": "./src/global.css"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@lit-labs/signals": "0.3.0",
+    "@lit/context": "^1.1.6",
+    "@lit/task": "^1.0.3",
+    "@openpool/core": "workspace:*",
+    "effect": "3.22.2",
+    "lit": "^3.3.3"
+  },
+  "devDependencies": {
+    "@vitest/browser": "^3.2.7",
+    "playwright": "^1.63.0",
+    "typescript": "~5.9.3",
+    "vite": "^7.3.6",
+    "vitest": "^3.2.7"
+  }
+}

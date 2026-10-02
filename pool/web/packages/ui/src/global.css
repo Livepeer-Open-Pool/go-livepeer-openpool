@@ -1,0 +1,109 @@
+/*
+ * The document-level stylesheet every Open Pool site starts from: a reset,
+ * the design tokens, and base typography. Components carry their own styles
+ * and read the tokens, which inherit into shadow roots.
+ */
+@layer reset, tokens, base, layout, components, utilities;
+
+@layer reset {
+  *, *::before, *::after { box-sizing: border-box; }
+  * { margin: 0; }
+  html { -webkit-text-size-adjust: none; text-size-adjust: none; }
+  img, picture, video, canvas, svg { display: block; max-inline-size: 100%; }
+  input, button, textarea, select { font: inherit; }
+  p, h1, h2, h3, h4 { overflow-wrap: break-word; }
+}
+
+@layer tokens {
+  :root {
+    color-scheme: light dark;
+
+    /* One hue; every color below is derived from it. */
+    --hue: 172;
+    --brand: light-dark(oklch(48% 0.105 var(--hue)), oklch(76% 0.125 var(--hue)));
+    --brand-hover: oklch(from var(--brand) calc(l - 0.06) c h);
+    --on-brand: light-dark(oklch(99% 0.01 var(--hue)), oklch(18% 0.03 var(--hue)));
+    --brand-subtle: color-mix(in oklch, var(--brand) 11%, var(--surface));
+
+    --surface: light-dark(oklch(98.6% 0.004 var(--hue)), oklch(17.5% 0.012 var(--hue)));
+    --surface-raised: light-dark(oklch(100% 0 0), oklch(21.5% 0.014 var(--hue)));
+    --surface-sunken: light-dark(oklch(96% 0.006 var(--hue)), oklch(14.5% 0.012 var(--hue)));
+    --text: light-dark(oklch(24% 0.02 var(--hue)), oklch(93% 0.012 var(--hue)));
+    --text-muted: color-mix(in oklch, var(--text) 66%, var(--surface));
+    --border: color-mix(in oklch, var(--text) 14%, var(--surface));
+    --border-strong: color-mix(in oklch, var(--text) 30%, var(--surface));
+
+    /* Meaning, not decoration: each has a text tone and a tint to sit on. */
+    --good: light-dark(oklch(45% 0.12 150), oklch(80% 0.15 150));
+    --warn: light-dark(oklch(48% 0.11 75), oklch(83% 0.13 80));
+    --bad: light-dark(oklch(50% 0.18 27), oklch(76% 0.14 25));
+    --good-subtle: color-mix(in oklch, var(--good) 12%, var(--surface));
+    --warn-subtle: color-mix(in oklch, var(--warn) 14%, var(--surface));
+    --bad-subtle: color-mix(in oklch, var(--bad) 11%, var(--surface));
+
+    --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+
+    /* Fluid space and type scales. */
+    --space-2xs: 0.25rem;
+    --space-xs: 0.5rem;
+    --space-s: 0.75rem;
+    --space: clamp(1rem, 0.8rem + 0.8vw, 1.5rem);
+    --space-l: clamp(1.5rem, 1.1rem + 1.8vw, 2.75rem);
+    --space-xl: clamp(2.5rem, 1.6rem + 4vw, 5.5rem);
+    --step--1: clamp(0.83rem, 0.81rem + 0.1vw, 0.9rem);
+    --step-0: clamp(1rem, 0.96rem + 0.2vw, 1.1rem);
+    --step-1: clamp(1.2rem, 1.1rem + 0.5vw, 1.45rem);
+    --step-2: clamp(1.5rem, 1.3rem + 1vw, 2.1rem);
+    --step-3: clamp(1.9rem, 1.5rem + 2vw, 3.1rem);
+    --step-4: clamp(2.3rem, 1.6rem + 3.6vw, 4.4rem);
+
+    --radius: 12px;
+    --radius-s: 7px;
+    --shadow: 0 1px 2px oklch(20% 0.03 var(--hue) / 0.07), 0 8px 24px oklch(20% 0.03 var(--hue) / 0.08);
+    --measure: 68ch;
+
+    accent-color: var(--brand);
+    scrollbar-color: var(--border-strong) transparent;
+  }
+
+  /* A person's own choice of theme wins over the system's. */
+  :root[data-theme="dark"] { color-scheme: dark; }
+  :root[data-theme="light"] { color-scheme: light; }
+}
+
+@layer base {
+  html { scrollbar-gutter: stable; }
+  body {
+    min-block-size: 100dvh;
+    background: var(--surface);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: var(--step-0);
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  h1, h2, h3, h4 { text-wrap: balance; line-height: 1.15; letter-spacing: -0.012em; }
+  p, li, dd, figcaption { text-wrap: pretty; }
+  a {
+    color: var(--brand);
+    text-decoration-thickness: 0.08em;
+    text-underline-offset: 0.18em;
+  }
+  a:hover { color: var(--brand-hover); }
+  code, kbd, samp, pre { font-family: var(--font-mono); font-size: 0.92em; }
+  :focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; border-radius: 2px; }
+  ::selection { background: var(--brand); color: var(--on-brand); }
+
+  @media (prefers-reduced-motion: no-preference) {
+    html { scroll-behavior: smooth; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}

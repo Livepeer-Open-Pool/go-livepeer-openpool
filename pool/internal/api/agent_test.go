@@ -82,9 +82,13 @@ func TestTheAgentKeepsAMachineRunningWhatItIsAssigned(t *testing.T) {
 
 	// The pool says how machines join, and the member is shown the one command.
 	var pool struct {
-		Agent struct{ Image, Key string }
+		Agent         struct{ Image, Key string }
+		CommissionBps int `json:"commission_bps"`
+		WindowRounds  int `json:"window_rounds"`
 	}
 	e.ok(http.StatusOK, "GET", "/v1/public/pool", "", nil, &pool)
+	require.Equal(t, 1500, pool.CommissionBps)
+	require.Equal(t, 7, pool.WindowRounds)
 	require.Equal(t, agentImage, pool.Agent.Image)
 	require.Equal(t, compose.EncodePublicKey(e.composeKey), pool.Agent.Key)
 	require.Equal(t, "docker run -d --name openpool-agent-us-east --restart unless-stopped --gpus all"+

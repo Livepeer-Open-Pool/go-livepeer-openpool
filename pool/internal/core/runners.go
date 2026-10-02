@@ -245,3 +245,24 @@ func (s *Service) evictMemberRunners(ctx context.Context, memberID, reason strin
 		s.log.Warn("member's runners not evicted from the orchestrator", "member_id", memberID, "err", err)
 	}
 }
+
+// ConnectedRunners counts, per app, the runners the pool admitted that have
+// not left. It reads the pool's own record and does not ask the orchestrator,
+// so it is cheap enough to answer anyone.
+func (s *Service) ConnectedRunners(ctx context.Context) (map[string]int, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT app, COUNT(*) FROM runners WHERE gone_at = 0 GROUP BY app`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	counts := map[string]int{}
+	for rows.Next() {
+		var app string
+		var n int
+		if err := rows.Scan(&app, &n); err != nil {
+			return nil, err
+		}
+		counts[app] = n
+	}
+	return counts, rows.Err()
+}

@@ -25,6 +25,11 @@ type publicPoolBody struct {
 	SignIn             SignInInfo `json:"sign_in"`
 	// Agent is how machines join, when the pool runs them with the agent.
 	Agent *publicAgent `json:"agent,omitempty"`
+	// CommissionBps and WindowRounds are the payout terms a member is paid
+	// under: the pool's cut in basis points, and how many rounds a payout
+	// window lasts.
+	CommissionBps int `json:"commission_bps"`
+	WindowRounds  int `json:"window_rounds"`
 }
 
 func (s *Server) publicPool(w http.ResponseWriter, r *http.Request) {
@@ -38,8 +43,14 @@ func (s *Server) publicPool(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
+	settings, err := s.core.Settings(r.Context())
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, publicPoolBody{
 		Region: s.region(), TakingApplications: terms.Global != nil, AppsOffered: len(apps), SignIn: s.signIn, Agent: s.publicAgent(),
+		CommissionBps: settings.CommissionBps, WindowRounds: settings.WindowRounds,
 	})
 }
 
@@ -52,7 +63,9 @@ type publicApp struct {
 	Price        core.Price `json:"price"`
 	Description  string     `json:"description"`
 	EligibleGPUs []string   `json:"eligible_gpus"`
-	UpdatedAt    time.Time  `json:"updated_at"`
+	// Runners is how many machines are connected for the app right now.
+	Runners   int       `json:"runners"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (s *Server) publicApps(w http.ResponseWriter, r *http.Request) {
@@ -61,10 +74,15 @@ func (s *Server) publicApps(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
+	connected, err := s.core.ConnectedRunners(r.Context())
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
 	out := make([]publicApp, 0, len(apps))
 	for _, a := range apps {
 		out = append(out, publicApp{ID: a.ID, Name: a.Name, Mode: a.Mode, Price: a.Price, Description: a.Description,
-			EligibleGPUs: a.EligibleGPUs, UpdatedAt: a.UpdatedAt})
+			EligibleGPUs: a.EligibleGPUs, Runners: connected[a.Name], UpdatedAt: a.UpdatedAt})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"region": s.region(), "apps": out})
 }
