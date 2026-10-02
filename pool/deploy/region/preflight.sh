@@ -38,6 +38,17 @@ others() { docker ps -a --format '{{.Names}}' --filter "label=com.docker.compose
   docker ps -a --format '{{.Names}}' | while read -r c; do
   [ -n "$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$c")" ] || echo "$c"; done; }
 others="$(others | sort -u)"
+# The key file of this region's account among what a container has mounted, if any.
+holds_key() {
+  local src
+  is_address "${ORCH_ETH_ADDRESS:-}" && [ "$ORCH_ETH_ADDRESS" != "0x0000000000000000000000000000000000000000" ] || return 0
+  docker inspect -f '{{range .Mounts}}{{println .Source}}{{end}}' "$1" | while read -r src; do
+    [ -d "$src" ] || continue
+    # A monitoring container mounts the whole host; a node mounts its data.
+    case "$src" in /|/proc*|/sys*|/dev*|/run*|/var/run*|/etc*|/usr*|/lib*|/boot*|/var/lib/docker|/var/lib/docker/volumes) continue ;; esac
+    timeout 20 find "$src" -xdev -maxdepth 3 -type f -size -8k -exec grep -liF "\"${ORCH_ETH_ADDRESS#0x}\"" {} + 2>/dev/null </dev/null | head -1
+  done | head -1
+}
 labels_of() { docker inspect -f '{{range $k, $v := .Config.Labels}}{{println $k "=" $v}}{{end}}' "$1" | grep '^traefik\.' || true; }
 
 section "Settings (.env)"
@@ -52,6 +63,17 @@ case "${TUNNEL_IMAGE:-}" in
   *) bad "TUNNEL_IMAGE must be named by digest, as name@sha256:…" ;;
 esac
 case "${ORCH_ETH_ADDRESS:-}" in 0x0000000000000000000000000000000000000000|"") bad "ORCH_ETH_ADDRESS is still the placeholder" ;; esac
+is_address() { [[ "$1" =~ ^0x[0-9a-fA-F]{40}$ ]]; }
+is_address "${ORCH_ETH_ADDRESS:-}" || bad "ORCH_ETH_ADDRESS is not an address: 0x and 40 hex digits"
+if [ -n "${ORCH_ONCHAIN_ADDRESS:-}" ]; then
+  if is_address "$ORCH_ONCHAIN_ADDRESS"; then
+    ok "tickets are made out to $ORCH_ONCHAIN_ADDRESS; this node signs and redeems as $ORCH_ETH_ADDRESS"
+    [ "${ORCH_REWARD:-false}" = "false" ] || warn "ORCH_REWARD is on with a separate on-chain orchestrator: the node will not start unless its account is that orchestrator's reward caller"
+  else
+    bad "ORCH_ONCHAIN_ADDRESS is not an address: 0x and 40 hex digits, or empty"
+  fi
+fi
+case "${ORCH_REWARD:-false}" in true|false) ;; *) bad "ORCH_REWARD is true or false" ;; esac
 case "${ADMIN_EMAIL:-}${MAIL_FROM:-}" in *example.com*) bad "ADMIN_EMAIL or MAIL_FROM is still an example address" ;; esac
 case "${RESEND_BASE_URL:-}" in
   ""|http://?*|https://?*) ;;
@@ -68,9 +90,11 @@ for file in orch_eth_password payout_password; do
   if [ -f "$secrets/$file" ]; then ok "$file"; else bad "$file is missing (an empty file is right for an empty password)"; fi
 done
 if [ -d "$secrets/orch_keystore" ] && [ -n "$(ls -A "$secrets/orch_keystore" 2>/dev/null)" ]; then
-  ok "orch_keystore holds a key file"
-  if [ -n "${ORCH_ETH_ADDRESS:-}" ] && ! ls "$secrets/orch_keystore" | grep -qi "${ORCH_ETH_ADDRESS#0x}"; then
-    warn "no file in orch_keystore is named after ORCH_ETH_ADDRESS; check the key is that account's"
+  # A key file names its account in its "address" field.
+  if grep -rqiF "\"${ORCH_ETH_ADDRESS#0x}\"" "$secrets/orch_keystore" 2>/dev/null; then
+    ok "orch_keystore holds the key of $ORCH_ETH_ADDRESS"
+  else
+    bad "no key file in orch_keystore is for ORCH_ETH_ADDRESS ($ORCH_ETH_ADDRESS): the orchestrator will not find its account"
   fi
 else
   bad "orch_keystore is missing or empty: it holds the orchestrator account's key file"
@@ -126,13 +150,16 @@ for c in $others; do
     if [ -n "$host" ] && echo "$mine" | grep -qF "\`$host\`"; then bad "container $c already has a Traefik rule for $host: two routers for one name fight over it"; clash=1; fi
   done
   if echo "$mine" | grep -q 'HostSNI(`\*`)'; then warn "container $c has a TCP router for every name (HostSNI(\`*\`)) and may take the orchestrator's connections"; fi
-  if [ -n "${ORCH_ETH_ADDRESS:-}" ] && [ "${ORCH_ETH_ADDRESS}" != "0x0000000000000000000000000000000000000000" ] \
-    && docker inspect -f '{{json .Args}}{{json .Config.Env}}{{json .Config.Cmd}}' "$c" | grep -qiF "${ORCH_ETH_ADDRESS#0x}"; then
-    bad "container $c already runs with the account $ORCH_ETH_ADDRESS: two nodes on one account take each other's transactions. Stop it before starting this region"
-    clash=1
+  # Nodes that send from one account can take each other's transaction
+  # number when they send at the same moment; the one that loses tries again.
+  if is_address "${ORCH_ETH_ADDRESS:-}" && [ "${ORCH_ETH_ADDRESS}" != "0x0000000000000000000000000000000000000000" ] \
+    && docker inspect -f '{{json .Args}}{{json .Config.Env}}{{json .Config.Cmd}}' "$c" | grep -qiE "ethAcctAddr[^a-z0-9]{1,5}(0x)?${ORCH_ETH_ADDRESS#0x}"; then
+    warn "container $c also sends from $ORCH_ETH_ADDRESS. That works, with a transaction retried now and then; an account for each node avoids it"
+  elif key="$(holds_key "$c")" && [ -n "$key" ]; then
+    warn "container $c also has the key of $ORCH_ETH_ADDRESS ($key). Sharing it works, with a transaction retried now and then; an account for each node avoids it"
   fi
 done
-[ "$clash" = 0 ] && ok "no other container uses this region's router names, hostnames or orchestrator account"
+[ "$clash" = 0 ] && ok "no other container uses this region's router names or hostnames"
 
 section "The inner network ($subnet)"
 to_int() { local IFS=.; read -r a b c d <<<"$1"; echo $(( (a << 24) + (b << 16) + (c << 8) + d )); }

@@ -63,7 +63,12 @@ services:
       - -useLiveRunners
       - -network=${LIVEPEER_NETWORK:-arbitrum-one-mainnet}
       - -ethUrl=${ETH_RPC_URL}
+      # The account this node signs and sends transactions with.
       - -ethAcctAddr=${ORCH_ETH_ADDRESS}
+      # The orchestrator registered on-chain, which tickets are made out to,
+      # when that is another account than the node's own. Empty otherwise.
+      - -ethOrchAddr=${ORCH_ONCHAIN_ADDRESS:-}
+      - -reward=${ORCH_REWARD:-false}
       - -ethKeystorePath=/keystore
       - -ethPassword=/run/secrets/orch_eth_password
       - -dataDir=/data

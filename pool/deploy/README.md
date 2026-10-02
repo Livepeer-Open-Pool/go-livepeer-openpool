@@ -59,7 +59,7 @@ Each is a file in `region/secrets/`. All of them must exist before the first sta
 | `pool_secret` | shared by the orchestrator and the pool service | `openssl rand -hex 32` |
 | `session_secret` | signs sign-in sessions; **the same file in every region** | `openssl rand -hex 32`, once, then copied |
 | `orch_secret` | the orchestrator's own secret, which no pool member uses | `openssl rand -hex 32` |
-| `orch_keystore/` | a directory holding the orchestrator account's key file | your existing keystore |
+| `orch_keystore/` | a directory holding the key file of the account the node signs with (`ORCH_ETH_ADDRESS`) | your existing keystore |
 | `orch_eth_password` | that key's password | |
 | `payout_keystore` | the key file of this region's payout wallet | `geth account new`, or any tool that writes a keystore file |
 | `payout_password` | that key's password | |
@@ -109,9 +109,22 @@ Both use the same HTTPS entrypoint. If you would rather publish the orchestrator
 
 The orchestrator's CLI port, which controls the node, listens only on the compose file's inner network at a fixed address. It is not reachable from the Traefik network or from outside.
 
+### The orchestrator's account
+
+The node needs one key: the account it signs with and sends transactions from, `ORCH_ETH_ADDRESS`, whose key file is in `secrets/orch_keystore/`. There are two ways to set it up.
+
+| | `ORCH_ETH_ADDRESS` | `ORCH_ONCHAIN_ADDRESS` | `ORCH_REWARD` |
+| --- | --- | --- | --- |
+| The node's account is the registered orchestrator | the orchestrator | empty | `true`, on one node |
+| The registered orchestrator is another account, and this node only redeems tickets for it | an account of the node's own, holding only ETH for gas | the orchestrator | `false` |
+
+In the second, tickets are made out to the orchestrator and their value is credited to it on-chain, while the key that holds its stake stays off this host. An account for each node is the cleaner arrangement. Nodes that share one still work: when two send at the same moment one of the transactions is refused and that node sends it again. `./preflight.sh` warns when another container on the host has this node's key.
+
+What the pool counts as a window's pot is what this node redeemed, whichever account it was credited to.
+
 ### After the first start
 
-1. **Activate the orchestrator on-chain**, if this account is not one already. `livepeer_cli` may send transactions only while `ORCH_CLI_TX_ROUTES=true` is in `.env`: set it, `docker compose up -d`, run `docker compose exec orchestrator livepeer_cli -host 172.31.250.10 -http 7935`, and set it back to `false` afterwards. Set the orchestrator's fee share so that it keeps 100% of fees: the payout rule assumes the whole of what the node redeems is the pot.
+1. **Activate the orchestrator on-chain**, if the node's account is the orchestrator and is not active yet. `livepeer_cli` may send transactions only while `ORCH_CLI_TX_ROUTES=true` is in `.env`: set it, `docker compose up -d`, run `docker compose exec orchestrator livepeer_cli -host 172.31.250.10 -http 7935`, and set it back to `false` afterwards. Set `ORCH_REWARD=true` if this node is to call reward. Skip this step when the orchestrator is another account (see below). Either way the orchestrator must keep 100% of fees (a fee share of 0% to delegators): the payout rule assumes the whole of what the node redeems is the pot.
 2. **Fund the payout wallet** with ETH on Arbitrum. The admin site shows its address and balance.
 3. **Sign in to the admin site** and set the region up: GPU models, apps, the terms. A region takes applications once the pool's terms are published in it.
 
