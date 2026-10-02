@@ -33,7 +33,8 @@ commit="$(git rev-parse --short=8 HEAD)"
 clean="$(mktemp -d)"
 trap 'rm -rf "$clean"' EXIT
 # Images in the repository are stored with Git LFS and no build needs them.
-GIT_LFS_SKIP_SMUDGE=1 git clone --quiet --local "$root" "$clean/src"
+# Copied, not linked: the temporary directory may be on another filesystem.
+GIT_LFS_SKIP_SMUDGE=1 git clone --quiet --local --no-hardlinks "$root" "$clean/src"
 cd "$clean/src"
 
 REGISTRY="${REGISTRY:-tztcloud}"
