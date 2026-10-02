@@ -1,6 +1,6 @@
 # Open Pool service
 
-The pool service for one region of Open Pool. It runs beside one go-livepeer orchestrator node and decides who may join, what each member's machine runs and whether it works, and (in later steps) what it earned, and paying it out. The design and the build order are in [DESIGN.md](DESIGN.md); the orchestrator's side is in [`doc/live-runner-pool.md`](../doc/live-runner-pool.md).
+The pool service for one region of Open Pool. It runs beside one go-livepeer orchestrator node and decides who may join, what each member's machine runs and whether it works, records what it earned, and pays it out. The design and the build order are in [DESIGN.md](DESIGN.md); the orchestrator's side is in [`doc/live-runner-pool.md`](../doc/live-runner-pool.md).
 
 It is its own Go module and shares no code with go-livepeer.
 
@@ -40,8 +40,19 @@ Configuration comes from `OPENPOOL_*` environment variables. Any of them can be 
 | `OPENPOOL_RESEND_BASE_URL` | | Resend's own | Base URL of a Resend-compatible API |
 | `OPENPOOL_MAIL_FROM` | | | From address of the emails |
 | `OPENPOOL_ALLOWED_ORIGINS` | | the three Open Pool sites | Sites whose pages may call this API, comma-separated |
+| `OPENPOOL_KAFKA_BROKERS` | | | Kafka brokers the orchestrator's events are read from, comma-separated |
+| `OPENPOOL_KAFKA_TOPIC` | | | The orchestrator's `-kafkaOrchestratorTopic`. One topic per region |
+| `OPENPOOL_KAFKA_GROUP` | | `openpool-<region id>` | Consumer group, which is how the service remembers where it stopped reading |
+| `OPENPOOL_KAFKA_USER`, `OPENPOOL_KAFKA_PASSWORD` | | | Sign in to Kafka with SASL over TLS |
+| `OPENPOOL_ETH_RPC_URL` | | | Ethereum node the payout wallet sends through. Set together with the keystore |
+| `OPENPOOL_PAYOUT_KEYSTORE` | | | Keystore file of this region's payout wallet |
+| `OPENPOOL_PAYOUT_PASSWORD` | | | The keystore's password; give it as `OPENPOOL_PAYOUT_PASSWORD_FILE` |
+| `OPENPOOL_PAYOUT_INTERVAL` | | `30s` | How often windows are checked and payments moved forward |
+| `OPENPOOL_SETTLE_DELAY` | | `10m` | How long after a window's last round the window is closed, so events in flight are counted |
 
 Without `OPENPOOL_RESEND_API_KEY` and `OPENPOOL_MAIL_FROM`, email is not sent: notices and the operator's sign-in code are written to the service's log instead. That is for local development only.
+
+Without Kafka, earnings are recorded only from events uploaded to `POST /v1/orchestrator/events`. Without a payout wallet, payout batches are built and can be approved, and nothing is paid.
 
 The orchestrator is started in pool mode, pointing at this service:
 

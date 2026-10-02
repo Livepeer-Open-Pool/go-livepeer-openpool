@@ -49,6 +49,22 @@ type Config struct {
 	// ReconcileInterval is how often the service looks over the registered
 	// runners: which are due a test, which to drain, which run an old version.
 	ReconcileInterval time.Duration
+
+	// Kafka is where the orchestrator's events are read from.
+	KafkaBrokers  []string
+	KafkaTopic    string
+	KafkaGroup    string
+	KafkaUser     string
+	KafkaPassword string
+
+	// The payout wallet: an Ethereum node, a keystore file and its password.
+	EthRPCURL      string
+	PayoutKeystore string
+	PayoutPassword string
+	// PayoutInterval is how often windows are checked and payments moved forward.
+	PayoutInterval time.Duration
+	// SettleDelay is how long after a window's last round the window is closed.
+	SettleDelay time.Duration
 }
 
 // value returns the environment variable name, or the content of the file
@@ -112,6 +128,17 @@ func FromEnv() (*Config, error) {
 		AllowedOrigins:     list(get("ALLOWED_ORIGINS", "https://open-pool.com,https://app.open-pool.com,https://admin.open-pool.com", false)),
 	}
 	cfg.OrchestratorInsecureTLS = get("ORCHESTRATOR_INSECURE_TLS", "false", false) == "true"
+	cfg.KafkaBrokers = list(get("KAFKA_BROKERS", "", false))
+	cfg.KafkaTopic = get("KAFKA_TOPIC", "", false)
+	cfg.KafkaGroup = get("KAFKA_GROUP", "openpool-"+cfg.RegionID, false)
+	cfg.KafkaUser = get("KAFKA_USER", "", false)
+	cfg.KafkaPassword = get("KAFKA_PASSWORD", "", false)
+	cfg.EthRPCURL = get("ETH_RPC_URL", "", false)
+	cfg.PayoutKeystore = get("PAYOUT_KEYSTORE", "", false)
+	cfg.PayoutPassword = get("PAYOUT_PASSWORD", "", false)
+	if (cfg.EthRPCURL == "") != (cfg.PayoutKeystore == "") {
+		problems = append(problems, "OPENPOOL_ETH_RPC_URL and OPENPOOL_PAYOUT_KEYSTORE go together: set both to pay out, or neither")
+	}
 	if cfg.RegionName == "" {
 		cfg.RegionName = cfg.RegionID
 	}
@@ -134,11 +161,22 @@ func FromEnv() (*Config, error) {
 		problems = append(problems, "OPENPOOL_RECONCILE_INTERVAL must be a duration such as 15s")
 	}
 	cfg.ReconcileInterval = interval
+	if cfg.PayoutInterval, err = time.ParseDuration(get("PAYOUT_INTERVAL", "30s", false)); err != nil || cfg.PayoutInterval <= 0 {
+		problems = append(problems, "OPENPOOL_PAYOUT_INTERVAL must be a duration such as 30s")
+	}
+	if cfg.SettleDelay, err = time.ParseDuration(get("SETTLE_DELAY", "10m", false)); err != nil || cfg.SettleDelay <= 0 {
+		problems = append(problems, "OPENPOOL_SETTLE_DELAY must be a duration such as 10m")
+	}
 
 	if len(problems) > 0 {
 		return nil, fmt.Errorf("configuration:\n  %s", strings.Join(problems, "\n  "))
 	}
 	return cfg, nil
+}
+
+// PayoutsConfigured says whether the service has a wallet to pay from.
+func (c *Config) PayoutsConfigured() bool {
+	return c.EthRPCURL != "" && c.PayoutKeystore != ""
 }
 
 // MailConfigured says whether email can be sent.

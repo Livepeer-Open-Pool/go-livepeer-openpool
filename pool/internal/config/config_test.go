@@ -76,3 +76,30 @@ func TestSecretsCanComeFromFiles(t *testing.T) {
 	_, err = FromEnv()
 	require.ErrorContains(t, err, "OPENPOOL_POOL_SECRET_FILE")
 }
+
+func TestPayoutAndKafkaSettings(t *testing.T) {
+	setRequired(t)
+	cfg, err := FromEnv()
+	require.NoError(t, err)
+	require.False(t, cfg.PayoutsConfigured())
+	require.Empty(t, cfg.KafkaBrokers)
+	require.Equal(t, "openpool-us-east", cfg.KafkaGroup)
+	require.Equal(t, 10*time.Minute, cfg.SettleDelay)
+	require.Equal(t, 30*time.Second, cfg.PayoutInterval)
+	require.Equal(t, 15*time.Second, cfg.ReconcileInterval)
+
+	// A node without a keystore, or the reverse, is a mistake worth stopping for.
+	t.Setenv("OPENPOOL_ETH_RPC_URL", "https://arb1.arbitrum.io/rpc")
+	_, err = FromEnv()
+	require.ErrorContains(t, err, "OPENPOOL_ETH_RPC_URL and OPENPOOL_PAYOUT_KEYSTORE go together")
+
+	t.Setenv("OPENPOOL_PAYOUT_KEYSTORE", "/etc/openpool/payout.json")
+	t.Setenv("OPENPOOL_PAYOUT_PASSWORD", "secret")
+	t.Setenv("OPENPOOL_KAFKA_BROKERS", "kafka-1:9092, kafka-2:9092")
+	t.Setenv("OPENPOOL_KAFKA_TOPIC", "orchestrator-events-us-east")
+	cfg, err = FromEnv()
+	require.NoError(t, err)
+	require.True(t, cfg.PayoutsConfigured())
+	require.Equal(t, []string{"kafka-1:9092", "kafka-2:9092"}, cfg.KafkaBrokers)
+	require.Equal(t, "secret", cfg.PayoutPassword)
+}

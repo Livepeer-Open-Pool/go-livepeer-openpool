@@ -18,8 +18,10 @@ import (
 	"github.com/Livepeer-Open-Pool/pool/internal/auth"
 	"github.com/Livepeer-Open-Pool/pool/internal/config"
 	"github.com/Livepeer-Open-Pool/pool/internal/core"
+	"github.com/Livepeer-Open-Pool/pool/internal/ledger"
 	"github.com/Livepeer-Open-Pool/pool/internal/mail"
 	"github.com/Livepeer-Open-Pool/pool/internal/orchestrator"
+	"github.com/Livepeer-Open-Pool/pool/internal/payouts"
 	"github.com/Livepeer-Open-Pool/pool/internal/store"
 )
 
@@ -79,6 +81,21 @@ func run(log *slog.Logger) error {
 		AdminURL:        cfg.AdminURL,
 		RecoverSigner:   auth.RecoverSigner,
 	}, log)
+	books := ledger.New(db, nil, log)
+	var wallet *payouts.Wallet
+	if cfg.PayoutsConfigured() {
+		wallet, err = payouts.OpenWallet(context.Background(), cfg.EthRPCURL, cfg.PayoutKeystore, cfg.PayoutPassword, int64(cfg.ChainID))
+		if err != nil {
+			return err
+		}
+		log.Info("payout wallet ready", "address", wallet.Address().Hex(), "chain_id", cfg.ChainID)
+	} else {
+		log.Warn("no payout wallet configured: batches are built and can be approved, and nothing is paid. Set OPENPOOL_ETH_RPC_URL and OPENPOOL_PAYOUT_KEYSTORE")
+	}
+	payer := payouts.New(db, books, service.Settings, orch, wallet, sender, payouts.Config{
+		RegionName: cfg.RegionName, AdminURL: cfg.AdminURL, SettleDelay: cfg.SettleDelay,
+	}, log)
+
 	prober, err := orchestrator.NewProber(cfg.OrchestratorURL, cfg.PoolSecret, cfg.OrchestratorInsecureTLS)
 	if err != nil {
 		return err
@@ -86,6 +103,8 @@ func run(log *slog.Logger) error {
 	service.SetProber(prober)
 	server := api.New(api.Options{
 		Core:           service,
+		Ledger:         books,
+		Payouts:        payer,
 		Tokens:         tokens,
 		Wallet:         auth.NewWallet(db, tokens, cfg.SignInDomains, cfg.ChainID, nil),
 		Admin:          auth.NewAdmin(db, tokens, sender, cfg.AdminEmail, nil),
@@ -121,6 +140,34 @@ func run(log *slog.Logger) error {
 			case <-ticker.C:
 				if err := service.Reconcile(ctx); err != nil {
 					log.Warn("runners not reconciled", "err", err)
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	kafka := ledger.KafkaConfig{Brokers: cfg.KafkaBrokers, Topic: cfg.KafkaTopic, Group: cfg.KafkaGroup, User: cfg.KafkaUser, Password: cfg.KafkaPassword}
+	if kafka.Configured() {
+		go func() {
+			if err := books.Consume(ctx, kafka); err != nil {
+				log.Error("orchestrator events are no longer read", "err", err)
+			}
+		}()
+	} else {
+		log.Warn("no Kafka topic configured: earnings are recorded only from events uploaded to /v1/orchestrator/events. Set OPENPOOL_KAFKA_BROKERS and OPENPOOL_KAFKA_TOPIC")
+	}
+	go func() {
+		ticker := time.NewTicker(cfg.PayoutInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := payer.Tick(ctx); err != nil {
+					log.Warn("payouts not moved forward", "err", err)
+				}
+				if err := books.Prune(ctx); err != nil {
+					log.Warn("event ids not pruned", "err", err)
 				}
 			case <-ctx.Done():
 				return

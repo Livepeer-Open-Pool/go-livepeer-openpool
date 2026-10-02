@@ -2,11 +2,14 @@ package api_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +18,8 @@ import (
 	"github.com/Livepeer-Open-Pool/pool/internal/api"
 	"github.com/Livepeer-Open-Pool/pool/internal/auth"
 	"github.com/Livepeer-Open-Pool/pool/internal/core"
+	"github.com/Livepeer-Open-Pool/pool/internal/ledger"
+	"github.com/Livepeer-Open-Pool/pool/internal/payouts"
 	"github.com/Livepeer-Open-Pool/pool/internal/testkit"
 )
 
@@ -27,16 +32,36 @@ const (
 
 // env is a pool service served over HTTP, as the sites and the orchestrator reach it.
 type env struct {
-	t     *testing.T
-	url   string
-	orch  *testkit.Orchestrator
-	mail  *testkit.Mailbox
-	clock *testkit.Clock
+	t       *testing.T
+	url     string
+	orch    *testkit.Orchestrator
+	mail    *testkit.Mailbox
+	clock   *testkit.Clock
+	payouts *payouts.Service
+	round   *roundCounter
+}
+
+// roundCounter is the Livepeer round the tests say it is.
+type roundCounter struct {
+	mu    sync.Mutex
+	round int64
+}
+
+func (r *roundCounter) CurrentRound(ctx context.Context) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.round, nil
+}
+
+func (r *roundCounter) set(round int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.round = round
 }
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	e := &env{t: t, orch: &testkit.Orchestrator{}, mail: &testkit.Mailbox{}, clock: testkit.NewClock()}
+	e := &env{t: t, orch: &testkit.Orchestrator{}, mail: &testkit.Mailbox{}, clock: testkit.NewClock(), round: &roundCounter{round: 4100}}
 	db := testkit.OpenDB(t)
 	tokens, err := auth.NewTokens(sessionSecret, 12*time.Hour, e.clock.Now)
 	require.NoError(t, err)
@@ -48,8 +73,15 @@ func newEnv(t *testing.T) *env {
 		RecoverSigner:   auth.RecoverSigner,
 		Now:             e.clock.Now,
 	}, nil)
+	books := ledger.New(db, e.clock.Now, nil)
+	e.payouts = payouts.New(db, books, service.Settings, e.round, nil, e.mail, payouts.Config{
+		RegionName: "US East", AdminURL: "https://admin.open-pool.com", SettleDelay: 10 * time.Minute, Now: e.clock.Now,
+	}, nil)
 	server := api.New(api.Options{
 		Core:           service,
+		Ledger:         books,
+		Payouts:        e.payouts,
+		Now:            e.clock.Now,
 		Tokens:         tokens,
 		Wallet:         auth.NewWallet(db, tokens, []string{"app.open-pool.com"}, 42161, e.clock.Now),
 		Admin:          auth.NewAdmin(db, tokens, e.mail, adminEmail, e.clock.Now),
@@ -423,4 +455,181 @@ func TestOperatorSeesTestsAndControlsHolds(t *testing.T) {
 	e.ok(http.StatusOK, "GET", "/v1/admin/tests", admin, nil, &tests)
 	require.Empty(t, tests.Tests)
 	e.refused(http.StatusUnauthorized, "GET", "/v1/admin/tests", "", nil)
+}
+
+// joined has the operator set the pool up and one member join it with a
+// machine assigned the vLLM app; it returns the sessions and the member.
+func (e *env) joined() (admin, memberToken string, member core.Member, wallet *testkit.Wallet) {
+	e.t.Helper()
+	admin = e.signInAdmin()
+	gpu, vllm, _ := e.catalog(admin)
+	wallet = testkit.NewWallet(e.t)
+	memberToken = e.signInWallet(wallet)
+	draft := map[string]any{
+		"display_name": "Alice",
+		"machines":     []map[string]any{{"label": "box-1", "gpus": []map[string]any{{"gpu_id": gpu.ID, "count": 1}}}},
+	}
+	var toSign struct {
+		Message string `json:"message"`
+	}
+	e.ok(http.StatusOK, "POST", "/v1/applications/message", memberToken, draft, &toSign)
+	draft["signature"] = wallet.Sign(e.t, toSign.Message)
+	var application core.Application
+	e.ok(http.StatusCreated, "POST", "/v1/applications", memberToken, draft, &application)
+	e.ok(http.StatusOK, "POST", "/v1/admin/applications/"+application.ID+"/approve", admin, map[string]any{
+		"machines": []map[string]any{{"machine": 0, "assignments": []map[string]any{{"app_id": vllm.ID}}}},
+	}, &member)
+	return admin, memberToken, member, wallet
+}
+
+// events uploads orchestrator events the way a replay from the log does.
+func (e *env) events(secret string, events ...map[string]any) (int, map[string]int) {
+	e.t.Helper()
+	for i, event := range events {
+		if _, ok := event["event_id"]; !ok {
+			event["event_id"] = fmt.Sprintf("evt-%d-%d", e.clock.Now().UnixNano(), i)
+		}
+		if _, ok := event["ts_ms"]; !ok {
+			event["ts_ms"] = e.clock.Now().UnixMilli()
+		}
+	}
+	var raw json.RawMessage
+	status := e.call("POST", "/v1/orchestrator/events", secret, events, &raw)
+	result := map[string]int{}
+	if status == http.StatusOK {
+		require.NoError(e.t, json.Unmarshal(raw, &result))
+	}
+	return status, result
+}
+
+func TestEarningsBecomeAPayoutBatchTheOperatorApproves(t *testing.T) {
+	e := newEnv(t)
+	admin, token, member, wallet := e.joined()
+	require.NoError(t, e.payouts.Tick(context.Background())) // the first window opens
+
+	// The orchestrator's events arrive: a session, its fees, a redeemed ticket, refused requests.
+	app := "vllm/qwen2.5-7b-instruct"
+	session := func(eventType string, more map[string]any) map[string]any {
+		event := map[string]any{"event_type": eventType, "round": 4100, "runner_id": "runner_a", "member_id": member.ID, "app": app,
+			"session_id": "s1", "sender": "0x00000000000000000000000000000000000000c1"}
+		for k, v := range more {
+			event[k] = v
+		}
+		return event
+	}
+	status, result := e.events(poolSecret,
+		session(ledger.EventSessionReserved, map[string]any{"paid": true}),
+		session(ledger.EventFeeDebited, map[string]any{"fee_wei": "600"}),
+		session(ledger.EventFeeDebited, map[string]any{"fee_wei": "400"}),
+		session(ledger.EventSessionReleased, map[string]any{"fee_wei_total": "1000", "reason": "stopped"}),
+		map[string]any{"event_type": ledger.EventTicketRedeemed, "round": 4101, "face_value_wei": "2000000000000000000"},
+		map[string]any{"event_type": ledger.EventRequestsRefused, "round": 4101, "app": app, "count": 7},
+		map[string]any{"event_type": "live_runner_registered", "runner_id": "runner_a"},
+		map[string]any{"event_type": ledger.EventFeeDebited, "round": 4100},
+	)
+	require.Equal(t, http.StatusOK, status)
+	require.Equal(t, map[string]int{"applied": 7, "malformed": 1}, result)
+
+	// Only the holder of the pool secret may write the books.
+	status, _ = e.events("", session(ledger.EventFeeDebited, map[string]any{"fee_wei": "9"}))
+	require.Equal(t, http.StatusUnauthorized, status)
+	status, _ = e.events(token, session(ledger.EventFeeDebited, map[string]any{"fee_wei": "9"}))
+	require.Equal(t, http.StatusUnauthorized, status)
+
+	// The member sees what she earned, and the public sees the leaderboard.
+	var earnings struct {
+		Earnings []ledger.Earning `json:"earnings"`
+		Window   struct {
+			FirstRound int64 `json:"first_round"`
+			LastRound  int64 `json:"last_round"`
+		} `json:"window"`
+	}
+	e.ok(http.StatusOK, "GET", "/v1/me/earnings", token, nil, &earnings)
+	require.Equal(t, []ledger.Earning{{Round: 4100, App: app, FeeWei: "1000", Sessions: 1}}, earnings.Earnings)
+	require.Equal(t, int64(4106), earnings.Window.LastRound)
+	var board struct {
+		Window  string                    `json:"window"`
+		Entries []ledger.LeaderboardEntry `json:"entries"`
+	}
+	e.ok(http.StatusOK, "GET", "/v1/public/leaderboard?window=current", "", nil, &board)
+	require.Equal(t, "current", board.Window)
+	require.Equal(t, []ledger.LeaderboardEntry{{Address: wallet.Address, DisplayName: "Alice", FeesWei: "1000", Sessions: 1}}, board.Entries)
+
+	// The operator sees demand per app.
+	e.orch.Register(core.OrchRunner{RunnerID: "runner_a", MemberID: member.ID, App: app, State: core.StateActive, Ready: true, Capacity: 4, CapacityUsed: 3})
+	var demand struct {
+		Demand []map[string]any `json:"demand"`
+	}
+	e.ok(http.StatusOK, "GET", "/v1/admin/demand", admin, nil, &demand)
+	require.Len(t, demand.Demand, 2)
+	require.Equal(t, map[string]any{"app": "flux/schnell", "runners_online": float64(0), "slots_busy": float64(0), "slots_total": float64(0),
+		"sessions_24h": float64(0), "fees_wei_24h": "0", "refused_24h": float64(0)}, demand.Demand[0])
+	require.Equal(t, map[string]any{"app": app, "runners_online": float64(1), "slots_busy": float64(3), "slots_total": float64(4),
+		"sessions_24h": float64(1), "fees_wei_24h": "1000", "refused_24h": float64(7)}, demand.Demand[1])
+
+	// The window closes; the operator is emailed, reviews the batch and approves it.
+	e.round.set(4107)
+	require.NoError(t, e.payouts.Tick(context.Background()))
+	e.clock.Advance(11 * time.Minute)
+	require.NoError(t, e.payouts.Tick(context.Background()))
+	notices := e.mail.AllNotices()
+	require.Equal(t, "Open Pool US East: payouts for rounds 4100 to 4106 need approval", notices[len(notices)-1].Subject)
+
+	var batches struct {
+		Batches []payouts.Batch `json:"batches"`
+	}
+	e.ok(http.StatusOK, "GET", "/v1/admin/batches", admin, nil, &batches)
+	require.Len(t, batches.Batches, 2)
+	require.Equal(t, payouts.StatusOpen, batches.Batches[0].Status)
+	require.Equal(t, payouts.StatusReady, batches.Batches[1].Status)
+	var batch payouts.Batch
+	e.ok(http.StatusOK, "GET", "/v1/admin/batches/batch_4100", admin, nil, &batch)
+	require.Equal(t, "1700000000000000000", batch.PayableWei, "2 ETH less the 15% commission")
+	require.Len(t, batch.Items, 1)
+	require.Equal(t, wallet.Address, batch.Items[0].Address)
+	require.Equal(t, "1700000000000000000", batch.Items[0].AmountWei)
+
+	e.ok(http.StatusOK, "PUT", "/v1/admin/batches/batch_4100/items/"+member.ID, admin, map[string]any{"include": false}, &batch)
+	require.False(t, batch.Items[0].Include)
+	e.ok(http.StatusOK, "PUT", "/v1/admin/batches/batch_4100/items/"+member.ID, admin, map[string]any{"include": true}, &batch)
+	e.refused(http.StatusBadRequest, "PUT", "/v1/admin/batches/batch_4100/items/"+member.ID, admin, map[string]any{})
+	e.ok(http.StatusOK, "POST", "/v1/admin/batches/batch_4100/approve", admin, nil, &batch)
+	require.Equal(t, payouts.StatusApproved, batch.Status)
+	e.refused(http.StatusConflict, "POST", "/v1/admin/batches/batch_4100/approve", admin, nil)
+	e.refused(http.StatusNotFound, "GET", "/v1/admin/batches/batch_9", admin, nil)
+	e.refused(http.StatusUnauthorized, "GET", "/v1/admin/batches", token, nil)
+
+	// The member sees the payment coming; with no wallet configured it is owed, not sent.
+	var mine struct {
+		Payouts []payouts.MemberPayout `json:"payouts"`
+	}
+	e.ok(http.StatusOK, "GET", "/v1/me/payouts", token, nil, &mine)
+	require.Len(t, mine.Payouts, 1)
+	require.Equal(t, "1700000000000000000", mine.Payouts[0].AmountWei)
+	require.Equal(t, payouts.StatusApproved, mine.Payouts[0].BatchStatus)
+	var walletStatus payouts.WalletStatus
+	e.ok(http.StatusOK, "GET", "/v1/admin/wallet", admin, nil, &walletStatus)
+	require.False(t, walletStatus.Configured)
+	require.Equal(t, "1700000000000000000", walletStatus.OwedWei)
+}
+
+func TestEventsCanBeUploadedOnePerLine(t *testing.T) {
+	e := newEnv(t)
+	body := `{"event_type":"orchestrator_ticket_redeemed","event_id":"a","round":4100,"face_value_wei":"5"}
+{"event_type":"orchestrator_ticket_redeemed","event_id":"b","round":4100,"face_value_wei":"7"}
+
+{"event_type":"orchestrator_ticket_redeemed","event_id":"a","round":4100,"face_value_wei":"5"}
+not json
+`
+	req, err := http.NewRequest("POST", e.url+"/v1/orchestrator/events", strings.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+poolSecret)
+	res, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer res.Body.Close()
+	var result map[string]int
+	require.NoError(t, json.NewDecoder(res.Body).Decode(&result))
+	require.Equal(t, http.StatusOK, res.StatusCode)
+	// The repeated event is accepted and counted once in the books.
+	require.Equal(t, map[string]int{"applied": 3, "malformed": 1}, result)
 }

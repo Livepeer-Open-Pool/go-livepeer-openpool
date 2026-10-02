@@ -173,4 +173,103 @@ CREATE TABLE test_results (
 CREATE INDEX test_results_runner ON test_results (runner_id, id);
 CREATE INDEX test_results_machine ON test_results (machine_id, id);
 `,
+	// 3: what runners earned, what the node redeemed, and paying it out.
+	// Amounts of wei are decimal strings: they outgrow a 64-bit integer.
+	`
+-- Events already taken in, so one delivered twice is counted once.
+CREATE TABLE events (
+	event_id TEXT PRIMARY KEY,
+	at       INTEGER NOT NULL
+);
+
+CREATE TABLE sessions (
+	session_id         TEXT NOT NULL,
+	runner_id          TEXT NOT NULL,
+	member_id          TEXT NOT NULL,
+	app                TEXT NOT NULL,
+	sender             TEXT NOT NULL DEFAULT '',
+	paid               INTEGER NOT NULL DEFAULT 0,
+	started_at         INTEGER NOT NULL DEFAULT 0,
+	ended_at           INTEGER NOT NULL DEFAULT 0,
+	reason             TEXT NOT NULL DEFAULT '',
+	duration_ms        INTEGER NOT NULL DEFAULT 0,
+	-- The sum of the session's fee events, the total its released event
+	-- reported, and how much of either has been credited to earnings.
+	fee_events_wei     TEXT NOT NULL DEFAULT '0',
+	released_total_wei TEXT NOT NULL DEFAULT '0',
+	credited_wei       TEXT NOT NULL DEFAULT '0',
+	PRIMARY KEY (session_id, runner_id)
+);
+CREATE INDEX sessions_member ON sessions (member_id, started_at);
+
+CREATE TABLE earnings (
+	member_id TEXT NOT NULL,
+	app       TEXT NOT NULL,
+	round     INTEGER NOT NULL,
+	fee_wei   TEXT NOT NULL DEFAULT '0',
+	sessions  INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (member_id, app, round)
+);
+CREATE INDEX earnings_round ON earnings (round);
+
+-- Per app and hour, for the operator's view of demand.
+CREATE TABLE app_hours (
+	app      TEXT NOT NULL,
+	hour     INTEGER NOT NULL,
+	fee_wei  TEXT NOT NULL DEFAULT '0',
+	sessions INTEGER NOT NULL DEFAULT 0,
+	refused  INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (app, hour)
+);
+
+CREATE TABLE redemptions (
+	event_id       TEXT PRIMARY KEY,
+	round          INTEGER NOT NULL,
+	face_value_wei TEXT NOT NULL,
+	sender         TEXT NOT NULL DEFAULT '',
+	tx_hash        TEXT NOT NULL DEFAULT '',
+	at             INTEGER NOT NULL
+);
+CREATE INDEX redemptions_round ON redemptions (round);
+
+CREATE TABLE batches (
+	id             TEXT PRIMARY KEY,
+	first_round    INTEGER NOT NULL UNIQUE,
+	last_round     INTEGER NOT NULL,
+	status         TEXT NOT NULL,
+	pot_wei        TEXT NOT NULL DEFAULT '0',
+	commission_bps INTEGER NOT NULL DEFAULT 0,
+	payable_wei    TEXT NOT NULL DEFAULT '0',
+	total_fees_wei TEXT NOT NULL DEFAULT '0',
+	-- Fees of runners that belong to no member, left out of the split.
+	other_fees_wei TEXT NOT NULL DEFAULT '0',
+	note           TEXT NOT NULL DEFAULT '',
+	closable_since INTEGER NOT NULL DEFAULT 0,
+	created_at     INTEGER NOT NULL,
+	closed_at      INTEGER NOT NULL DEFAULT 0,
+	approved_at    INTEGER NOT NULL DEFAULT 0,
+	approved_by    TEXT NOT NULL DEFAULT '',
+	sent_at        INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE batch_items (
+	batch_id     TEXT NOT NULL REFERENCES batches (id),
+	member_id    TEXT NOT NULL,
+	address      TEXT NOT NULL,
+	display_name TEXT NOT NULL,
+	fees_wei     TEXT NOT NULL,
+	amount_wei   TEXT NOT NULL,
+	include      INTEGER NOT NULL DEFAULT 1,
+	banned       INTEGER NOT NULL DEFAULT 0,
+	status       TEXT NOT NULL,
+	-- The one transaction signed for this payment. It is stored before it is
+	-- broadcast, so a restart resends that transaction and never signs another.
+	nonce        INTEGER NOT NULL DEFAULT -1,
+	tx_hash      TEXT NOT NULL DEFAULT '',
+	raw_tx       TEXT NOT NULL DEFAULT '',
+	error        TEXT NOT NULL DEFAULT '',
+	updated_at   INTEGER NOT NULL,
+	PRIMARY KEY (batch_id, member_id)
+);
+`,
 }

@@ -1,6 +1,6 @@
 # Open Pool: design of the pool service
 
-**Status:** steps 1 to 3 of the [build order](#build-order) are built, 2026-10-01; the rest is design.\
+**Status:** steps 1 to 4 of the [build order](#build-order) are built, 2026-10-01; the agent, the sites and the end-to-end harness are design.\
 **Companion:** `doc/live-runner-pool.md` describes the orchestrator side, which is built (changes 0 to 8 on `feat/open-pool-enhancements`).\
 **Reader:** Mike, who made these decisions in conversation and is checking them before the build; later, whoever builds or operates the pool.
 
@@ -121,8 +121,8 @@ pool/
     mail/               the admin emails and the sign-in code
     api/                HTTP handlers
     testkit/            what the tests share
-    ledger/             (step 4) Kafka consumer, earnings per member per round, pot per round
-    payouts/            (step 4) windows, batches, approval, sending
+    ledger/             Kafka consumer, earnings per member per round, pot per round, demand
+    payouts/            windows, batches, approval, the payout wallet, sending
     compose/            (step 5) compose generation and signing
   web/                  (step 6) the three sites
 ```
@@ -298,11 +298,13 @@ A runner is tested when it registers and then on the test interval, while it rep
 
 ### Earnings, windows and payouts
 
-**Earnings.** The service reads the orchestrator's events. Each fee event adds to `earnings` for its member, app and round. Events are recorded by id, so a redelivered event changes nothing. A session's released event carries the session's totals; if they exceed the sum of its fee events, the difference is added, so lost fee events do not lose a member money.
+**Earnings.** The service reads the orchestrator's events from Kafka, one topic per region. Each fee event adds to `earnings` for its member, app and round. Events are recorded by id, so a redelivered event changes nothing. A session's released event carries the session's totals; a session is worth the larger of that total and the sum of its fee events, so lost fee events do not lose a member money and nothing is counted twice, whatever order events arrive in. The pool's own tests are unpaid and are not counted as work.
+
+Events can also be uploaded to `POST /v1/orchestrator/events` with the pool secret, as a JSON array or one event per line. The orchestrator writes any event it had to drop to its log whole; this is how such events are put back. Uploading an event twice changes nothing.
 
 **Pot.** Each ticket the node redeems arrives as an event with its value and round. The pot for a window is the sum over its rounds.
 
-**Windows.** Windows are consecutive blocks of 7 rounds, counted from the first round the pool saw. The service reads the current round from the orchestrator. When it passes the end of a window and the event stream has caught up, the window closes and its batch is built.
+**Windows.** Windows are consecutive blocks of 7 rounds, counted from the first round the pool saw. The service reads the current round from the orchestrator. When it passes the end of a window, the service waits a settle delay (ten minutes by default) for events still in flight, then closes the window and builds its batch. A closed window is settled: an event that arrives late for one of its rounds is booked in the window still open, where it will be paid. A service that was down through several windows closes them one after another when it comes back.
 
 **The batch.**
 
@@ -326,9 +328,11 @@ One property of this rule worth knowing: winning tickets are a lottery, so a win
 | approved | by the operator, or at once when approval is automatic |
 | sending | payments are going out |
 | sent | every payment confirmed |
-| blocked | the payout wallet cannot cover the batch plus gas; the admin site says how much is missing |
+| blocked | the payout wallet cannot cover what is left plus gas; the batch says how much is missing and resumes by itself once the wallet is funded |
+| failed | some payments could not be made, for instance to an address that rejects ETH; the others were paid. The operator can retry |
+| empty | the window closed with nothing to pay: nothing redeemed, or no member earned fees |
 
-Each payment is one transfer from the region's payout wallet on Arbitrum One. Before a transfer is broadcast, its intent and nonce are written to the database; after a restart the service reconciles by nonce and transaction hash before sending anything, so a crash cannot pay twice. Failed transfers are retried. Gas is paid by the wallet and not deducted from members.
+Each payment is one transfer from the region's payout wallet on Arbitrum One, one batch at a time, oldest first. A payment gets exactly one signed transaction, and that transaction is stored before it is broadcast. After a restart the service finds the stored transaction and either sees it confirmed or sends that same transaction again; it signs another only when the first can never be mined. A crash at any point therefore cannot pay twice. The service refuses to send at all if the Ethereum node is on another chain than the one configured. Gas is paid by the wallet and not deducted from members.
 
 The operator funds the payout wallet. The admin site shows its balance and what the next batch needs.
 
@@ -367,7 +371,7 @@ Per region, under `/v1`. JSON throughout. Errors are `{"error": "<text>"}` with 
 
 | Group | Authenticated by | Endpoints |
 | --- | --- | --- |
-| Orchestrator | pool secret | `POST /orchestrator/admit` |
+| Orchestrator | pool secret | `POST /orchestrator/admit`, `POST /orchestrator/events` |
 | Agent | machine credential | `GET /agent/desired`, `POST /agent/report` |
 | Public | none | `GET /public/pool`, `GET /public/apps`, `GET /public/gpus`, `GET /public/terms`, `GET /public/leaderboard` |
 | Sign-in | none | `POST /auth/wallet/nonce`, `POST /auth/wallet/verify`, `POST /auth/admin/code`, `POST /auth/admin/verify` |
@@ -423,7 +427,7 @@ A ticket the node gives up on is also marked redeemed in its database; the event
 | 1 | go-livepeer additions | **Built.** Events carry rounds; a redeemed ticket and refused requests produce events; Go tests |
 | 2 | Pool service core: store, catalog, applications, members, machines, assignments, credentials, admission, orchestrator control, both sign-ins, the API for these | **Built.** A runner started with a machine credential is admitted on probation only for its assigned app; everything else is refused with a reason. Covered by the module's own tests and by a test in go-livepeer (`server/ai_http_openpool_test.go`) that runs the real pool service as a process beside a real orchestrator. |
 | 3 | Tests, promotion and suspension, holds, version deadlines, draining | **Built.** A passing runner goes active by itself; a failing one is suspended and comes back after passing again; reassigning lets sessions finish. The go-livepeer test shows all of it against a real orchestrator and runner |
-| 4 | Ledger, windows, batches, approval, sending, emails | a window of events produces the batch the formula predicts; an approved batch pays each member once on a test chain, also across a restart mid-send |
+| 4 | Ledger, windows, batches, approval, sending, emails | **Built.** A window of events produces the batch the formula predicts; an approved batch pays each member once, also across a restart mid-send. The go-livepeer test feeds a real orchestrator's events to the pool service and sees the batch built and approved. Not exercised yet: a real Kafka broker (the tests upload events over HTTP, and the consumer loop is untested) and a real chain (the tests pay on an in-memory one that follows a node's nonce, receipt and error behaviour) |
 | 5 | Member agent and signed compose files | one command on a GPU box brings its assigned app online; changing the assignment switches it with no action from the member |
 | 6 | The three sites | each page listed above works against two regions, and with one of them stopped |
 | 7 | End-to-end harness | one command runs an orchestrator, Kafka, a pool service, an agent and an echo app locally, through signup, approval, a paid call and a payout |

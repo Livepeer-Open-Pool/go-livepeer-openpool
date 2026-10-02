@@ -11,14 +11,20 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Livepeer-Open-Pool/pool/internal/auth"
 	"github.com/Livepeer-Open-Pool/pool/internal/core"
+	"github.com/Livepeer-Open-Pool/pool/internal/ledger"
+	"github.com/Livepeer-Open-Pool/pool/internal/payouts"
 )
 
 // Server serves the API.
 type Server struct {
 	core       *core.Service
+	ledger     *ledger.Ledger
+	payouts    *payouts.Service
+	now        func() time.Time
 	tokens     *auth.Tokens
 	wallet     *auth.Wallet
 	admin      *auth.Admin
@@ -37,7 +43,12 @@ type SignInInfo struct {
 
 // Options configure a Server.
 type Options struct {
-	Core   *core.Service
+	Core *core.Service
+	// Ledger and Payouts are the pool's books and its payments.
+	Ledger  *ledger.Ledger
+	Payouts *payouts.Service
+	// Now is the clock; nil means time.Now.
+	Now    func() time.Time
 	Tokens *auth.Tokens
 	Wallet *auth.Wallet
 	Admin  *auth.Admin
@@ -59,8 +70,13 @@ func New(opts Options) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
 	return &Server{
-		core: opts.Core, tokens: opts.Tokens, wallet: opts.Wallet, admin: opts.Admin,
+		core: opts.Core, ledger: opts.Ledger, payouts: opts.Payouts, now: now,
+		tokens: opts.Tokens, wallet: opts.Wallet, admin: opts.Admin,
 		poolSecret: opts.PoolSecret, origins: origins, signIn: opts.SignIn, log: log,
 	}
 }
@@ -73,11 +89,13 @@ func (s *Server) Handler() http.Handler {
 	})
 
 	mux.HandleFunc("POST /v1/orchestrator/admit", s.admit)
+	mux.HandleFunc("POST /v1/orchestrator/events", s.orchestratorEvents)
 
 	mux.HandleFunc("GET /v1/public/pool", s.publicPool)
 	mux.HandleFunc("GET /v1/public/apps", s.publicApps)
 	mux.HandleFunc("GET /v1/public/gpus", s.publicGPUs)
 	mux.HandleFunc("GET /v1/public/terms", s.publicTerms)
+	mux.HandleFunc("GET /v1/public/leaderboard", s.publicLeaderboard)
 
 	mux.HandleFunc("POST /v1/auth/wallet/nonce", s.walletNonce)
 	mux.HandleFunc("POST /v1/auth/wallet/verify", s.walletVerify)
@@ -94,6 +112,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/me/machines/{id}/credential", s.member_(s.revokeCredential))
 	mux.HandleFunc("GET /v1/me/runners", s.member_(s.myRunners))
 	mux.HandleFunc("GET /v1/me/tests", s.member_(s.myTests))
+	mux.HandleFunc("GET /v1/me/earnings", s.member_(s.myEarnings))
+	mux.HandleFunc("GET /v1/me/payouts", s.member_(s.myPayouts))
 
 	mux.HandleFunc("GET /v1/admin/status", s.admin_(s.adminStatus))
 	mux.HandleFunc("GET /v1/admin/applications", s.admin_(s.adminApplications))
@@ -129,6 +149,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/admin/runners/{id}/test", s.admin_(s.testRunner))
 	mux.HandleFunc("GET /v1/admin/tests", s.admin_(s.adminTests))
 	mux.HandleFunc("GET /v1/admin/audit", s.admin_(s.adminAudit))
+	mux.HandleFunc("GET /v1/admin/demand", s.admin_(s.adminDemand))
+	mux.HandleFunc("GET /v1/admin/batches", s.admin_(s.adminBatches))
+	mux.HandleFunc("GET /v1/admin/batches/{id}", s.admin_(s.adminBatch))
+	mux.HandleFunc("PUT /v1/admin/batches/{id}/items/{member}", s.admin_(s.setBatchItem))
+	mux.HandleFunc("POST /v1/admin/batches/{id}/approve", s.admin_(s.approveBatch))
+	mux.HandleFunc("POST /v1/admin/batches/{id}/retry", s.admin_(s.retryBatch))
+	mux.HandleFunc("GET /v1/admin/wallet", s.admin_(s.adminWallet))
 
 	return s.cors(mux)
 }
@@ -277,7 +304,7 @@ func (s *Server) admin_(next adminHandler) http.HandlerFunc {
 // admit answers the orchestrator's admission webhook. Only the orchestrator
 // holding the pool secret is answered: the request carries member credentials.
 func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
-	if s.poolSecret == "" || subtle.ConstantTimeCompare([]byte(bearer(r)), []byte(s.poolSecret)) != 1 {
+	if !s.poolSecretOK(r) {
 		writeJSON(w, http.StatusUnauthorized, errorBody{"the pool secret is missing or wrong"})
 		return
 	}
@@ -294,6 +321,12 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// poolSecretOK says whether the caller presented the pool secret, which
+// only the orchestrator and the operator hold.
+func (s *Server) poolSecretOK(r *http.Request) bool {
+	return s.poolSecret != "" && subtle.ConstantTimeCompare([]byte(bearer(r)), []byte(s.poolSecret)) == 1
 }
 
 func noContent(w http.ResponseWriter) { w.WriteHeader(http.StatusNoContent) }
