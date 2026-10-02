@@ -1,6 +1,6 @@
 # Open Pool: design of the pool service
 
-**Status:** steps 1 and 2 of the [build order](#build-order) are built, 2026-10-01; the rest is design.\
+**Status:** steps 1 to 3 of the [build order](#build-order) are built, 2026-10-01; the rest is design.\
 **Companion:** `doc/live-runner-pool.md` describes the orchestrator side, which is built (changes 0 to 8 on `feat/open-pool-enhancements`).\
 **Reader:** Mike, who made these decisions in conversation and is checking them before the build; later, whoever builds or operates the pool.
 
@@ -114,13 +114,13 @@ pool/
     config/             deployment settings from the environment
     store/              SQLite schema and migrations
     core/               the pool's rules: catalog (GPUs, apps, terms, settings), applications,
-                        members, machines, assignments, credentials, admission, runners, audit
+                        members, machines, assignments, credentials, admission, runners, audit,
+                        and the pass that tests, promotes, suspends and drains runners
     auth/               wallet sign-in, admin code, session tokens
-    orchestrator/       CLI-port client
+    orchestrator/       CLI-port client, and the prober that tests a runner through the probe route
     mail/               the admin emails and the sign-in code
     api/                HTTP handlers
     testkit/            what the tests share
-    tests/              (step 3) test runs, promotion, suspension, version deadlines, draining
     ledger/             (step 4) Kafka consumer, earnings per member per round, pot per round
     payouts/            (step 4) windows, batches, approval, sending
     compose/            (step 5) compose generation and signing
@@ -286,11 +286,15 @@ Tests run through the orchestrator's probe: an unpaid session on one named runne
 | on probation | fail | stays on probation; retested |
 | active | 3 failures in a row | suspended |
 | suspended by tests | 3 passes in a row | active |
-| any | operator sets a hold | automation leaves it alone until the hold is lifted |
+| any | operator sets a hold | the pool keeps testing it and otherwise leaves it alone until the hold is lifted |
 
-A runner is tested when it registers and then on the test interval. Every result is kept and shown to the member with its detail, so "why is my runner suspended" has an answer on the page.
+A runner is tested when it registers and then on the test interval, while it reports itself ready. Every result is kept for two weeks and shown to the member with its detail, so "why is my runner suspended" has an answer on the page. The operator can also test a runner on demand.
 
-**Version deadline.** When the operator raises an app's required version, the agents pull the new file and their runners re-register on the new version. A runner still on the old version when the deadline passes is suspended.
+**Holds.** When the operator sets a runner's state by hand, that is a hold: the pool stops promoting, suspending and draining that runner. Lifting the hold hands it back; if it is suspended at that point, three passes bring it back. An app with no test defined is never promoted by the pool: its runners wait on probation for the operator.
+
+**Version deadline.** When the operator raises an app's required version, the agents pull the new file and their runners re-register on the new version. A runner still on the old version when the deadline passes is suspended, and passing tests do not bring it back. Rolling a new version out machine by machine, so an app is never without runners, belongs to the agent (step 5).
+
+**Draining.** Unassigning an app, or removing a machine, does not cut its runner off. The runner is suspended so it takes no new work, and it is removed once the sessions it was running have finished. Assigning the app again before then keeps the runner. A ban is the exception: it removes a member's runners at once.
 
 ### Earnings, windows and payouts
 
@@ -371,7 +375,7 @@ Per region, under `/v1`. JSON throughout. Errors are `{"error": "<text>"}` with 
 | Admin: people | admin session | `GET /admin/applications`, `POST /admin/applications/{id}/approve`, `POST /admin/applications/{id}/reject`, `GET /admin/members`, `GET /admin/members/{id}`, `POST /admin/members/{id}/ban`, `POST /admin/members/{id}/unban` |
 | Admin: machines | admin session | `GET /admin/machines`, `POST /admin/machines/{id}/approve`, `PUT /admin/machines/{id}/assignments`, `GET /admin/demand` |
 | Admin: catalog | admin session | `GET/POST/PUT /admin/gpus`, `GET/POST/PUT /admin/apps`, `POST /admin/apps/{id}/version`, `POST /admin/apps/{id}/pause`, `GET/POST /admin/terms` |
-| Admin: runners | admin session | `GET /admin/runners`, `POST /admin/runners/{id}/state`, `POST /admin/runners/{id}/hold`, `POST /admin/runners/{id}/evict`, `POST /admin/runners/{id}/test`, `GET /admin/tests` |
+| Admin: runners | admin session | `GET /admin/runners`, `POST /admin/runners/{id}/state` (also a hold), `POST /admin/runners/{id}/hold`, `POST /admin/runners/{id}/evict`, `POST /admin/runners/{id}/test`, `GET /admin/tests` |
 | Admin: money | admin session | `GET /admin/batches`, `GET /admin/batches/{id}`, `PUT /admin/batches/{id}/items/{member}`, `POST /admin/batches/{id}/approve`, `POST /admin/batches/{id}/retry`, `GET /admin/wallet` |
 | Admin: pool | admin session | `GET/PUT /admin/settings`, `GET /admin/audit`, `GET /admin/status` |
 | Health | none | `GET /healthz` |
@@ -417,8 +421,8 @@ A ticket the node gives up on is also marked redeemed in its database; the event
 | Step | Work | Done when |
 | --- | --- | --- |
 | 1 | go-livepeer additions | **Built.** Events carry rounds; a redeemed ticket and refused requests produce events; Go tests |
-| 2 | Pool service core: store, catalog, applications, members, machines, assignments, credentials, admission, orchestrator control, both sign-ins, the API for these | **Built.** A runner started with a machine credential is admitted on probation only for its assigned app; everything else is refused with a reason. Covered by the module's own tests and by a test in go-livepeer (`server/ai_http_openpool_test.go`) that runs the real pool service as a process beside a real orchestrator. Until step 3, removing or reassigning a machine evicts its runner at once instead of letting sessions finish, and nothing promotes a runner off probation but the operator |
-| 3 | Tests, promotion and suspension, holds, version deadlines, draining | a passing runner goes active by itself; a failing one is suspended; reassigning lets sessions finish |
+| 2 | Pool service core: store, catalog, applications, members, machines, assignments, credentials, admission, orchestrator control, both sign-ins, the API for these | **Built.** A runner started with a machine credential is admitted on probation only for its assigned app; everything else is refused with a reason. Covered by the module's own tests and by a test in go-livepeer (`server/ai_http_openpool_test.go`) that runs the real pool service as a process beside a real orchestrator. |
+| 3 | Tests, promotion and suspension, holds, version deadlines, draining | **Built.** A passing runner goes active by itself; a failing one is suspended and comes back after passing again; reassigning lets sessions finish. The go-livepeer test shows all of it against a real orchestrator and runner |
 | 4 | Ledger, windows, batches, approval, sending, emails | a window of events produces the batch the formula predicts; an approved batch pays each member once on a test chain, also across a restart mid-send |
 | 5 | Member agent and signed compose files | one command on a GPU box brings its assigned app online; changing the assignment switches it with no action from the member |
 | 6 | The three sites | each page listed above works against two regions, and with one of them stopped |

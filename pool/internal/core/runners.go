@@ -41,6 +41,17 @@ type Runner struct {
 	// Unknown marks a runner the pool did not admit, such as a static runner
 	// left in the orchestrator's configuration.
 	Unknown bool `json:"unknown,omitempty"`
+	// Hold is set while the operator has taken the runner out of the pool's
+	// own promoting, suspending and draining.
+	Hold       bool   `json:"hold"`
+	HoldReason string `json:"hold_reason,omitempty"`
+	// SuspendReason says why the pool suspended the runner: "tests",
+	// "version" or "draining".
+	SuspendReason string     `json:"suspend_reason,omitempty"`
+	LastTestAt    *time.Time `json:"last_test_at,omitempty"`
+	LastTestOK    bool       `json:"last_test_ok"`
+	// Failures is how many tests in a row the runner has failed.
+	Failures int `json:"failures"`
 }
 
 // runnerGrace is how long a runner this service admitted may be missing from
@@ -58,9 +69,17 @@ func (s *Service) Runners(ctx context.Context, memberID string) ([]Runner, error
 	if err != nil {
 		return nil, unavailablef("the orchestrator did not answer: %v", err)
 	}
-	type known struct{ machineID, label, memberID, memberName string }
+	type known struct {
+		machineID, label, memberID, memberName string
+		hold                                   bool
+		holdReason, suspendReason              string
+		lastTestAt                             int64
+		lastTestOK                             bool
+		failures                               int
+	}
 	admitted := map[string]known{}
-	rows, err := s.db.QueryContext(ctx, `SELECT r.runner_id, m.id, m.label, b.id, b.display_name
+	rows, err := s.db.QueryContext(ctx, `SELECT r.runner_id, m.id, m.label, b.id, b.display_name,
+		r.hold, r.hold_reason, r.suspend_reason, r.last_test_at, r.last_test_ok, r.failures
 		FROM runners r JOIN machines m ON m.id = r.machine_id JOIN members b ON b.id = m.member_id WHERE r.gone_at = 0`)
 	if err != nil {
 		return nil, err
@@ -68,7 +87,8 @@ func (s *Service) Runners(ctx context.Context, memberID string) ([]Runner, error
 	for rows.Next() {
 		var runnerID string
 		var k known
-		if err := rows.Scan(&runnerID, &k.machineID, &k.label, &k.memberID, &k.memberName); err != nil {
+		if err := rows.Scan(&runnerID, &k.machineID, &k.label, &k.memberID, &k.memberName,
+			&k.hold, &k.holdReason, &k.suspendReason, &k.lastTestAt, &k.lastTestOK, &k.failures); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -86,6 +106,8 @@ func (s *Service) Runners(ctx context.Context, memberID string) ([]Runner, error
 		view := Runner{OrchRunner: r}
 		if k, ok := admitted[r.RunnerID]; ok {
 			view.MachineID, view.MachineLabel, view.MemberName = k.machineID, k.label, k.memberName
+			view.Hold, view.HoldReason, view.SuspendReason = k.hold, k.holdReason, k.suspendReason
+			view.LastTestAt, view.LastTestOK, view.Failures = optionalTime(k.lastTestAt), k.lastTestOK, k.failures
 		} else {
 			view.Unknown = true
 		}
@@ -106,7 +128,8 @@ func (s *Service) Runners(ctx context.Context, memberID string) ([]Runner, error
 	return runners, nil
 }
 
-// SetRunnerState moves a runner between probation, active and suspended.
+// SetRunnerState moves a runner between probation, active and suspended and
+// puts it on hold, so that the pool's tests do not move it back.
 func (s *Service) SetRunnerState(ctx context.Context, actor, runnerID, state, reason string) error {
 	if state != StateProbation && state != StateActive && state != StateSuspended {
 		return invalidf("state must be probation, active, or suspended")
@@ -116,6 +139,12 @@ func (s *Service) SetRunnerState(ctx context.Context, actor, runnerID, state, re
 	}
 	if err := s.orch.SetState(ctx, runnerID, state, reason); err != nil {
 		return orchError(err)
+	}
+	// The operator overrode the pool's own decision, so the pool stops
+	// deciding for this runner until the hold is lifted.
+	if _, err := s.db.ExecContext(ctx, `UPDATE runners SET hold = 1, hold_reason = ?, suspend_reason = '' WHERE runner_id = ? AND gone_at = 0`,
+		"state set to "+state+" by the operator", runnerID); err != nil {
+		return err
 	}
 	return s.audit(ctx, s.db, actor, "runner.state", runnerID, strings.TrimSpace(state+" "+reason))
 }
@@ -197,22 +226,6 @@ func asError(err error, target **Error) bool {
 		*target = e
 	}
 	return ok
-}
-
-// evictMachineRunners removes a machine's runners from the orchestrator; app
-// narrows to one app when not empty.
-func (s *Service) evictMachineRunners(ctx context.Context, machineID, app, reason string) {
-	ids, err := s.liveRunners(ctx, machineID, app)
-	if err != nil {
-		s.log.Error("listing a machine's runners", "machine_id", machineID, "err", err)
-		return
-	}
-	for _, id := range ids {
-		s.evictOnOrchestrator(ctx, id, reason)
-		if _, err := s.db.ExecContext(ctx, `UPDATE runners SET gone_at = ? WHERE runner_id = ?`, s.nowMs(), id); err != nil {
-			s.log.Error("marking a runner gone", "runner_id", id, "err", err)
-		}
-	}
 }
 
 // evictMemberRunners removes every runner of a member from the orchestrator.

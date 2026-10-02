@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -81,6 +82,7 @@ func startOpenPool(t *testing.T, bin, listen, orchURL, cliURL string) *openPool 
 		"OPENPOOL_SESSION_SECRET=a-session-signing-secret-of-enough-length",
 		"OPENPOOL_ADMIN_EMAIL=ops@open-pool.com",
 		"OPENPOOL_SIGN_IN_DOMAINS=app.open-pool.com",
+		"OPENPOOL_RECONCILE_INTERVAL=200ms",
 	)
 	cmd.Stderr = p.log
 	require.NoError(t, cmd.Start())
@@ -197,7 +199,10 @@ func TestOpenPoolServiceAndOrchestratorAgree(t *testing.T) {
 	var vllm struct {
 		ID string `json:"id"`
 	}
-	pool.call(http.StatusCreated, "POST", "/v1/admin/apps", admin, appDefinition("vllm/qwen2.5-7b-instruct"), &vllm)
+	// The app's test: its model list must answer and name the model.
+	vllmDefinition := appDefinition("vllm/qwen2.5-7b-instruct")
+	vllmDefinition["test"] = map[string]any{"method": "GET", "path": "/v1/models", "expect_status": 200, "expect_contains": []string{"qwen"}, "timeout_ms": 5000}
+	pool.call(http.StatusCreated, "POST", "/v1/admin/apps", admin, vllmDefinition, &vllm)
 	pool.call(http.StatusCreated, "POST", "/v1/admin/apps", admin, appDefinition("flux/schnell"), nil)
 	pool.call(http.StatusOK, "POST", "/v1/admin/terms", admin, map[string]string{"scope": "global", "body": "Be good."}, nil)
 
@@ -260,9 +265,21 @@ func TestOpenPoolServiceAndOrchestratorAgree(t *testing.T) {
 	}
 	pool.call(http.StatusCreated, "POST", "/v1/me/machines/"+machines.Machines[0].ID+"/credential", member, nil, &credential)
 
-	// The member's machine starts the runner command with its credential.
+	// The member's machine starts the runner command with its credential. The
+	// app behind it answers well until it is broken.
+	var broken atomic.Bool
+	var sawProbeSecret atomic.Bool
 	startRunner := func(app string, log io.Writer) *tunnelclient.Client {
-		target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "app") }))
+		target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Livepeer-Probe-Secret") != "" {
+				sawProbeSecret.Store(true)
+			}
+			if broken.Load() {
+				http.Error(w, "CUDA out of memory", http.StatusInternalServerError)
+				return
+			}
+			_, _ = io.WriteString(w, `{"data":[{"id":"qwen2.5-7b-instruct"}]}`)
+		}))
 		t.Cleanup(target.Close)
 		client, err := tunnelclient.New(tunnelclient.Config{
 			Orchestrator: orch.URL, Credential: credential.Secret, Target: target.URL,
@@ -285,36 +302,74 @@ func TestOpenPoolServiceAndOrchestratorAgree(t *testing.T) {
 	client := startRunner("vllm/qwen2.5-7b-instruct", io.Discard)
 	runnerID := waitPoolRunnerConnected(t, lp, client)
 
-	// The orchestrator admitted it under the member the pool service named, on probation.
+	// The orchestrator admitted it under the member the pool service named.
 	listed := manager.PoolRunners()
 	require.Len(t, listed, 1)
 	require.Equal(t, approved.ID, listed[0].MemberID)
 	require.Equal(t, address, listed[0].PayoutAddress)
-	require.Equal(t, runner.LiveRunnerStateProbation, listed[0].State)
-	require.Empty(t, discoveredRunnerURLs(t, orch.URL))
-
-	// The pool service sees the same runner through the CLI port, traced to its machine.
-	var runners struct {
-		Runners []struct {
-			RunnerID  string `json:"runner_id"`
-			MachineID string `json:"machine_id"`
-			State     string `json:"state"`
-		} `json:"runners"`
+	state := func() string {
+		runners := manager.PoolRunners()
+		if len(runners) != 1 {
+			return ""
+		}
+		return runners[0].State
 	}
-	pool.call(http.StatusOK, "GET", "/v1/admin/runners", admin, nil, &runners)
-	require.Len(t, runners.Runners, 1)
-	require.Equal(t, runnerID, runners.Runners[0].RunnerID)
-	require.Equal(t, machines.Machines[0].ID, runners.Runners[0].MachineID)
 
-	// The operator makes it active through the pool service; customers can now use it.
-	pool.call(http.StatusNoContent, "POST", "/v1/admin/runners/"+runnerID+"/state", admin, map[string]string{"state": "active", "reason": "checked by hand"}, nil)
+	// Nobody promotes it by hand: the pool service tests it through the
+	// probe route, it passes, and it goes from probation to active.
+	require.Eventually(t, func() bool { return state() == runner.LiveRunnerStateActive }, 15*time.Second, 50*time.Millisecond)
+	require.False(t, sawProbeSecret.Load(), "the runner never sees the pool secret")
 	require.Len(t, discoveredRunnerURLs(t, orch.URL), 1)
 	res, err := http.Get(orch.URL + "/apps/" + runnerID + "/app/v1/models")
 	require.NoError(t, err)
 	body, _ := io.ReadAll(res.Body)
 	res.Body.Close()
 	require.Equal(t, http.StatusOK, res.StatusCode)
-	require.Equal(t, "app", string(body))
+	require.Contains(t, string(body), "qwen2.5-7b-instruct")
+
+	// The pool service sees the same runner through the CLI port, traced to its machine.
+	var runners struct {
+		Runners []struct {
+			RunnerID   string `json:"runner_id"`
+			MachineID  string `json:"machine_id"`
+			LastTestOK bool   `json:"last_test_ok"`
+		} `json:"runners"`
+	}
+	pool.call(http.StatusOK, "GET", "/v1/admin/runners", admin, nil, &runners)
+	require.Len(t, runners.Runners, 1)
+	require.Equal(t, runnerID, runners.Runners[0].RunnerID)
+	require.Equal(t, machines.Machines[0].ID, runners.Runners[0].MachineID)
+	require.True(t, runners.Runners[0].LastTestOK)
+
+	// The app breaks. Three failed tests in a row suspend the runner, and the
+	// member can read why.
+	broken.Store(true)
+	var result struct {
+		OK     bool   `json:"ok"`
+		Detail string `json:"detail"`
+	}
+	for i := 0; i < 3; i++ {
+		pool.call(http.StatusOK, "POST", "/v1/admin/runners/"+runnerID+"/test", admin, nil, &result)
+		require.False(t, result.OK)
+	}
+	require.Equal(t, "answered 500, expected 200: CUDA out of memory", result.Detail)
+	require.Equal(t, runner.LiveRunnerStateSuspended, state())
+	require.Empty(t, discoveredRunnerURLs(t, orch.URL))
+	var tests struct {
+		Tests []struct {
+			OK bool `json:"ok"`
+		} `json:"tests"`
+	}
+	pool.call(http.StatusOK, "GET", "/v1/me/tests", member, nil, &tests)
+	require.Len(t, tests.Tests, 4)
+
+	// It is fixed. Three passes bring it back without anyone stepping in.
+	broken.Store(false)
+	for i := 0; i < 3; i++ {
+		pool.call(http.StatusOK, "POST", "/v1/admin/runners/"+runnerID+"/test", admin, nil, &result)
+		require.True(t, result.OK)
+	}
+	require.Equal(t, runner.LiveRunnerStateActive, state())
 
 	// The same credential cannot serve an app the machine was not assigned;
 	// the runner command's log says why.
@@ -325,9 +380,13 @@ func TestOpenPoolServiceAndOrchestratorAgree(t *testing.T) {
 	}, 15*time.Second, 50*time.Millisecond, refusedLog.String())
 	require.Len(t, manager.PoolRunners(), 1)
 
-	// Banning the member removes their runner from the orchestrator and keeps it out.
-	pool.call(http.StatusOK, "POST", "/v1/admin/members/"+approved.ID+"/ban", admin, map[string]string{"reason": "contract test"}, nil)
-	require.Eventually(t, func() bool { return len(manager.PoolRunners()) == 0 }, 5*time.Second, 20*time.Millisecond)
+	// The operator unassigns the app: the runner is drained and, being idle,
+	// removed; the machine is refused when it tries to come back.
+	pool.call(http.StatusOK, "PUT", "/v1/admin/machines/"+machines.Machines[0].ID+"/assignments", admin, map[string]any{"assignments": []any{}}, nil)
+	require.Eventually(t, func() bool { return len(manager.PoolRunners()) == 0 }, 15*time.Second, 50*time.Millisecond)
 	time.Sleep(3 * time.Second) // the runner command retries after a second or two
-	require.Empty(t, manager.PoolRunners(), "a banned member's machine is refused when it registers again")
+	require.Empty(t, manager.PoolRunners())
+
+	// A ban is accepted whether or not the member has runners registered.
+	pool.call(http.StatusOK, "POST", "/v1/admin/members/"+approved.ID+"/ban", admin, map[string]string{"reason": "contract test"}, nil)
 }

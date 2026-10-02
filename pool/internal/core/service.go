@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
@@ -56,11 +57,15 @@ type Config struct {
 
 // Service is the pool's rules over its database.
 type Service struct {
-	db   *store.DB
-	orch Orchestrator
-	mail Notifier
-	cfg  Config
-	log  *slog.Logger
+	db     *store.DB
+	orch   Orchestrator
+	prober Prober
+	mail   Notifier
+	cfg    Config
+	log    *slog.Logger
+
+	// reconcileMu keeps one pass over the runners at a time.
+	reconcileMu sync.Mutex
 }
 
 // New returns a Service. orch and mail may be nil in tests that do not reach them.
@@ -73,6 +78,10 @@ func New(db *store.DB, orch Orchestrator, mail Notifier, cfg Config, log *slog.L
 	}
 	return &Service{db: db, orch: orch, mail: mail, cfg: cfg, log: log}
 }
+
+// SetProber gives the service the means to test runners. Without one,
+// Reconcile still drains and enforces versions and tests nothing.
+func (s *Service) SetProber(prober Prober) { s.prober = prober }
 
 // Region is the region this service serves.
 func (s *Service) Region() (id, name string) { return s.cfg.RegionID, s.cfg.RegionName }

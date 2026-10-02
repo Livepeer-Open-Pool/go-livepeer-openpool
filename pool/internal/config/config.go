@@ -25,6 +25,10 @@ type Config struct {
 	OrchestratorURL    string
 	OrchestratorCLIURL string
 	PoolSecret         string
+	// OrchestratorInsecureTLS skips certificate verification when testing
+	// runners through the orchestrator, for one that serves its default
+	// self-signed certificate.
+	OrchestratorInsecureTLS bool
 
 	// SessionSecret signs session tokens and must be the same in every region.
 	SessionSecret string
@@ -41,6 +45,10 @@ type Config struct {
 
 	// AllowedOrigins are the sites whose pages may call this API.
 	AllowedOrigins []string
+
+	// ReconcileInterval is how often the service looks over the registered
+	// runners: which are due a test, which to drain, which run an old version.
+	ReconcileInterval time.Duration
 }
 
 // value returns the environment variable name, or the content of the file
@@ -103,6 +111,7 @@ func FromEnv() (*Config, error) {
 		MailFrom:           get("MAIL_FROM", "", false),
 		AllowedOrigins:     list(get("ALLOWED_ORIGINS", "https://open-pool.com,https://app.open-pool.com,https://admin.open-pool.com", false)),
 	}
+	cfg.OrchestratorInsecureTLS = get("ORCHESTRATOR_INSECURE_TLS", "false", false) == "true"
 	if cfg.RegionName == "" {
 		cfg.RegionName = cfg.RegionID
 	}
@@ -120,6 +129,11 @@ func FromEnv() (*Config, error) {
 		problems = append(problems, "OPENPOOL_SESSION_TTL must be a duration such as 12h")
 	}
 	cfg.SessionTTL = ttl
+	interval, err := time.ParseDuration(get("RECONCILE_INTERVAL", "15s", false))
+	if err != nil || interval <= 0 {
+		problems = append(problems, "OPENPOOL_RECONCILE_INTERVAL must be a duration such as 15s")
+	}
+	cfg.ReconcileInterval = interval
 
 	if len(problems) > 0 {
 		return nil, fmt.Errorf("configuration:\n  %s", strings.Join(problems, "\n  "))

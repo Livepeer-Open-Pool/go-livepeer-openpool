@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -17,17 +18,18 @@ const operator = "admin:ops@open-pool.com"
 // fixture is a pool service over a fresh database, with a stand-in
 // orchestrator, a mailbox and a clock the test controls.
 type fixture struct {
-	t     *testing.T
-	ctx   context.Context
-	svc   *core.Service
-	orch  *testkit.Orchestrator
-	mail  *testkit.Mailbox
-	clock *testkit.Clock
+	t      *testing.T
+	ctx    context.Context
+	svc    *core.Service
+	orch   *testkit.Orchestrator
+	prober *testkit.Prober
+	mail   *testkit.Mailbox
+	clock  *testkit.Clock
 }
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
-	f := &fixture{t: t, ctx: context.Background(), orch: &testkit.Orchestrator{}, mail: &testkit.Mailbox{}, clock: testkit.NewClock()}
+	f := &fixture{t: t, ctx: context.Background(), orch: &testkit.Orchestrator{}, prober: &testkit.Prober{}, mail: &testkit.Mailbox{}, clock: testkit.NewClock()}
 	f.svc = core.New(testkit.OpenDB(t), f.orch, f.mail, core.Config{
 		RegionID:        "us-east",
 		RegionName:      "US East",
@@ -37,7 +39,41 @@ func newFixture(t *testing.T) *fixture {
 		RecoverSigner:   auth.RecoverSigner,
 		Now:             f.clock.Now,
 	}, nil)
+	f.svc.SetProber(f.prober)
 	return f
+}
+
+// testedApp is an app with a test defined, so its runners are tested.
+func (f *fixture) testedApp(name string) *core.App {
+	f.t.Helper()
+	return f.app(name, func(in *core.AppInput) {
+		in.Test = core.Test{Method: "GET", Path: "/v1/models", ExpectStatus: 200, ExpectContains: []string{"data"}, TimeoutMs: 5000}
+	})
+}
+
+// runner admits a runner for the machine and registers it on the stand-in
+// orchestrator, on probation and ready, as the real one would.
+func (f *fixture) runner(member *core.Member, credential, runnerID string, app *core.App) {
+	f.t.Helper()
+	require.True(f.t, f.admit(credential, runnerID, app).Allow)
+	f.orch.Register(core.OrchRunner{
+		RunnerID: runnerID, MemberID: member.ID, App: app.Name, Mode: app.Mode, Version: app.RequiredVersion,
+		State: core.StateProbation, Status: "ready", Ready: true, Capacity: 2, Tunnel: true, TunnelConnected: true,
+	})
+}
+
+func (f *fixture) state(runnerID string) string {
+	f.t.Helper()
+	r := f.orch.Runner(runnerID)
+	require.NotNil(f.t, r, "runner %s is not registered", runnerID)
+	return r.State
+}
+
+// pass runs one reconcile pass after moving the clock past the test interval.
+func (f *fixture) pass() {
+	f.t.Helper()
+	f.clock.Advance(10 * time.Minute)
+	require.NoError(f.t, f.svc.Reconcile(f.ctx))
 }
 
 // requireKind asserts err is a core error of the kind, optionally with the message.

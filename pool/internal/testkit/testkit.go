@@ -272,3 +272,78 @@ func (o *Orchestrator) Evicted() []string {
 
 // PinnedImage is a container image reference pinned by digest, for app definitions.
 const PinnedImage = "vllm/vllm-openai@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+// Prober stands in for testing runners through the orchestrator: it answers
+// each probe with the outcome set for the runner, a pass by default, and
+// remembers which runners it was asked to test.
+type Prober struct {
+	mu sync.Mutex
+	// Outcomes is the result for each runner id; a runner not listed passes.
+	Outcomes map[string]core.TestOutcome
+	Probed   []string
+}
+
+// Probe returns the runner's outcome.
+func (p *Prober) Probe(ctx context.Context, runner core.OrchRunner, test core.Test) core.TestOutcome {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.Probed = append(p.Probed, runner.RunnerID)
+	if outcome, ok := p.Outcomes[runner.RunnerID]; ok {
+		return outcome
+	}
+	return core.TestOutcome{OK: true, LatencyMs: 120}
+}
+
+// Fail makes the runner fail its tests with the detail; Pass makes it pass again.
+func (p *Prober) Fail(runnerID, detail string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.Outcomes == nil {
+		p.Outcomes = map[string]core.TestOutcome{}
+	}
+	p.Outcomes[runnerID] = core.TestOutcome{OK: false, LatencyMs: 80, Detail: detail}
+}
+
+// Pass makes the runner pass its tests.
+func (p *Prober) Pass(runnerID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.Outcomes, runnerID)
+}
+
+// Count is how many times the runner was probed.
+func (p *Prober) Count(runnerID string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, id := range p.Probed {
+		if id == runnerID {
+			n++
+		}
+	}
+	return n
+}
+
+// Runner returns the listed runner with the id, or nil.
+func (o *Orchestrator) Runner(runnerID string) *core.OrchRunner {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for i := range o.List {
+		if o.List[i].RunnerID == runnerID {
+			r := o.List[i]
+			return &r
+		}
+	}
+	return nil
+}
+
+// Update changes a listed runner in place.
+func (o *Orchestrator) Update(runnerID string, change func(*core.OrchRunner)) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for i := range o.List {
+		if o.List[i].RunnerID == runnerID {
+			change(&o.List[i])
+		}
+	}
+}

@@ -408,3 +408,19 @@ func TestBrowsersOnTheSitesMayCallTheAPI(t *testing.T) {
 	res.Body.Close()
 	require.Equal(t, http.StatusOK, res.StatusCode)
 }
+
+func TestOperatorSeesTestsAndControlsHolds(t *testing.T) {
+	e := newEnv(t)
+	admin := e.signInAdmin()
+
+	e.refused(http.StatusNotFound, "POST", "/v1/admin/runners/runner_missing/hold", admin, map[string]any{"reason": "x"})
+	// Without an orchestrator connection to test through, the answer is that it is unavailable.
+	e.refused(http.StatusServiceUnavailable, "POST", "/v1/admin/runners/runner_missing/test", admin, nil)
+
+	var tests struct {
+		Tests []core.TestResult `json:"tests"`
+	}
+	e.ok(http.StatusOK, "GET", "/v1/admin/tests", admin, nil, &tests)
+	require.Empty(t, tests.Tests)
+	e.refused(http.StatusUnauthorized, "GET", "/v1/admin/tests", "", nil)
+}

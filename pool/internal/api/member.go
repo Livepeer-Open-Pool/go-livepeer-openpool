@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/Livepeer-Open-Pool/pool/internal/core"
 )
@@ -114,4 +115,14 @@ func (s *Server) myRunners(w http.ResponseWriter, r *http.Request, member *core.
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"runners": runners})
+}
+
+func (s *Server) myTests(w http.ResponseWriter, r *http.Request, member *core.Member) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	results, err := s.core.TestResults(r.Context(), r.URL.Query().Get("runner"), member.ID, limit)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tests": results})
 }

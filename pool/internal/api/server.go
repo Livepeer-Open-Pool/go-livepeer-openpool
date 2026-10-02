@@ -93,6 +93,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/me/machines/{id}/credential", s.member_(s.createCredential))
 	mux.HandleFunc("DELETE /v1/me/machines/{id}/credential", s.member_(s.revokeCredential))
 	mux.HandleFunc("GET /v1/me/runners", s.member_(s.myRunners))
+	mux.HandleFunc("GET /v1/me/tests", s.member_(s.myTests))
 
 	mux.HandleFunc("GET /v1/admin/status", s.admin_(s.adminStatus))
 	mux.HandleFunc("GET /v1/admin/applications", s.admin_(s.adminApplications))
@@ -124,6 +125,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/admin/runners", s.admin_(s.adminRunners))
 	mux.HandleFunc("POST /v1/admin/runners/{id}/state", s.admin_(s.setRunnerState))
 	mux.HandleFunc("POST /v1/admin/runners/{id}/evict", s.admin_(s.evictRunner))
+	mux.HandleFunc("POST /v1/admin/runners/{id}/hold", s.admin_(s.holdRunner))
+	mux.HandleFunc("POST /v1/admin/runners/{id}/test", s.admin_(s.testRunner))
+	mux.HandleFunc("GET /v1/admin/tests", s.admin_(s.adminTests))
 	mux.HandleFunc("GET /v1/admin/audit", s.admin_(s.adminAudit))
 
 	return s.cors(mux)

@@ -79,6 +79,11 @@ func run(log *slog.Logger) error {
 		AdminURL:        cfg.AdminURL,
 		RecoverSigner:   auth.RecoverSigner,
 	}, log)
+	prober, err := orchestrator.NewProber(cfg.OrchestratorURL, cfg.PoolSecret, cfg.OrchestratorInsecureTLS)
+	if err != nil {
+		return err
+	}
+	service.SetProber(prober)
 	server := api.New(api.Options{
 		Core:           service,
 		Tokens:         tokens,
@@ -102,6 +107,21 @@ func run(log *slog.Logger) error {
 			}
 			select {
 			case <-ticker.C:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(cfg.ReconcileInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := service.Reconcile(ctx); err != nil {
+					log.Warn("runners not reconciled", "err", err)
+				}
 			case <-ctx.Done():
 				return
 			}

@@ -261,10 +261,10 @@ func (s *Service) ApproveMachine(ctx context.Context, actor, id string) (*Machin
 	return s.Machine(ctx, id)
 }
 
-// RemoveMachine removes a machine: its credential stops working, its
-// assignments end, and its runners are removed from the orchestrator. A
-// member removes their own machines; the operator may remove any, with
-// memberID empty.
+// RemoveMachine removes a machine: its credential stops working at once and
+// its assignments end, so its runners take no new work and are removed once
+// the sessions they are running finish. A member removes their own machines;
+// the operator may remove any, with memberID empty.
 func (s *Service) RemoveMachine(ctx context.Context, actor, memberID, id string) error {
 	m, err := s.Machine(ctx, id)
 	if err != nil {
@@ -281,8 +281,9 @@ func (s *Service) RemoveMachine(ctx context.Context, actor, memberID, id string)
 		if _, err := tx.ExecContext(ctx, `UPDATE credentials SET revoked_at = ? WHERE machine_id = ? AND revoked_at = 0`, now, id); err != nil {
 			return err
 		}
+		// Its runners stop taking work and leave once their sessions finish.
 		if _, err := tx.ExecContext(ctx, `UPDATE assignments SET status = ?, updated_at = ? WHERE machine_id = ? AND status != ?`,
-			AssignmentRemoved, now, id, AssignmentRemoved); err != nil {
+			AssignmentDraining, now, id, AssignmentRemoved); err != nil {
 			return err
 		}
 		return s.audit(ctx, tx, actor, "machine.remove", id, m.Label)
@@ -290,13 +291,13 @@ func (s *Service) RemoveMachine(ctx context.Context, actor, memberID, id string)
 	if err != nil {
 		return err
 	}
-	s.evictMachineRunners(ctx, id, "", "machine removed")
-	return nil
+	return s.finishDrainedAssignments(ctx)
 }
 
 // SetAssignments makes inputs the apps a machine runs. An app no longer
-// listed is unassigned and its runner removed; a new one may register as
-// soon as the machine presents its credential.
+// listed is drained: its runner takes no new work and is removed once the
+// sessions it is running finish. A new app may register as soon as the
+// machine presents its credential.
 func (s *Service) SetAssignments(ctx context.Context, actor, machineID string, inputs []AssignmentInput) (*Machine, error) {
 	m, err := s.Machine(ctx, machineID)
 	if err != nil {
@@ -314,19 +315,23 @@ func (s *Service) SetAssignments(ctx context.Context, actor, machineID string, i
 		wanted[r.app.ID] = r
 	}
 	now := s.nowMs()
-	unassigned := []string{}
 	err = s.db.Tx(ctx, func(tx *sql.Tx) error {
 		for _, current := range m.Assignments {
 			want, keep := wanted[current.AppID]
 			if !keep {
-				if _, err := tx.ExecContext(ctx, `UPDATE assignments SET status = ?, updated_at = ? WHERE id = ?`, AssignmentRemoved, now, current.ID); err != nil {
+				if _, err := tx.ExecContext(ctx, `UPDATE assignments SET status = ?, updated_at = ? WHERE id = ?`, AssignmentDraining, now, current.ID); err != nil {
 					return err
 				}
-				unassigned = append(unassigned, current.AppName)
 				continue
 			}
 			if _, err := tx.ExecContext(ctx, `UPDATE assignments SET capacity = ?, status = ?, updated_at = ? WHERE id = ?`,
 				want.capacity, AssignmentActive, now, current.ID); err != nil {
+				return err
+			}
+			// An app assigned again while its runner was draining: the runner
+			// stays, and comes back once it passes its tests.
+			if _, err := tx.ExecContext(ctx, `UPDATE runners SET suspend_reason = ?, passes = 0 WHERE assignment_id = ? AND gone_at = 0 AND suspend_reason = ?`,
+				SuspendedByTests, current.ID, SuspendedByDrain); err != nil {
 				return err
 			}
 			delete(wanted, current.AppID)
@@ -342,8 +347,8 @@ func (s *Service) SetAssignments(ctx context.Context, actor, machineID string, i
 	if err != nil {
 		return nil, err
 	}
-	for _, app := range unassigned {
-		s.evictMachineRunners(ctx, machineID, app, "unassigned")
+	if err := s.finishDrainedAssignments(ctx); err != nil {
+		return nil, err
 	}
 	return s.Machine(ctx, machineID)
 }

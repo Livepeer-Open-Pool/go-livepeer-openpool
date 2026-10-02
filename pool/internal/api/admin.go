@@ -400,3 +400,38 @@ func (s *Server) adminAudit(w http.ResponseWriter, r *http.Request, actor string
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"entries": entries})
 }
+
+func (s *Server) holdRunner(w http.ResponseWriter, r *http.Request, actor string) {
+	req := struct {
+		Hold   bool   `json:"hold"`
+		Reason string `json:"reason"`
+	}{Hold: true}
+	if err := readJSON(r, &req); err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	if err := s.core.SetRunnerHold(r.Context(), actor, r.PathValue("id"), req.Hold, req.Reason); err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	noContent(w)
+}
+
+func (s *Server) testRunner(w http.ResponseWriter, r *http.Request, actor string) {
+	result, err := s.core.TestRunnerNow(r.Context(), actor, r.PathValue("id"))
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) adminTests(w http.ResponseWriter, r *http.Request, actor string) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	results, err := s.core.TestResults(r.Context(), r.URL.Query().Get("runner"), r.URL.Query().Get("member"), limit)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tests": results})
+}

@@ -148,4 +148,29 @@ CREATE TABLE audit (
 	detail  TEXT NOT NULL DEFAULT ''
 );
 `,
+	// 2: what the pool does with a runner once it is registered: tests it,
+	// and promotes, suspends, holds or drains it.
+	`
+ALTER TABLE runners ADD COLUMN hold INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runners ADD COLUMN hold_reason TEXT NOT NULL DEFAULT '';
+-- Why this service suspended the runner: 'tests', 'version', 'draining', or '' when it did not.
+ALTER TABLE runners ADD COLUMN suspend_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE runners ADD COLUMN failures INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runners ADD COLUMN passes INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runners ADD COLUMN last_test_at INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runners ADD COLUMN last_test_ok INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE test_results (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	runner_id  TEXT NOT NULL,
+	machine_id TEXT NOT NULL,
+	app        TEXT NOT NULL,
+	at         INTEGER NOT NULL,
+	ok         INTEGER NOT NULL,
+	latency_ms INTEGER NOT NULL,
+	detail     TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX test_results_runner ON test_results (runner_id, id);
+CREATE INDEX test_results_machine ON test_results (machine_id, id);
+`,
 }
