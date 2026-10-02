@@ -74,6 +74,9 @@ services:
       - -httpAddr=0.0.0.0:8935
       # The CLI port controls the node. It listens on the inner network only.
       - -cliAddr=${ORCH_INNER_IP:-172.31.250.10}:7935
+      # Whether livepeer_cli may send transactions, which activating the
+      # orchestrator on-chain needs. Off unless you turn it on.
+      - -enableCliTxRoutes=${ORCH_CLI_TX_ROUTES:-false}
       # Pool mode: the pool service decides who may register, and is told what happens.
       - -liveRunnerAuthWebhookUrl=http://openpool:8090/v1/orchestrator/admit
       - -liveRunnerPoolSecret=/run/secrets/pool_secret

@@ -93,7 +93,7 @@ The orchestrator's CLI port, which controls the node, listens only on the compos
 
 ### After the first start
 
-1. **Activate the orchestrator on-chain**, if this account is not one already, with `docker compose exec orchestrator livepeer_cli -host 172.31.250.10 -http 7935`. Set its fee share so that it keeps 100% of fees: the payout rule assumes the whole of what the node redeems is the pot.
+1. **Activate the orchestrator on-chain**, if this account is not one already. `livepeer_cli` may send transactions only while `ORCH_CLI_TX_ROUTES=true` is in `.env`: set it, `docker compose up -d`, run `docker compose exec orchestrator livepeer_cli -host 172.31.250.10 -http 7935`, and set it back to `false` afterwards. Set the orchestrator's fee share so that it keeps 100% of fees: the payout rule assumes the whole of what the node redeems is the pot.
 2. **Fund the payout wallet** with ETH on Arbitrum. The admin site shows its address and balance.
 3. **Sign in to the admin site** and set the region up: GPU models, apps, the terms. A region takes applications once the pool's terms are published in it.
 
