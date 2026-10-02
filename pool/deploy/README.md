@@ -71,6 +71,24 @@ chmod 700 secrets && chmod 644 secrets/* && chmod 755 secrets/orch_keystore
 
 The directory is closed to other users of the host; the files inside are readable so that the pool service, which does not run as root in its container, can read the ones it is given.
 
+`SECRETS_DIR` in `.env` says where this directory is. Give its full path when the compose file is run from somewhere else, as Portainer does with a stack.
+
+### Check it against what already runs on the host
+
+```bash
+./preflight.sh          # with sudo if Docker needs it
+```
+
+It starts nothing and changes nothing. It says what is still missing (settings, secrets, images not yet in the registry, names that do not resolve) and whether starting the region could touch anything already running:
+
+- a Traefik router or service with one of this region's names, or a rule for one of its hostnames, on another container;
+- another container running with the orchestrator's account;
+- a Docker network overlapping the region's inner one;
+- a port published on the host (the region publishes none);
+- a TCP router that takes every name, which would take the orchestrator's connections.
+
+Everything the region creates is named after it: the compose project `openpool-<region>`, its volumes and inner network, and the Traefik routers `openpool-api-<region>` and `openpool-orch-<region>`. It joins your Traefik's network and adds nothing else to it.
+
 ### Start it
 
 ```bash

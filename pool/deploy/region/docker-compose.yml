@@ -5,6 +5,7 @@
 #
 #   cp .env.example .env    and fill it in
 #   put the secrets in ./secrets (see ../README.md)
+#   ./preflight.sh          checks it against what already runs here; changes nothing
 #   docker compose up -d
 name: openpool-${REGION_ID}
 
@@ -86,7 +87,7 @@ services:
       - -v=${ORCH_LOG_LEVEL:-4}
     volumes:
       - orchestrator:/data
-      - ${ORCH_KEYSTORE_DIR:-./secrets/orch_keystore}:/keystore:ro
+      - ${SECRETS_DIR:-./secrets}/orch_keystore:/keystore:ro
     secrets: [orch_eth_password, orch_secret, pool_secret]
     networks:
       inner:
@@ -160,13 +161,20 @@ services:
       - traefik.http.services.openpool-api-${REGION_ID}.loadbalancer.server.port=8090
 
 secrets:
-  pool_secret: { file: ./secrets/pool_secret }
-  session_secret: { file: ./secrets/session_secret }
-  orch_secret: { file: ./secrets/orch_secret }
-  orch_eth_password: { file: ./secrets/orch_eth_password }
-  payout_keystore: { file: ./secrets/payout_keystore }
-  payout_password: { file: ./secrets/payout_password }
-  resend_api_key: { file: ./secrets/resend_api_key }
+  pool_secret:
+    file: ${SECRETS_DIR:-./secrets}/pool_secret
+  session_secret:
+    file: ${SECRETS_DIR:-./secrets}/session_secret
+  orch_secret:
+    file: ${SECRETS_DIR:-./secrets}/orch_secret
+  orch_eth_password:
+    file: ${SECRETS_DIR:-./secrets}/orch_eth_password
+  payout_keystore:
+    file: ${SECRETS_DIR:-./secrets}/payout_keystore
+  payout_password:
+    file: ${SECRETS_DIR:-./secrets}/payout_password
+  resend_api_key:
+    file: ${SECRETS_DIR:-./secrets}/resend_api_key
 
 volumes:
   redpanda:
