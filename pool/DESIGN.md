@@ -49,28 +49,32 @@ The pool service and go-livepeer share no code. `pool/` has its own `go.mod`, so
 | Machine | One box with one or more GPUs. One install, one credential. |
 | Running apps | A member agent with access to the Docker socket applies a signed compose file the pool generates. Images are upstream images the operator picks, pinned by digest; Open Pool publishes none of its own. |
 | Platform | Linux with NVIDIA and Docker. Others can be certified later. |
-| Payout address | Cannot be changed. A different address means applying again. |
+| Payout address | The wallet the member signs in with. Cannot be changed; a different address means applying again. |
+| Operator's own capacity | Joins like any member's. There are no static runners in a pool. |
+| Banned members | Not paid for the window they were banned in unless the operator switches them on in the batch. Money not paid stays in the payout wallet. |
+| Reinstatement | A runner suspended by tests becomes active again by itself after enough passes. |
+| Kafka | Required in every region; earnings arrive as events. |
 | Tests | One test per app, defined by the operator. A pass promotes a runner automatically, repeated failures suspend it automatically, and the operator can override. |
 | App versions | A new required version applies to new registrations at once; runners on the old one get a deadline, then are suspended. |
 | Reassigning | Running sessions finish before a machine switches app. |
 | Machines later | A member may request more machines (needs approval) and remove their own freely. |
-| Earnings pot | What the region's node redeemed, known from the node itself, not looked up on-chain. Each node redeems its own tickets. |
+| Earnings pot | What the region's node redeemed, known from the node itself, not looked up on-chain. Each node redeems its own tickets. A ticket counts in the round it was redeemed. |
 | Payout window | 7 rounds. |
 | Payout rule | Every member is paid `pot × (1 − commission) × member's fees ÷ all fees`. The commission is the orchestrator's and defaults to 15%. The operator's own machines are paid like anyone's if they join as a member. |
 | Minimum payout | None. Whatever was earned in a window is paid. |
 | Gas | Paid by the pool, from the payout wallet. |
 | Approval | A payout batch waits for the operator's approval by default; this can be set to automatic. |
 | Fee cut | The orchestrator keeps 100% of fees (no share to delegators), which is what makes the payout rule add up. |
-| Terms | Accepted by signing up. Members can be banned for any reason at any time; malicious use is an immediate ban. Editable in the admin site and versioned. |
+| Terms | Global terms for the whole pool, and optionally regional terms per region. Accepted by signing up. Members can be banned for any reason at any time; malicious use is an immediate ban. Editable in the admin site and versioned. |
 | Public data | Apps, prices, capacity, and a leaderboard ranked by earnings. A marketing site explains how to connect and sign up and carries the terms. |
-| Name and domains | Open Pool. `open-pool.com` marketing, `app.open-pool.com` members, `admin.open-pool.com` operator. |
+| Name and domains | Open Pool. Three separate UI apps: `open-pool.com` marketing, `app.open-pool.com` members, `admin.open-pool.com` operator. |
 | Storage | SQLite. |
 | Orchestrator control | Through the orchestrator's CLI port. |
 
 ## Terms used here
 
 - **Region:** one orchestrator node and its pool service.
-- **Member:** an approved applicant, identified by a wallet address, which is also where they are paid **(assumed)**.
+- **Member:** an approved applicant, identified by a wallet address, which is also where they are paid.
 - **Machine:** one box a member declared, with its GPUs.
 - **App:** a catalog entry the operator defined: what customers ask for, what it costs, how to run it and how to test it.
 - **Assignment:** the operator's decision that a machine runs an app, with a cap on concurrent sessions.
@@ -157,8 +161,8 @@ Deployment settings come from a config file or environment. Pool policy lives in
 | `settings` | pool policy |
 | `gpus` | supported GPU models: name, memory, whether still accepted |
 | `apps` | name, mode, price, required version and the previous one with its deadline, container definition, eligible GPUs, default and maximum capacity, test, discovery text, whether offered |
-| `terms` | each published version, its text and hash |
-| `applications` | address, display name, machines, terms version, signature, status, reason |
+| `terms` | each published version of the global terms and of this region's terms, its text and hash |
+| `applications` | address, display name, machines, global and regional terms versions, signature, status, reason |
 | `members` | address, display name, status (active, banned, left), reason |
 | `machines` | member, label, declared GPUs, GPUs the agent reported, status, last seen |
 | `assignments` | machine, app, capacity cap, status (active, draining, removed) |
@@ -278,7 +282,7 @@ Tests run through the orchestrator's probe: an unpaid session on one named runne
 | on probation | pass | active |
 | on probation | fail | stays on probation; retested |
 | active | 3 failures in a row | suspended |
-| suspended by a test | 3 passes in a row | active |
+| suspended by tests | 3 passes in a row | active |
 | any | operator sets a hold | automation leaves it alone until the hold is lifted |
 
 A runner is tested when it registers and then on the test interval. Every result is kept and shown to the member with its detail, so "why is my runner suspended" has an answer on the page.
@@ -300,9 +304,9 @@ payable        = pot × (1 − commission)
 member payment = payable × member's fees ÷ all fees in the window
 ```
 
-"All fees" includes fees earned by runners that are not pool members (the operator's static runners). Their share is not paid to anyone and stays with the pool **(assumed)**. Amounts round down to the wei.
+"All fees" are the fees of members' runners. A pool has no other runners: the operator's own machines join as a member. Should the orchestrator report fees for a runner that belongs to no member (a static runner left in its config), the admin site flags it and those fees are left out of the split. Amounts round down to the wei.
 
-A member banned during the window is listed and marked, and is not paid unless the operator switches them on. Money not paid stays in the payout wallet **(assumed)**.
+A member banned during the window is listed and marked, and is not paid unless the operator switches them on. Money not paid stays in the payout wallet.
 
 One property of this rule worth knowing: winning tickets are a lottery, so a window can have fees and a small pot, or the reverse. Members are paid from what was actually redeemed in the window, split by who earned fees in that same window.
 
@@ -327,9 +331,14 @@ Each region serves, without sign-in: its name, the apps it offers with prices an
 
 ### Terms
 
-The operator edits the terms on the admin site and publishes a version. An application records the version and hash in force and is covered by the applicant's wallet signature. The terms state that signing up is acceptance, that a member can be banned for any reason at any time, that malicious use is an immediate ban, and what the agent's access to the Docker socket means.
+There are two kinds, both edited on the admin site and published as versions:
 
-Terms and the supported GPU list apply to the whole pool but are stored per region, since regions are independent. The admin site publishes to every region at once and shows which regions are out of step, with a button to bring them level **(assumed)**.
+- **Global terms** apply to the whole pool. They state that signing up is acceptance, that a member can be banned for any reason at any time, that malicious use is an immediate ban, and what the agent's access to the Docker socket means.
+- **Regional terms** are optional and apply to one region, on top of the global ones.
+
+An application to a region records the global version and that region's version in force, with their hashes, and is covered by the applicant's wallet signature. A new version applies from the moment it is published; members are not asked to accept again, and their site shows that the terms changed **(assumed)**.
+
+Regions are independent, so the global terms are held as a copy in every region; regional terms are held only in theirs. The admin site publishes the global terms to every region at once and shows any region that is out of step, with a button to bring it level. The supported GPU list is kept level across regions the same way **(assumed)**.
 
 ### Emails
 
@@ -366,7 +375,7 @@ Per region, under `/v1`. JSON throughout. Errors are `{"error": "<text>"}` with 
 
 ## The web sites
 
-One TypeScript workspace in `pool/web` builds three sites from shared components and one shared data layer.
+Three separate UI apps, one per domain, in one TypeScript workspace in `pool/web`. They share components and one data layer and are built and deployed separately.
 
 | Site | Pages | Rendering |
 | --- | --- | --- |
@@ -374,7 +383,7 @@ One TypeScript workspace in `pool/web` builds three sites from shared components
 | `app.open-pool.com` | sign in; apply; application status; machines with install command; runners with test results; earnings; payouts | in the browser; not indexed |
 | `admin.open-pool.com` | sign in; overview with each region's health; applications; members; machines and assignments with the demand table; catalog (GPUs, apps, tests); runners; payout batches and wallet; terms; settings; audit log | in the browser; not indexed |
 
-All three are static files. Production needs no JavaScript server: the browser calls each region's API directly.
+Each app builds into plain files (HTML, JavaScript, CSS) that any web server or CDN can host. No server process of ours runs behind them: the app runs in the visitor's browser and calls each region's pool service directly **(assumed)**.
 
 **Regions.** The sites are configured with the list of regions and their API addresses. Every view that spans regions asks all of them at once with a time limit and shows what answered. A region that did not answer is named as unavailable, and the rest of the page works. Actions go to the region they concern.
 
@@ -416,15 +425,10 @@ A ticket the node gives up on is also marked redeemed in its database; the event
 
 These were not decided in conversation. Each is what the design above does unless changed.
 
-1. **Payout address is the sign-in wallet.** The applicant proves they hold it, and there is no separate address field.
-2. **Display name.** The applicant gives one at signup for the leaderboard.
-3. **Banned members are not paid** for the window they were banned in unless the operator switches them on in the batch, and unpaid money stays in the payout wallet.
-4. **Fees of runners that are not members** (the operator's static runners) count in "all fees" and their share stays with the pool.
-5. **The pot counts a ticket in the round it was redeemed**, not the round it was created.
-6. **A new registration for the same machine and app replaces the old runner.**
-7. **Reinstatement is automatic:** a runner suspended by tests becomes active again after three passes.
-8. **Numbers:** tests every 10 minutes, 3 failures to suspend, 24-hour version deadline, 12-hour sessions.
-9. **Terms and the GPU list are stored per region** and the admin site keeps the regions level.
-10. **Kafka is required in every region,** since earnings arrive as events.
-11. **Ordinary wallets only** for sign-in in this version.
-12. **The sites are static** and call the regions from the browser, so each region's API must be reachable from the internet over HTTPS.
+1. **Display name.** The applicant gives one at signup for the leaderboard.
+2. **A new registration for the same machine and app replaces the old runner.**
+3. **Numbers:** tests every 10 minutes, 3 failures to suspend, 3 passes to reinstate, 24-hour version deadline, 12-hour sessions.
+4. **Members are not asked to accept new terms again**; a new version applies when published.
+5. **Global terms and the GPU list are copied to every region** and the admin site keeps the regions level.
+6. **Ordinary wallets only** for sign-in in this version.
+7. **The three apps are served as plain files** and call the regions from the browser, so each region's API must be reachable from the internet over HTTPS.
