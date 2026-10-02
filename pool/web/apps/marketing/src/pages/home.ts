@@ -17,24 +17,39 @@ export const homePage: Route = {
         "@type": "Organization",
         name: site.name,
         url: `${site.url}/`,
-        logo: `${site.url}/favicon.svg`,
+        logo: `${site.url}/icon-512.png`,
         description: "A pool of GPU machines serving AI and video apps on the Livepeer network.",
       },
     ],
   }),
   template: () => html`
     <section class="hero">
-      <hgroup>
-        <h1>Put your GPU to work on Livepeer, and get paid in ETH</h1>
-        <p>
-          Open Pool is a pool of GPU machines that serve AI and video apps on the Livepeer network. You bring the machine. The pool
-          brings the customers, runs the orchestrator, and pays you for the work your machine does.
+      <div class="pitch">
+        <hgroup>
+          <p class="eyebrow">A GPU pool on the Livepeer network</p>
+          <h1>Put your GPU to work on Livepeer, and get paid in <span class="accent">ETH</span></h1>
+          <p>
+            Open Pool is a pool of GPU machines that serve AI and video apps on the Livepeer network. You bring the machine. The
+            pool brings the customers, runs the orchestrator, and pays you for the work your machine does.
+          </p>
+        </hgroup>
+        <p class="actions">
+          <a class="button primary large" href="/join/">Join the pool</a>
+          <a class="button large" href="/how-it-works/">See how it works</a>
         </p>
-      </hgroup>
-      <p class="actions">
-        <a class="button primary" href="/join/">Join the pool</a>
-        <a class="button" href="/how-it-works/">See how it works</a>
-      </p>
+      </div>
+      <figure class="terminal">
+        <figcaption>One command on each machine</figcaption>
+        <pre><code translate="no"><span class="prompt">$</span> docker run -d --restart unless-stopped \\
+    --gpus all \\
+    -v /var/run/docker.sock:/var/run/docker.sock \\
+    -e OPENPOOL_CREDENTIAL=<var>your machine's credential</var> \\
+    <var>the pool's agent</var> --pool <var>your region</var></code></pre>
+        <p>
+          The member site gives you this command filled in for your machine. The agent it starts pulls the app the pool assigns,
+          runs it, and connects it. <a href="/connect/">How connecting a machine works</a>
+        </p>
+      </figure>
     </section>
 
     <section aria-labelledby="split-heading">

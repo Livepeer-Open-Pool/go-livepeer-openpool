@@ -2,8 +2,9 @@ import { alice } from "../harness/seed.js"
 import { signInAs, signInAsOperator, sites, test } from "./fixtures.js"
 
 // Not a test of behavior: it saves pictures of the pages for a person to look at.
-// Run with OPENPOOL_SHOTS=<dir>.
+// Run with OPENPOOL_SHOTS=<dir>, and OPENPOOL_SHOTS_SCHEME=dark for the dark theme.
 const dir = process.env["OPENPOOL_SHOTS"]
+const colorScheme = process.env["OPENPOOL_SHOTS_SCHEME"] === "dark" ? "dark" : "light"
 
 test.describe("pictures of the sites", () => {
   test.skip(!dir, "set OPENPOOL_SHOTS to a directory to save pictures")
@@ -11,6 +12,7 @@ test.describe("pictures of the sites", () => {
   test("member pages", async ({ page, pool }) => {
     void pool
     await page.setViewportSize({ width: 1280, height: 900 })
+    await page.emulateMedia({ colorScheme })
     await page.goto(sites.member)
     await page.waitForTimeout(500)
     await page.screenshot({ path: `${dir}/member-signin.png`, fullPage: true })
@@ -31,6 +33,7 @@ test.describe("pictures of the sites", () => {
 
   test("admin pages", async ({ page, pool }) => {
     await page.setViewportSize({ width: 1280, height: 900 })
+    await page.emulateMedia({ colorScheme })
     await signInAsOperator(page, pool)
     await page.waitForTimeout(800)
     await page.screenshot({ path: `${dir}/admin-overview.png`, fullPage: true })
@@ -48,6 +51,7 @@ test.describe("pictures of the sites", () => {
   test("public pages", async ({ page, pool }) => {
     void pool
     await page.setViewportSize({ width: 1280, height: 900 })
+    await page.emulateMedia({ colorScheme })
     for (const [name, path] of [["home", "/"], ["how", "/how-it-works/"], ["connect", "/connect/"], ["apps", "/apps/"], ["leaderboard", "/leaderboard/"], ["terms", "/terms/"], ["join", "/join/"]] as const) {
       await page.goto(`${sites.marketing}${path}`)
       await page.waitForTimeout(1200)

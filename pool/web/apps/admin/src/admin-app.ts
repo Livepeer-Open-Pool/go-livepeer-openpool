@@ -8,6 +8,8 @@ import {
   base,
   controls,
   failureNotice,
+  lockup,
+  lockupStyles,
   primaryNav,
   Router,
   run,
@@ -41,9 +43,10 @@ export class AdminApp extends SignalWatcher(LitElement) {
     base,
     controls,
     surfaces,
+    lockupStyles,
     shell,
     css`
-      .signin { max-inline-size: 30rem; margin-inline: auto; }
+      .signin { max-inline-size: 30rem; }
     `,
   ]
 
@@ -84,22 +87,28 @@ export class AdminApp extends SignalWatcher(LitElement) {
     autoRun: false,
   })
 
+  /** The frame puts the banner down the side only for someone signed in. */
+  protected override updated(): void {
+    this.toggleAttribute("signed-in", sessionState.get()._tag === "SignedIn")
+  }
+
   override render() {
     const session = sessionState.get()
     return html`
       <a class="skip" href="#main" @click=${this.#skip}>Skip to main content</a>
       <header class="banner">
         <div class="bar">
-          <a class="brand" href="/">Open <span>Pool</span><small>admin</small></a>
-          ${session._tag === "SignedIn"
-            ? html`
-                ${primaryNav(nav, this.#router.path)}
-                <div class="who">
-                  <span>Signed in as ${session.session.subject}</span>
+          ${lockup("admin")}
+          ${session._tag === "SignedIn" ? primaryNav(nav, this.#router.path) : nothing}
+          <div class="who">
+            ${session._tag === "SignedIn"
+              ? html`
+                  <span>Signed in as <span class="subject">${session.session.subject}</span></span>
                   <button type="button" class="small" @click=${() => void this.#signOut.run()}>Sign out</button>
-                </div>
-              `
-            : nothing}
+                `
+              : nothing}
+            <op-theme></op-theme>
+          </div>
         </div>
       </header>
       <main id="main" tabindex="-1">${this.#main(session._tag)}</main>

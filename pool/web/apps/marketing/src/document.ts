@@ -1,5 +1,8 @@
 import { html } from "@lit-labs/ssr"
+import { headTags, type HeadTag } from "@openpool/ui/brand"
+import { lockup } from "@openpool/ui/lockup"
 import type { TemplateResult } from "lit"
+import { ifDefined } from "lit/directives/if-defined.js"
 import { unsafeHTML } from "lit/directives/unsafe-html.js"
 import type { Site } from "./site.js"
 
@@ -30,10 +33,19 @@ const safeJson = (data: unknown): string =>
 /**
  * A script element holding JSON. Template bindings are HTML-escaped even
  * inside <script>, which would corrupt the JSON, so the element is written
- * as raw HTML. It is safe because safeJson's output contains no "<". This is
- * the site's one use of unsafeHTML.
+ * as raw HTML. It is safe because safeJson's output contains no "<". This
+ * and the theme script below are the site's only uses of unsafeHTML.
  */
 const jsonLdScript = (data: object) => unsafeHTML(`<script type="application/ld+json">${safeJson(data)}</script>`)
+
+/** One of the head tags every Open Pool site shares: its icons, manifest, theme colors and theme script. */
+const brandTag = (tag: HeadTag) => {
+  const a = tag.attrs
+  // The theme script is the brand's own file, not anything a visitor or a region supplies.
+  if (tag.tag === "script") return unsafeHTML(`<script>${tag.children ?? ""}</script>`)
+  if (tag.tag === "meta") return html`<meta name=${a.name ?? ""} content=${a.content ?? ""} media=${ifDefined(a.media)}>`
+  return html`<link rel=${a.rel ?? ""} href=${a.href ?? ""} type=${ifDefined(a.type)} sizes=${ifDefined(a.sizes)}>`
+}
 
 const navigation = [
   { href: "/how-it-works/", label: "How it works" },
@@ -55,8 +67,7 @@ export const document = (site: Site, meta: PageMeta, assets: Assets, content: Te
     <title>${fullTitle}</title>
     <meta name="description" content=${meta.description}>
     ${meta.index ? html`<link rel="canonical" href=${canonical}>` : html`<meta name="robots" content="noindex">`}
-    <meta name="color-scheme" content="light dark">
-    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    ${headTags.map(brandTag)}
     <meta property="og:type" content="website">
     <meta property="og:site_name" content=${site.name}>
     <meta property="og:title" content=${meta.title}>
@@ -71,19 +82,22 @@ export const document = (site: Site, meta: PageMeta, assets: Assets, content: Te
     <a class="skip" href="#main">Skip to main content</a>
     <header class="banner">
       <div class="bar">
-        <a class="brand" href="/" translate="no">Open <span>Pool</span></a>
+        ${lockup()}
         <nav aria-label="Primary">
           <ul>
             ${navigation.map((item) => html`<li><a href=${item.href} aria-current=${meta.path === item.href ? "page" : "false"}>${item.label}</a></li>`)}
           </ul>
         </nav>
-        <a class="button primary join" href="/join/">Join the pool</a>
+        <div class="tools">
+          <op-theme></op-theme>
+          <a class="button primary" href="/join/">Join the pool</a>
+        </div>
       </div>
     </header>
     <main id="main">${content}</main>
     <footer class="site">
       <div class="bar">
-        <p translate="no"><strong>Open Pool</strong></p>
+        <p class="wordmark" translate="no">open-pool.com</p>
         <nav aria-label="Footer">
           <ul>
             ${navigation.map((item) => html`<li><a href=${item.href}>${item.label}</a></li>`)}

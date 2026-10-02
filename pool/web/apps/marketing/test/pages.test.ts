@@ -36,6 +36,20 @@ describe("every page", () => {
     expect(html).not.toContain('name="keywords"')
   })
 
+  it.each(pages)("$route.path names the logo's icons and the manifest, and sets the theme before it loads its styles", ({ html }) => {
+    const head = html.slice(html.indexOf("<head>"), html.indexOf("</head>"))
+    expect(head).toMatch(/<link rel="icon" href="\/favicon\.svg" type="image\/svg\+xml"/)
+    expect(head).toMatch(/<link rel="icon" href="\/favicon\.ico"/)
+    expect(head).toMatch(/<link rel="apple-touch-icon" href="\/apple-touch-icon\.png"/)
+    expect(head).toMatch(/<link rel="manifest" href="\/site\.webmanifest"/)
+    expect(all(head, /<meta name="(theme-color)"/g)).toHaveLength(2)
+    // The script is the brand's own, written out whole: a binding would have escaped it.
+    const script = head.indexOf("openPoolTheme")
+    expect(script).toBeGreaterThan(-1)
+    expect(head).not.toContain("=&gt;")
+    expect(script).toBeLessThan(head.indexOf('rel="stylesheet"'))
+  })
+
   it.each(pages)("$route.path carries structured data that parses and names real addresses", ({ html }) => {
     const blocks = all(html, /<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)
     expect(blocks.length).toBeGreaterThan(0)

@@ -1,8 +1,12 @@
-import { css } from "lit"
+import { css, unsafeCSS } from "lit"
+import lockupCss from "./lockup.css?inline"
 
 // Styles shared by the sites' components. Each component lists the ones it
 // uses in `static styles`; they are parsed once and shared by every instance.
 // All of them read the tokens of global.css, which inherit into shadow roots.
+
+/** The logo beside the site's name: the same rules the public site reads from global.css. */
+export const lockupStyles = unsafeCSS(lockupCss)
 
 /** What every shadow root starts from. */
 export const base = css`
@@ -10,10 +14,10 @@ export const base = css`
   * { margin: 0; }
   :host { display: block; color: var(--text); }
   [hidden] { display: none !important; }
-  h1, h2, h3, h4 { text-wrap: balance; line-height: 1.15; letter-spacing: -0.012em; }
-  h1 { font-size: var(--step-2); }
-  h2 { font-size: var(--step-1); }
-  h3 { font-size: var(--step-0); }
+  h1, h2, h3, h4 { font-family: var(--font-display); text-wrap: balance; line-height: 1.12; letter-spacing: -0.022em; }
+  h1 { font-size: var(--step-2); font-weight: 800; }
+  h2 { font-size: var(--step-1); font-weight: 700; }
+  h3 { font-size: var(--step-0); font-weight: 700; letter-spacing: -0.01em; }
   p, li, dd { text-wrap: pretty; }
   a { color: var(--brand); text-decoration-thickness: 0.08em; text-underline-offset: 0.18em; }
   a:hover { color: var(--brand-hover); }
@@ -37,21 +41,29 @@ export const controls = css`
   button, .button {
     display: inline-flex; align-items: center; justify-content: center; gap: var(--space-xs);
     min-block-size: 2.75rem; padding: 0.5rem 1rem;
-    border: 1px solid var(--border-strong); border-radius: var(--radius-s);
+    border: 1px solid var(--border-strong); border-radius: var(--radius-pill);
     background: var(--surface-raised); color: var(--text);
-    font: inherit; font-weight: 550; line-height: 1.2; text-decoration: none;
+    font: inherit; font-weight: 600; line-height: 1.2; text-decoration: none;
     cursor: pointer; touch-action: manipulation;
-    transition: background-color 0.15s ease-out, border-color 0.15s ease-out, color 0.15s ease-out;
+    transition: background-color 0.15s ease-out, border-color 0.15s ease-out, color 0.15s ease-out, box-shadow 0.15s ease-out;
   }
   button:hover, .button:hover { border-color: var(--brand); color: var(--brand); }
-  button.primary, .button.primary { background: var(--brand); border-color: var(--brand); color: var(--on-brand); }
-  button.primary:hover, .button.primary:hover { background: var(--brand-hover); border-color: var(--brand-hover); color: var(--on-brand); }
+  button.primary, .button.primary {
+    background: var(--brand); border-color: var(--brand); color: var(--on-brand);
+    font-family: var(--font-display); font-weight: 700;
+    box-shadow: 0 0 0 0 var(--glow), 0 0.6rem 1.6rem -0.7rem var(--glow);
+  }
+  button.primary:hover, .button.primary:hover {
+    background: var(--brand-hover); border-color: var(--brand-hover); color: var(--on-brand);
+    box-shadow: 0 0 0 0.3rem var(--glow), 0 0.6rem 1.6rem -0.7rem var(--glow);
+  }
+  button.primary:disabled { box-shadow: none; }
   button.danger { color: var(--bad); border-color: color-mix(in oklch, var(--bad) 45%, var(--surface)); }
   button.danger:hover { background: var(--bad-subtle); border-color: var(--bad); color: var(--bad); }
   button.quiet { border-color: transparent; background: transparent; color: var(--brand); padding-inline: 0.5rem; }
   button.quiet:hover { background: var(--brand-subtle); }
   button:disabled { opacity: 0.55; cursor: not-allowed; }
-  button.small { min-block-size: 2.25rem; padding: 0.3rem 0.7rem; font-size: var(--step--1); }
+  button.small { min-block-size: 2.25rem; padding: 0.3rem 0.85rem; font-size: var(--step--1); }
 
   label { display: grid; gap: var(--space-2xs); font-weight: 550; }
   label .hint, .hint { font-weight: 400; font-size: var(--step--1); color: var(--text-muted); }
@@ -59,8 +71,11 @@ export const controls = css`
   input, textarea, select {
     inline-size: 100%; min-block-size: 2.75rem; padding: 0.5rem 0.75rem;
     border: 1px solid var(--border-strong); border-radius: var(--radius-s);
-    background: var(--surface-raised); color: var(--text); font: inherit;
-    transition: border-color 0.15s;
+    background: light-dark(var(--surface-raised), var(--surface-sunken)); color: var(--text); font: inherit;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  input:focus-visible, textarea:focus-visible, select:focus-visible {
+    outline: none; border-color: var(--brand); box-shadow: 0 0 0 0.2rem var(--glow);
   }
   input[type="checkbox"], input[type="radio"] { inline-size: 1.15rem; min-block-size: 1.15rem; padding: 0; }
   textarea { field-sizing: content; min-block-size: 4lh; max-block-size: 24lh; resize: vertical; }
@@ -80,22 +95,28 @@ export const surfaces = css`
   }
   .cards { display: grid; gap: var(--space); grid-template-columns: repeat(auto-fit, minmax(min(17rem, 100%), 1fr)); }
   .notice {
-    border: 1px solid var(--border); border-inline-start: 4px solid var(--border-strong);
+    border: 1px solid var(--border-strong);
     border-radius: var(--radius-s); padding: var(--space-s) var(--space); background: var(--surface-raised);
   }
-  .notice.good { border-inline-start-color: var(--good); background: var(--good-subtle); }
-  .notice.warn { border-inline-start-color: var(--warn); background: var(--warn-subtle); }
-  .notice.bad { border-inline-start-color: var(--bad); background: var(--bad-subtle); }
+  .notice.good { border-color: color-mix(in oklch, var(--good) 45%, var(--surface)); background: var(--good-subtle); }
+  .notice.warn { border-color: color-mix(in oklch, var(--warn) 45%, var(--surface)); background: var(--warn-subtle); }
+  .notice.bad { border-color: color-mix(in oklch, var(--bad) 45%, var(--surface)); background: var(--bad-subtle); }
   .badge {
-    display: inline-block; padding: 0.1em 0.6em; border-radius: 999px;
+    display: inline-flex; align-items: center; gap: 0.45em; padding: 0.1em 0.7em; border-radius: var(--radius-pill);
     font-size: var(--step--1); font-weight: 600; line-height: 1.5; white-space: nowrap;
     background: var(--surface-sunken); color: var(--text-muted); border: 1px solid var(--border);
   }
+  /* A state that means something carries a light of its own color. */
+  .badge:is(.good, .warn, .bad)::before {
+    content: ""; inline-size: 0.5em; aspect-ratio: 1; border-radius: 50%; background: currentColor;
+  }
+  .badge.good::before { box-shadow: 0 0 0.6em currentColor; }
   .badge.good { background: var(--good-subtle); color: var(--good); border-color: color-mix(in oklch, var(--good) 35%, var(--surface)); }
   .badge.warn { background: var(--warn-subtle); color: var(--warn); border-color: color-mix(in oklch, var(--warn) 35%, var(--surface)); }
   .badge.bad { background: var(--bad-subtle); color: var(--bad); border-color: color-mix(in oklch, var(--bad) 35%, var(--surface)); }
   dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: var(--space-2xs) var(--space); }
   dl.facts dt { color: var(--text-muted); }
+  dl.facts dd { font-weight: 550; }
   dl.facts dd { min-inline-size: 0; overflow-wrap: anywhere; }
   .skeleton {
     --shine: color-mix(in oklch, var(--text) 7%, var(--surface));
@@ -116,10 +137,17 @@ export const tables = css`
   th, td { padding: var(--space-xs) var(--space-s); text-align: start; vertical-align: top; }
   th:first-child, td:first-child { padding-inline-start: var(--space); }
   th:last-child, td:last-child { padding-inline-end: var(--space); }
-  thead th { color: var(--text-muted); font-weight: 600; white-space: nowrap; border-block-end: 1px solid var(--border); }
+  thead th {
+    color: var(--text-muted); font-weight: 600; font-size: 0.86em; letter-spacing: 0.06em; text-transform: uppercase;
+    white-space: nowrap; border-block-end: 1px solid var(--border);
+  }
+  @media (hover: hover) {
+    tbody tr:hover > * { background: color-mix(in oklch, var(--brand) 5%, transparent); }
+  }
   tbody tr + tr > * { border-block-start: 1px solid var(--border); }
   tbody th { font-weight: 600; }
   td.num, th.num { text-align: end; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.num { font-family: var(--font-mono); font-size: 0.94em; }
   td.actions { white-space: nowrap; }
   td.actions > * + * { margin-inline-start: var(--space-2xs); }
   tfoot td, tfoot th { border-block-start: 1px solid var(--border-strong); font-weight: 650; }

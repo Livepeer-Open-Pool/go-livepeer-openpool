@@ -8,6 +8,8 @@ import {
   base,
   controls,
   failureNotice,
+  lockup,
+  lockupStyles,
   primaryNav,
   Router,
   run,
@@ -35,9 +37,9 @@ export class MemberApp extends SignalWatcher(LitElement) {
     base,
     controls,
     surfaces,
+    lockupStyles,
     shell,
     css`
-      .signin { max-inline-size: 38rem; margin-inline: auto; }
       .signin ol { padding-inline-start: 1.2rem; display: grid; gap: var(--space-xs); }
     `,
   ]
@@ -72,6 +74,11 @@ export class MemberApp extends SignalWatcher(LitElement) {
     args: () => [] as const,
   })
 
+  /** The frame puts the banner down the side only for someone signed in. */
+  protected override updated(): void {
+    this.toggleAttribute("signed-in", sessionState.get()._tag === "SignedIn")
+  }
+
   override render() {
     const state = sessionState.get()
     const marketing = this.#links.value?.marketing
@@ -79,16 +86,17 @@ export class MemberApp extends SignalWatcher(LitElement) {
       <a class="skip" href="#main" @click=${this.#skip}>Skip to main content</a>
       <header class="banner">
         <div class="bar">
-          <a class="brand" href="/">Open <span>Pool</span><small>members</small></a>
+          ${lockup("members")}
           ${state._tag === "SignedIn" ? primaryNav(nav, this.#router.path) : nothing}
-          ${state._tag === "SignedIn"
-            ? html`
-                <div class="who">
-                  <span>Signed in as ${shortAddress(state.session.subject)}</span>
+          <div class="who">
+            ${state._tag === "SignedIn"
+              ? html`
+                  <span>Signed in as <span class="subject">${shortAddress(state.session.subject)}</span></span>
                   <button type="button" class="small" @click=${() => void this.#signOut.run()}>Sign out</button>
-                </div>
-              `
-            : nothing}
+                `
+              : nothing}
+            <op-theme></op-theme>
+          </div>
         </div>
       </header>
       <main id="main" tabindex="-1">${this.#main(state._tag)}</main>

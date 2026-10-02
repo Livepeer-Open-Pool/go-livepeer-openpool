@@ -3,7 +3,15 @@
  * the design tokens, and base typography. Components carry their own styles
  * and read the tokens, which inherit into shadow roots.
  */
-@layer reset, tokens, base, layout, components, utilities;
+@layer reset, vendor, tokens, base, layout, components, utilities;
+
+/* Two variable typefaces, served by the site itself: Sora for headings and
+   the wordmark, Figtree for everything read at length. */
+@import "@fontsource-variable/sora/wght.css" layer(vendor);
+@import "@fontsource-variable/figtree/wght.css" layer(vendor);
+/* The logo's shape, and how the logo is drawn beside the site's name. */
+@import "./brand.css";
+@import "./lockup.css" layer(components);
 
 @layer reset {
   *, *::before, *::after { box-sizing: border-box; }
@@ -18,30 +26,41 @@
   :root {
     color-scheme: light dark;
 
-    /* One hue; every color below is derived from it. */
-    --hue: 172;
-    --brand: light-dark(oklch(48% 0.105 var(--hue)), oklch(76% 0.125 var(--hue)));
-    --brand-hover: oklch(from var(--brand) calc(l - 0.06) c h);
-    --on-brand: light-dark(oklch(99% 0.01 var(--hue)), oklch(18% 0.03 var(--hue)));
-    --brand-subtle: color-mix(in oklch, var(--brand) 11%, var(--surface));
+    /* Deep water: every neutral is tinted with one hue, and the accent is
+       the logo's cyan on dark, its blue on light. */
+    --hue: 264;
+    --brand: light-dark(oklch(49% 0.2 262), oklch(85% 0.125 210));
+    --brand-hover: light-dark(oklch(43% 0.2 262), oklch(91% 0.09 205));
+    --on-brand: light-dark(oklch(99% 0.01 var(--hue)), oklch(18% 0.05 var(--hue)));
+    --brand-subtle: color-mix(in oklch, var(--brand) 12%, var(--surface));
 
-    --surface: light-dark(oklch(98.6% 0.004 var(--hue)), oklch(17.5% 0.012 var(--hue)));
-    --surface-raised: light-dark(oklch(100% 0 0), oklch(21.5% 0.014 var(--hue)));
-    --surface-sunken: light-dark(oklch(96% 0.006 var(--hue)), oklch(14.5% 0.012 var(--hue)));
-    --text: light-dark(oklch(24% 0.02 var(--hue)), oklch(93% 0.012 var(--hue)));
-    --text-muted: color-mix(in oklch, var(--text) 66%, var(--surface));
-    --border: color-mix(in oklch, var(--text) 14%, var(--surface));
-    --border-strong: color-mix(in oklch, var(--text) 30%, var(--surface));
+    --surface: light-dark(oklch(97.8% 0.008 var(--hue)), oklch(15.5% 0.035 var(--hue)));
+    --surface-raised: light-dark(oklch(100% 0 0), oklch(20.5% 0.05 var(--hue)));
+    --surface-sunken: light-dark(oklch(95.2% 0.014 var(--hue)), oklch(12.5% 0.03 var(--hue)));
+    --text: light-dark(oklch(23% 0.065 var(--hue)), oklch(95.5% 0.02 var(--hue)));
+    --text-muted: color-mix(in oklch, var(--text) 68%, var(--surface));
+    --border: color-mix(in oklch, var(--text) 15%, var(--surface));
+    --border-strong: color-mix(in oklch, var(--text) 32%, var(--surface));
 
     /* Meaning, not decoration: each has a text tone and a tint to sit on. */
-    --good: light-dark(oklch(45% 0.12 150), oklch(80% 0.15 150));
-    --warn: light-dark(oklch(48% 0.11 75), oklch(83% 0.13 80));
-    --bad: light-dark(oklch(50% 0.18 27), oklch(76% 0.14 25));
+    --good: light-dark(oklch(45% 0.12 155), oklch(86% 0.15 162));
+    --warn: light-dark(oklch(48% 0.11 75), oklch(87% 0.12 85));
+    --bad: light-dark(oklch(50% 0.18 27), oklch(78% 0.14 22));
     --good-subtle: color-mix(in oklch, var(--good) 12%, var(--surface));
-    --warn-subtle: color-mix(in oklch, var(--warn) 14%, var(--surface));
-    --bad-subtle: color-mix(in oklch, var(--bad) 11%, var(--surface));
+    --warn-subtle: color-mix(in oklch, var(--warn) 13%, var(--surface));
+    --bad-subtle: color-mix(in oklch, var(--bad) 12%, var(--surface));
 
-    --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    /* The logo's gradient, the light it throws on dark ground, and the
+       rings drawn behind a page's opening. */
+    --mark-fill: linear-gradient(135deg in oklch,
+      light-dark(oklch(74% 0.14 215), oklch(89% 0.11 200)),
+      light-dark(oklch(53% 0.21 260), oklch(64% 0.19 258)) 55%,
+      light-dark(oklch(44% 0.24 283), oklch(50% 0.24 283)));
+    --glow: light-dark(oklch(49% 0.2 262 / 0.22), oklch(85% 0.125 210 / 0.38));
+    --ring: color-mix(in oklch, var(--brand) 20%, transparent);
+
+    --font: "Figtree Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Helvetica Neue", sans-serif;
+    --font-display: "Sora Variable", var(--font);
     --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
 
     /* Fluid space and type scales. */
@@ -51,16 +70,19 @@
     --space: clamp(1rem, 0.8rem + 0.8vw, 1.5rem);
     --space-l: clamp(1.5rem, 1.1rem + 1.8vw, 2.75rem);
     --space-xl: clamp(2.5rem, 1.6rem + 4vw, 5.5rem);
-    --step--1: clamp(0.83rem, 0.81rem + 0.1vw, 0.9rem);
+    --step--1: clamp(0.84rem, 0.82rem + 0.1vw, 0.91rem);
     --step-0: clamp(1rem, 0.96rem + 0.2vw, 1.1rem);
     --step-1: clamp(1.2rem, 1.1rem + 0.5vw, 1.45rem);
     --step-2: clamp(1.5rem, 1.3rem + 1vw, 2.1rem);
     --step-3: clamp(1.9rem, 1.5rem + 2vw, 3.1rem);
-    --step-4: clamp(2.3rem, 1.6rem + 3.6vw, 4.4rem);
+    --step-4: clamp(2.4rem, 1.5rem + 4.2vw, 4.6rem);
 
-    --radius: 12px;
-    --radius-s: 7px;
-    --shadow: 0 1px 2px oklch(20% 0.03 var(--hue) / 0.07), 0 8px 24px oklch(20% 0.03 var(--hue) / 0.08);
+    --radius: 16px;
+    --radius-s: 10px;
+    --radius-pill: 999px;
+    --shadow:
+      0 1px 2px light-dark(oklch(23% 0.065 var(--hue) / 0.06), oklch(5% 0.02 var(--hue) / 0.4)),
+      0 12px 32px light-dark(oklch(23% 0.065 var(--hue) / 0.08), oklch(5% 0.02 var(--hue) / 0.45));
     --measure: 68ch;
 
     accent-color: var(--brand);
@@ -83,7 +105,7 @@
     line-height: 1.55;
     -webkit-font-smoothing: antialiased;
   }
-  h1, h2, h3, h4 { text-wrap: balance; line-height: 1.15; letter-spacing: -0.012em; }
+  h1, h2, h3, h4 { font-family: var(--font-display); text-wrap: balance; line-height: 1.12; letter-spacing: -0.022em; }
   p, li, dd, figcaption { text-wrap: pretty; }
   a {
     color: var(--brand);

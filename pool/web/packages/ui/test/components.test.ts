@@ -1,7 +1,7 @@
 import { Option } from "effect"
 import { html } from "lit"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { type ConfirmRequest, type OpConfirm, type OpCopy } from "../src/index.js"
+import { type ConfirmRequest, type OpConfirm, type OpCopy, type OpTheme } from "../src/index.js"
 import "../src/index.js"
 import { cleanup, mount, settle, text } from "./kit.js"
 
@@ -19,6 +19,39 @@ describe("op-copy", () => {
     await settle(el)
     expect(written).toHaveBeenCalledWith("docker run -d agent")
     expect(text(button)).toBe("Copied")
+  })
+})
+
+describe("op-theme", () => {
+  afterEach(() => document.documentElement.removeAttribute("data-theme"))
+
+  it("starts by following the system, and each press moves to the next theme", async () => {
+    const el = await mount<OpTheme>(html`<op-theme></op-theme>`)
+    const button = el.shadowRoot?.querySelector("button")
+    expect(button?.getAttribute("aria-label")).toBe("Theme: following your system. Switch to light.")
+    expect(document.documentElement.hasAttribute("data-theme")).toBe(false)
+    button?.click()
+    await settle(el)
+    expect(document.documentElement.getAttribute("data-theme")).toBe("light")
+    expect(button?.getAttribute("aria-label")).toBe("Theme: light. Switch to dark.")
+    button?.click()
+    await settle(el)
+    expect(document.documentElement.getAttribute("data-theme")).toBe("dark")
+    button?.click()
+    await settle(el)
+    expect(document.documentElement.hasAttribute("data-theme")).toBe(false)
+  })
+
+  it("hands the choice to the page's theme script, which remembers it", async () => {
+    const set = vi.fn()
+    window.openPoolTheme = { get: () => "dark", set }
+    const el = await mount<OpTheme>(html`<op-theme></op-theme>`)
+    const button = el.shadowRoot?.querySelector("button")
+    expect(button?.getAttribute("aria-label")).toBe("Theme: dark. Switch to follow your system.")
+    button?.click()
+    await settle(el)
+    expect(set).toHaveBeenCalledWith("system")
+    delete window.openPoolTheme
   })
 })
 

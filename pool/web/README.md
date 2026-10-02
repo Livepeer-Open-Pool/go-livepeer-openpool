@@ -71,6 +71,15 @@ The first command builds `../cmd/openpool`, starts two pool services (ports 8091
 - **Decode once.** The pool service's JSON is decoded by the schemas in `packages/core/src/domain/model.ts` and nowhere else. Wei is `bigint`, times are `DateTime`, absent values are `Option`, a credential's secret is `Redacted`.
 - **The public site is files.** `apps/marketing/src/pages` are server-only Lit templates in light DOM, rendered by `scripts/prerender.ts` (and by the dev server, with the same code). The parts that show live data are custom elements defined only in the browser; in the file they hold a sentence saying what loads there.
 
+## The look, which every site shares
+
+Nothing about the look is written twice.
+
+- **The theme** is `packages/ui/src/global.css`: the colors, typefaces, spacing and type scale as tokens, each color given once as its light and its dark value. The public site imports it in its stylesheet, the members' and operator's sites in `main.ts`; the tokens inherit into every component's shadow root. Components are styled by `packages/ui/src/styles.ts` and the page frame by `shell.ts`, both of which read only tokens.
+- **Light and dark.** A site follows the system's theme until the visitor picks one with the switch in the banner (`op-theme`). The choice is kept by `packages/ui/brand/theme.js`, which is written into every page's head and runs before the first paint.
+- **The logo** is `packages/ui/brand/mark.svg`. `pnpm --filter @openpool/ui brand` draws from it the icons a browser or phone asks for and the mark's shape as a CSS mask; what it writes is committed. A page paints the mark by filling that shape with the theme's gradient (`lockup.css`), so the one shape serves both themes.
+- **Icons and manifest.** Each site's Vite config adds `brand()` from `@openpool/ui/brand`, which serves the favicon, the touch and home-screen icons and `site.webmanifest` from the site's root and writes them into its build. The same module lists the head tags that name them; the members' and operator's sites get them injected, and the public site's `document.ts` writes them itself.
+
 ## Where this departs from the skills it was built with
 
 - **Effect 3.22, not 4.** Effect 4.0 was released while this was written; the Effect skill is verified against 3.x and says to stay there until it is re-verified.
