@@ -121,12 +121,14 @@ export class Region {
     return this.#log
   }
 
-  /** The newest sign-in code the service wrote to its log in place of an email. */
-  latestCode(): string {
-    const codes = [...this.#log.matchAll(/sign-in code written to the log instead.*?code=(\d{6})/g)]
-    const last = codes.at(-1)?.[1]
-    if (!last) throw new Error(`the ${this.id} pool service has logged no sign-in code`)
-    return last
+  /** The sign-in codes the service wrote to its log in place of emails, oldest first. */
+  codes(): ReadonlyArray<string> {
+    return [...this.#log.matchAll(/sign-in code written to the log instead.*?code=(\d{6})/g)].map((match) => match[1] ?? "")
+  }
+
+  /** The code the service logs next, given how many it had logged before it was asked for one. */
+  async nextCode(before: number): Promise<string> {
+    return eventually(`${this.id} to log a sign-in code`, async () => this.codes()[before])
   }
 
   /** Calls the service's API and returns the decoded JSON answer. */

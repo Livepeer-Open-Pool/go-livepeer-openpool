@@ -40,16 +40,14 @@ Press Ctrl+C to stop.
 `)
 
 // Sign-in codes go to the services' logs; repeat them here as they appear.
-const seen = new Set<string>()
+const shown = new Map([pool.usEast, pool.euWest].map((region) => [region.id, region.codes().length]))
 const watch = setInterval(() => {
   for (const region of [pool.usEast, pool.euWest]) {
-    for (const match of region.log.matchAll(/sign-in code written to the log instead.*?code=(\d{6})/g)) {
-      const key = `${region.id}:${match.index}`
-      if (!seen.has(key)) {
-        seen.add(key)
-        if (seen.size > 2) console.log(`Sign-in code from ${region.name}: ${match[1]}`)
-      }
+    const codes = region.codes()
+    for (const code of codes.slice(shown.get(region.id) ?? 0)) {
+      console.log(`Sign-in code from ${region.name}: ${code}`)
     }
+    shown.set(region.id, codes.length)
   }
 }, 500)
 

@@ -141,9 +141,14 @@ func (s *Service) SetRunnerState(ctx context.Context, actor, runnerID, state, re
 		return orchError(err)
 	}
 	// The operator overrode the pool's own decision, so the pool stops
-	// deciding for this runner until the hold is lifted.
+	// deciding for this runner until the hold is lifted. The member reads
+	// the hold's reason, so it carries the operator's own words when given.
+	held := "state set to " + state + " by the operator"
+	if reason = strings.TrimSpace(reason); reason != "" {
+		held = reason
+	}
 	if _, err := s.db.ExecContext(ctx, `UPDATE runners SET hold = 1, hold_reason = ?, suspend_reason = '' WHERE runner_id = ? AND gone_at = 0`,
-		"state set to "+state+" by the operator", runnerID); err != nil {
+		held, runnerID); err != nil {
 		return err
 	}
 	return s.audit(ctx, s.db, actor, "runner.state", runnerID, strings.TrimSpace(state+" "+reason))

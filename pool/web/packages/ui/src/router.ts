@@ -135,3 +135,18 @@ export class Router implements ReactiveController {
     void this.#show(new URL(anchor.href))
   }
 }
+
+/**
+ * Goes to a path of this site from code, as a link click would: for after a
+ * form is saved. With the Navigation API the router sees it as any other
+ * navigation; without it, the router is told through popstate.
+ */
+export const navigate = (path: string): void => {
+  const url = new URL(path, location.origin)
+  if ("navigation" in window) {
+    ;(window.navigation as unknown as { navigate: (url: string) => unknown }).navigate(url.href)
+  } else {
+    history.pushState(null, "", url)
+    dispatchEvent(new PopStateEvent("popstate"))
+  }
+}

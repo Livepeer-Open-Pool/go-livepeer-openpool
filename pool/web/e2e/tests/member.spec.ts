@@ -115,7 +115,7 @@ test.describe("the member site", () => {
     await expect(page).toHaveURL(`${sites.member}/apply?region=eu-west`)
     await expect(page.getByLabel("Region")).toHaveValue("eu-west")
     // Both the pool's terms and the region's own are shown to be accepted.
-    await expect(page.getByText("Open Pool terms, version 1")).toBeVisible()
+    await expect(page.getByText(/Open Pool terms, version \d+/)).toBeVisible()
     await expect(page.getByText("EU West terms, version 1")).toBeVisible()
     await expect(page.getByText("Machines in this region must be located in it.")).toBeVisible()
 

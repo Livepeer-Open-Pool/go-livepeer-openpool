@@ -140,7 +140,7 @@ func TestOperatorsHoldStopsThePoolDecidingForARunner(t *testing.T) {
 	runners, err := f.svc.Runners(f.ctx, "")
 	require.NoError(t, err)
 	require.True(t, runners[0].Hold)
-	require.Equal(t, "state set to suspended by the operator", runners[0].HoldReason)
+	require.Equal(t, "investigating", runners[0].HoldReason, "the member reads the operator's own reason")
 
 	// Lifting the hold hands it back: three passes later it is active.
 	require.NoError(t, f.svc.SetRunnerHold(f.ctx, operator, "runner_a", false, ""))

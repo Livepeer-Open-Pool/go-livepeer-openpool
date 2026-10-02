@@ -5,14 +5,28 @@ import { ADMIN_EMAIL, eventually, type Region } from "./region.js"
 export const alice = privateKeyToAccount("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
 export const bob = privateKeyToAccount("0x59c6995e998f97a5a0044966f0945389dc9d86dae88c7a8412f4603b6b78690d")
 export const carol = privateKeyToAccount("0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a")
+export const dave = privateKeyToAccount("0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6")
+export const erin = privateKeyToAccount("0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a")
 
 const image = (name: string, fill: string): string => `${name}@sha256:${fill.repeat(32)}`
 
-/** Signs the operator in at a region, reading the code from the service's log. */
-export const adminToken = async (region: Region): Promise<string> => {
+/** A session as the pool service returns it and the sites store it. */
+export interface StoredSession {
+  readonly token: string
+  readonly role: string
+  readonly subject: string
+  readonly expires_at: string
+}
+
+/**
+ * Signs the operator in at a region, reading the code from the service's
+ * log. The session is good in every region. A region sends one code a
+ * minute, so this is done once and the session reused.
+ */
+export const adminSession = async (region: Region): Promise<StoredSession> => {
+  const before = region.codes().length
   await region.call("POST", "/auth/admin/code", undefined, { email: ADMIN_EMAIL })
-  const session = await region.call<{ token: string }>("POST", "/auth/admin/verify", undefined, { email: ADMIN_EMAIL, code: region.latestCode() })
-  return session.token
+  return region.call<StoredSession>("POST", "/auth/admin/verify", undefined, { email: ADMIN_EMAIL, code: await region.nextCode(before) })
 }
 
 /** Signs a wallet in at a region, as the member site does. */
@@ -80,8 +94,7 @@ export const apply = async (region: Region, account: PrivateKeyAccount, host: st
  * machine is connected and earning, an applicant waiting, a closed payout
  * window waiting for approval and an open one with earnings in it.
  */
-export const seedRegion = async (region: Region, host: string, options: { regionalTerms: boolean; aliceFeeWei: string }) => {
-  const admin = await adminToken(region)
+export const seedRegion = async (region: Region, host: string, admin: string, options: { regionalTerms: boolean; aliceFeeWei: string }) => {
   const catalog = await seedCatalog(region, admin, options.regionalTerms)
 
   // Alice is approved, with her machine assigned the chat app, and connects it.

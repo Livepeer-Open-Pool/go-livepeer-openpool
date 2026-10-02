@@ -36,16 +36,14 @@ export const signInAs = async (page: Page, account: PrivateKeyAccount): Promise<
   await expect(page.getByText("Signed in as")).toBeVisible()
 }
 
-/** Opens the admin site signed in as the operator, with the code read from the region's log. */
+/**
+ * Opens the admin site signed in as the operator. A region emails one code
+ * a minute, so the tests share one session, put where the site keeps it;
+ * the sign-in itself has its own test.
+ */
 export const signInAsOperator = async (page: Page, pool: Pool): Promise<void> => {
+  await page.addInitScript((session) => localStorage.setItem("openpool.session.admin", JSON.stringify(session)), pool.operator)
   await page.goto(sites.admin)
-  await page.getByLabel("Email").fill(ADMIN_EMAIL)
-  await page.getByRole("button", { name: "Email me a code" }).click()
-  await expect(page.getByLabel("Code")).toBeVisible()
-  const region = [pool.usEast, pool.euWest].find((r) => page.url() !== "" && r.log.includes("sign-in code written")) ?? pool.usEast
-  await expect.poll(() => { try { return region.latestCode() } catch { return "" } }).toMatch(/^\d{6}$/)
-  await page.getByLabel("Code").fill(region.latestCode())
-  await page.getByRole("button", { name: "Sign in" }).click()
   await expect(page.getByText(`Signed in as ${ADMIN_EMAIL}`)).toBeVisible()
 }
 
