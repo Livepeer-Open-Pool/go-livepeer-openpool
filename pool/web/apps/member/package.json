@@ -1,0 +1,24 @@
+{
+  "name": "@openpool/member",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@lit-labs/signals": "0.3.0",
+    "@lit/context": "^1.1.6",
+    "@lit/task": "^1.0.3",
+    "@openpool/core": "workspace:*",
+    "@openpool/ui": "workspace:*",
+    "effect": "3.22.2",
+    "lit": "^3.3.3"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.3",
+    "vite": "^7.3.6"
+  }
+}

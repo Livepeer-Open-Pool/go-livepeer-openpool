@@ -1,0 +1,16 @@
+# livepeer_runner_tunnel alone, for machines that only connect an app to an
+# orchestrator: a pool member's machine runs this image beside each app.
+# Build from the repository root:
+#
+#   docker build -f docker/Dockerfile.runner-tunnel -t tztcloud/livepeer-runner-tunnel:<version> .
+FROM	golang:1.27 AS build
+WORKDIR	/src
+COPY	go.mod go.sum ./
+COPY	cmd/livepeer_runner_tunnel ./cmd/livepeer_runner_tunnel
+COPY	ai/runner/tunnelclient ./ai/runner/tunnelclient
+COPY	ai/runner/tunnelconn ./ai/runner/tunnelconn
+RUN	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/livepeer_runner_tunnel ./cmd/livepeer_runner_tunnel
+
+FROM	gcr.io/distroless/static-debian12
+COPY --from=build	/out/livepeer_runner_tunnel /usr/local/bin/livepeer_runner_tunnel
+ENTRYPOINT	["/usr/local/bin/livepeer_runner_tunnel"]

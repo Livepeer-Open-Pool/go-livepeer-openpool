@@ -61,6 +61,10 @@ func NewLivepeerConfig(fs *flag.FlagSet) LivepeerConfig {
 	cfg.UseLiveRunners = fs.Bool("useLiveRunners", *cfg.UseLiveRunners, "Set to true to use LiveRunner-backed runners for supported pipelines")
 	cfg.LiveRunnerConfig = fs.String("liveRunnerConfig", *cfg.LiveRunnerConfig, "Path to JSON config file for static LiveRunner registration")
 	cfg.LiveRunnerProxyURL = fs.String("liveRunnerProxyUrl", *cfg.LiveRunnerProxyURL, "Public LiveRunner proxy URL template. Must contain exactly one {proxy} placeholder, e.g. https://{proxy}.example.com or https://example.com/run/{proxy}")
+	cfg.LiveRunnerAuthWebhookURL = fs.String("liveRunnerAuthWebhookUrl", *cfg.LiveRunnerAuthWebhookURL, "Pool mode: URL of the pool service's admission webhook. When set, every dynamic LiveRunner registration is decided by the webhook, -orchSecret registers no LiveRunner, and runners must register with a tunnel")
+	cfg.LiveRunnerAuthTimeout = fs.Duration("liveRunnerAuthWebhookTimeout", *cfg.LiveRunnerAuthTimeout, "Maximum time to wait for the LiveRunner admission webhook; a registration is refused when it does not answer")
+	cfg.LiveRunnerPrices = fs.String("liveRunnerPrices", *cfg.LiveRunnerPrices, "Path to a JSON file with the operator's LiveRunner price per app, {\"apps\":{\"<app>\":{\"price\":\"0.50\",\"currency\":\"usd\",\"unit\":\"hour\"}}}. A runner of a listed app is priced from the file whatever it asks for; in pool mode a runner may only register a listed app")
+	cfg.LiveRunnerPoolSecret = fs.String("liveRunnerPoolSecret", *cfg.LiveRunnerPoolSecret, "Secret shared with the pool service, or the path of a file holding it. Sent as a bearer token on admission webhook calls, and accepted in the Livepeer-Probe-Secret header for the pool service's unpaid probe sessions")
 	cfg.AIModels = fs.String("aiModels", *cfg.AIModels, "Set models (pipeline:model_id) for AI worker to load upon initialization")
 	cfg.AIModelsDir = fs.String("aiModelsDir", *cfg.AIModelsDir, "Set directory where AI model weights are stored")
 	cfg.AIRunnerImage = fs.String("aiRunnerImage", *cfg.AIRunnerImage, "[Deprecated] Specify the base Docker image for the AI runner. Example: livepeer/ai-runner:0.0.1. Use -aiRunnerImageOverrides instead.")
@@ -157,6 +161,9 @@ func NewLivepeerConfig(fs *flag.FlagSet) LivepeerConfig {
 	cfg.KafkaUsername = fs.String("kafkaUser", *cfg.KafkaUsername, "Kafka Username")
 	cfg.KafkaPassword = fs.String("kafkaPassword", *cfg.KafkaPassword, "Kafka Password")
 	cfg.KafkaGatewayTopic = fs.String("kafkaGatewayTopic", *cfg.KafkaGatewayTopic, "Kafka Topic used to send gateway logs")
+	cfg.KafkaOrchTopic = fs.String("kafkaOrchestratorTopic", *cfg.KafkaOrchTopic, "Kafka Topic used to send orchestrator events: LiveRunner registrations, state changes, sessions and every fee debited (requires -monitor)")
+	cfg.KafkaRequireDelivery = fs.Bool("kafkaRequireDelivery", *cfg.KafkaRequireDelivery, "Refuse to sign remote payments when the Kafka event queue cannot accept the accounting event (requires -monitor and Kafka)")
+	cfg.KafkaEnqueueTimeout = fs.Duration("kafkaEnqueueTimeout", *cfg.KafkaEnqueueTimeout, "Maximum time to wait for space in the Kafka event queue when -kafkaRequireDelivery is set (default 2s)")
 
 	return cfg
 }

@@ -1,0 +1,24 @@
+# For trying the wiring on one machine with no chain: the orchestrator runs
+# off-chain and the pool service has no payout wallet.
+services:
+  orchestrator:
+    command:
+      - -orchestrator
+      - -useLiveRunners
+      - -network=offchain
+      - -dataDir=/data
+      - -orchSecret=/run/secrets/orch_secret
+      - -serviceAddr=${ORCH_HOST}:${ORCH_PUBLIC_PORT:-443}
+      - -liveRunnerAddr=https://${ORCH_HOST}:${ORCH_PUBLIC_PORT:-443}
+      - -httpAddr=0.0.0.0:8935
+      - -cliAddr=${ORCH_INNER_IP:-172.31.250.10}:7935
+      - -liveRunnerAuthWebhookUrl=http://openpool:8090/v1/orchestrator/admit
+      - -liveRunnerPoolSecret=/run/secrets/pool_secret
+      - -monitor
+      - -kafkaBootstrapServers=redpanda:9092
+      - -kafkaOrchestratorTopic=${KAFKA_TOPIC}
+      - -v=4
+  openpool:
+    environment:
+      OPENPOOL_ETH_RPC_URL: ""
+      OPENPOOL_PAYOUT_KEYSTORE: ""

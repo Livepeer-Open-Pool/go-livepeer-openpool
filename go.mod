@@ -20,6 +20,7 @@ require (
 	github.com/golang/mock v1.6.0
 	github.com/golang/protobuf v1.5.4
 	github.com/gorilla/websocket v1.5.3
+	github.com/hashicorp/yamux v0.1.2
 	github.com/jaypipes/ghw v0.25.0
 	github.com/jaypipes/pcidb v1.1.1
 	github.com/livepeer/go-tools v0.3.6-0.20260826170350-a5f4061b169f

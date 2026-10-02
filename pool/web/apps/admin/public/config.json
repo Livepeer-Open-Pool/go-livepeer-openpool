@@ -1,0 +1,12 @@
+{
+  "regions": [
+    { "id": "us-east", "name": "US East", "api": "http://127.0.0.1:8091" },
+    { "id": "eu-west", "name": "EU West", "api": "http://127.0.0.1:8092" }
+  ],
+  "sites": {
+    "marketing": "http://localhost:5173",
+    "member": "http://localhost:5174",
+    "admin": "http://localhost:5175"
+  },
+  "explorer": "https://arbiscan.io"
+}

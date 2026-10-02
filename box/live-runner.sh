@@ -17,6 +17,8 @@ ORCH_ARGS=(
   -useLiveRunners
   -orchSecret "$ORCH_SECRET"
   -serviceAddr 127.0.0.1:8935
+  # Bound on every interface so containers on a bridge can reach the tunnel route.
+  -httpAddr 0.0.0.0:8935
   -liveRunnerAddr "$ORCH_URL"
   -cliAddr 127.0.0.1:7935
   -network offchain
@@ -71,8 +73,37 @@ case "$1" in
           "$CACHE_DIR/echo-client.py" - --mode blur --discovery "$ORCH_URL/discovery" --output - \
       | "$FFPLAY" -fflags nobuffer -flags low_delay -framedrop -i -
     ;;
+  tunnel-app)
+    # An app the orchestrator is never given an address for: it publishes a
+    # port on the orchestrator host's loopback only, and the tunnel command
+    # beside it is what registers (runner_url becomes tunnel://<runner_id>).
+    # Host networking rather than a bridge because rootless Docker has no
+    # route from a bridge back to the host.
+    docker rm -f box-tunnel-app box-tunnel-runner >/dev/null 2>&1 || true
+    docker run -d --rm --name box-tunnel-app -p 127.0.0.1:18989:8080 mendhak/http-https-echo:latest >/dev/null
+    TUNNEL_ARGS=(
+      -orchestrator "$ORCH_URL" -orchSecret "$ORCH_SECRET"
+      -app box/echo -mode single-shot -capacity 4
+      -target http://127.0.0.1:18989 -health /
+      -metadata '{"box":1}'
+    )
+    if [ "$DOCKER" = "true" ]; then
+      docker run --rm --name box-tunnel-runner --network host \
+        --entrypoint livepeer_runner_tunnel livepeer/go-livepeer "${TUNNEL_ARGS[@]}"
+    else
+      ./livepeer_runner_tunnel "${TUNNEL_ARGS[@]}"
+    fi
+    ;;
+  tunnel-call)
+    wait_for_runner
+    discover | jq '.[].runners[] | {app, mode, url}'
+    curl -sk -X POST "$URL/hello" -H 'Content-Type: application/json' -d '{"name":"box"}' | jq '{path, method, json}'
+    ;;
+  tunnel-stop)
+    docker rm -f box-tunnel-app box-tunnel-runner >/dev/null 2>&1 || true
+    ;;
   *)
-    echo "Usage: $0 {orchestrator|app|call|echo}"
+    echo "Usage: $0 {orchestrator|app|call|echo|tunnel-app|tunnel-call|tunnel-stop}"
     exit 1
     ;;
 esac

@@ -1,0 +1,28 @@
+# The member agent: openpool-agent with the Docker CLI and its compose plugin.
+# Build from the pool directory:
+#
+#   docker build -f docker/Dockerfile.agent --build-arg VERSION=0.1.0 -t tztcloud/openpool-agent:0.1.0 .
+#
+# The base has glibc so that nvidia-smi, which the NVIDIA container runtime
+# mounts into a container started with --gpus all, runs inside it.
+FROM golang:1.27 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+COPY cmd/openpool-agent ./cmd/openpool-agent
+COPY internal/agent ./internal/agent
+COPY internal/compose ./internal/compose
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -trimpath \
+	-ldflags "-s -w -X github.com/Livepeer-Open-Pool/pool/internal/agent.Version=${VERSION}" \
+	-o /out/openpool-agent ./cmd/openpool-agent
+
+FROM docker:29-cli AS docker
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends ca-certificates \
+	&& rm -rf /var/lib/apt/lists/*
+COPY --from=docker /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=docker /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
+COPY --from=build /out/openpool-agent /usr/local/bin/openpool-agent
+ENTRYPOINT ["/usr/local/bin/openpool-agent"]

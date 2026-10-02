@@ -103,6 +103,10 @@ type LivepeerConfig struct {
 	UseLiveRunners             *bool
 	LiveRunnerConfig           *string
 	LiveRunnerProxyURL         *string
+	LiveRunnerAuthWebhookURL   *string
+	LiveRunnerAuthTimeout      *time.Duration
+	LiveRunnerPoolSecret       *string
+	LiveRunnerPrices           *string
 	Gateway                    *bool
 	Broadcaster                *bool
 	OrchSecret                 *string
@@ -192,6 +196,9 @@ type LivepeerConfig struct {
 	KafkaUsername              *string
 	KafkaPassword              *string
 	KafkaGatewayTopic          *string
+	KafkaOrchTopic             *string
+	KafkaRequireDelivery       *bool
+	KafkaEnqueueTimeout        *time.Duration
 	MediaMTXApiPassword        *string
 	LiveAIAuthApiKey           *string
 	LiveAIHeartbeatURL         *string
@@ -249,6 +256,10 @@ func DefaultLivepeerConfig() LivepeerConfig {
 	defaultUseLiveRunners := false
 	defaultLiveRunnerConfig := ""
 	defaultLiveRunnerProxyURL := ""
+	defaultLiveRunnerAuthWebhookURL := ""
+	defaultLiveRunnerAuthTimeout := 5 * time.Second
+	defaultLiveRunnerPoolSecret := ""
+	defaultLiveRunnerPrices := ""
 	defaultAIModels := ""
 	defaultAIModelsDir := ""
 	defaultAIRunnerImage := "livepeer/ai-runner:latest"
@@ -336,6 +347,9 @@ func DefaultLivepeerConfig() LivepeerConfig {
 	defaultKafkaUsername := ""
 	defaultKafkaPassword := ""
 	defaultKafkaGatewayTopic := ""
+	defaultKafkaOrchTopic := ""
+	defaultKafkaRequireDelivery := false
+	defaultKafkaEnqueueTimeout := 2 * time.Second
 
 	return LivepeerConfig{
 		// Network & Addresses:
@@ -381,6 +395,10 @@ func DefaultLivepeerConfig() LivepeerConfig {
 		UseLiveRunners:           &defaultUseLiveRunners,
 		LiveRunnerConfig:         &defaultLiveRunnerConfig,
 		LiveRunnerProxyURL:       &defaultLiveRunnerProxyURL,
+		LiveRunnerAuthWebhookURL: &defaultLiveRunnerAuthWebhookURL,
+		LiveRunnerAuthTimeout:    &defaultLiveRunnerAuthTimeout,
+		LiveRunnerPoolSecret:     &defaultLiveRunnerPoolSecret,
+		LiveRunnerPrices:         &defaultLiveRunnerPrices,
 		AIModels:                 &defaultAIModels,
 		AIModelsDir:              &defaultAIModelsDir,
 		AIRunnerImage:            &defaultAIRunnerImage,
@@ -470,6 +488,9 @@ func DefaultLivepeerConfig() LivepeerConfig {
 		KafkaUsername:         &defaultKafkaUsername,
 		KafkaPassword:         &defaultKafkaPassword,
 		KafkaGatewayTopic:     &defaultKafkaGatewayTopic,
+		KafkaOrchTopic:        &defaultKafkaOrchTopic,
+		KafkaRequireDelivery:  &defaultKafkaRequireDelivery,
+		KafkaEnqueueTimeout:   &defaultKafkaEnqueueTimeout,
 	}
 }
 
@@ -485,6 +506,7 @@ func (cfg LivepeerConfig) PrintConfig(w io.Writer) {
 	sensitiveFields := map[string]bool{
 		"EthPassword":                true,
 		"OrchSecret":                 true,
+		"LiveRunnerPoolSecret":       true,
 		"KafkaPassword":              true,
 		"MediaMTXApiPassword":        true,
 		"LiveAIAuthApiKey":           true,
@@ -792,6 +814,16 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 		if err := startKafkaProducer(cfg); err != nil {
 			exit("Error while starting Kafka producer", err)
 		}
+	}
+	if *cfg.KafkaRequireDelivery {
+		if !*cfg.Monitor || *cfg.KafkaBootstrapServers == "" || (*cfg.KafkaGatewayTopic == "" && *cfg.KafkaOrchTopic == "") {
+			exit("-kafkaRequireDelivery requires -monitor, -kafkaBootstrapServers and -kafkaGatewayTopic or -kafkaOrchestratorTopic")
+		}
+		if *cfg.KafkaEnqueueTimeout <= 0 {
+			exit("-kafkaEnqueueTimeout must be positive, got %v", *cfg.KafkaEnqueueTimeout)
+		}
+		n.KafkaRequireDelivery = true
+		n.KafkaEnqueueTimeout = *cfg.KafkaEnqueueTimeout
 	}
 
 	watcherErr := make(chan error)
@@ -2055,20 +2087,71 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 		orch := core.NewOrchestrator(s.LivepeerNode, timeWatcher)
 
 		if *cfg.UseLiveRunners || *cfg.LiveRunnerConfig != "" {
-			if n.OrchSecret == "" && *cfg.LiveRunnerConfig == "" {
-				glog.Exit("running with -useLiveRunners requires -orchSecret")
+			// Pool mode: the admission webhook, not -orchSecret, decides who registers.
+			poolSecret := ""
+			if *cfg.LiveRunnerPoolSecret != "" {
+				poolSecret, _ = common.ReadFromFile(*cfg.LiveRunnerPoolSecret)
+			}
+			n.LiveRunnerPoolSecret = poolSecret
+			var admitter runner.LiveRunnerAdmitter
+			if *cfg.LiveRunnerAuthWebhookURL != "" {
+				webhook, err := runner.NewLiveRunnerWebhookAdmitter(*cfg.LiveRunnerAuthWebhookURL, poolSecret, *cfg.LiveRunnerAuthTimeout)
+				if err != nil {
+					glog.Exitf("invalid -liveRunnerAuthWebhookUrl: %v", err)
+				}
+				if poolSecret == "" {
+					glog.Warning("No -liveRunnerPoolSecret configured; the LiveRunner admission webhook cannot tell this orchestrator from any other caller")
+				}
+				admitter = webhook
+				glog.Info("LiveRunner pool mode: registrations are decided by ", *cfg.LiveRunnerAuthWebhookURL)
+			}
+			if n.OrchSecret == "" && *cfg.LiveRunnerConfig == "" && admitter == nil {
+				glog.Exit("running with -useLiveRunners requires -orchSecret or -liveRunnerAuthWebhookUrl")
+			}
+			var liveRunnerPrices runner.LiveRunnerPriceTable
+			if *cfg.LiveRunnerPrices != "" {
+				pricesJSON, err := os.ReadFile(*cfg.LiveRunnerPrices)
+				if err != nil {
+					glog.Exitf("error reading -liveRunnerPrices: %v", err)
+				}
+				if liveRunnerPrices, err = runner.ParseLiveRunnerPrices(pricesJSON); err != nil {
+					glog.Exitf("invalid -liveRunnerPrices: %v", err)
+				}
+				glog.Infof("Loaded LiveRunner prices for %d apps from %s", len(liveRunnerPrices.Apps), *cfg.LiveRunnerPrices)
+			} else if admitter != nil {
+				glog.Warning("LiveRunner pool mode without -liveRunnerPrices: no app is offered, so every registration is refused until prices are set")
 			}
 			if cfg.LiveRunnerProxyURL != nil && *cfg.LiveRunnerProxyURL != "" {
 				if err := runner.ValidateProxyURLTemplate(*cfg.LiveRunnerProxyURL, orch.ServiceURI()); err != nil {
 					glog.Exitf("invalid -liveRunnerProxyUrl: %v", err)
 				}
 			}
+			var liveRunnerEvents runner.LiveRunnerEventSink
+			if lpmon.OrchestratorEventsEnabled() {
+				liveRunnerEvents = lpmon.SendOrchestratorEvent
+			} else if admitter != nil {
+				glog.Warning("LiveRunner pool mode without orchestrator events: set -monitor, -kafkaBootstrapServers and -kafkaOrchestratorTopic to record what each member's runners earn")
+			}
 			n.LiveRunnerManager = runner.NewLiveRunnerRegistry(runner.LiveRunnerRegistryConfig{
 				Host:             liveRunnerHost{RunnerHost: orch, LivepeerNode: n},
 				Onchain:          *cfg.Network != "offchain",
 				ProxyURLTemplate: *cfg.LiveRunnerProxyURL,
+				Admitter:         admitter,
+				OrchAddress:      liveRunnerOrchAddress(orch.Address()),
+				Prices:           liveRunnerPrices,
+				Events:           liveRunnerEvents,
+				Round: func() int64 {
+					// Off-chain there is no time watcher and no round.
+					if timeWatcher == nil {
+						return 0
+					}
+					if round := timeWatcher.LastInitializedRound(); round != nil {
+						return round.Int64()
+					}
+					return 0
+				},
 			})
-			if n.OrchSecret == "" {
+			if n.OrchSecret == "" && admitter == nil {
 				glog.Warning("No -orchSecret configured; dynamic LiveRunner heartbeat registration is disabled")
 			}
 			if *cfg.LiveRunnerConfig != "" {
@@ -2665,6 +2748,15 @@ func (h liveRunnerHost) LiveRunnerURI() *url.URL {
 		return &v
 	}
 	return h.RunnerHost.ServiceURI()
+}
+
+// liveRunnerOrchAddress is the address pool events and the admission webhook
+// identify this orchestrator by; an off-chain orchestrator has none.
+func liveRunnerOrchAddress(addr ethcommon.Address) string {
+	if addr == (ethcommon.Address{}) {
+		return ""
+	}
+	return addr.Hex()
 }
 
 func parseLiveRunnerAddr(addr string) (*url.URL, error) {

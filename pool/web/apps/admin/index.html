@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Open Pool admin</title>
+    <meta name="description" content="The operator's site for Open Pool: applications, members, machines, the catalog, runners and payouts, across every region." />
+    <!-- The operator's site: nothing here is for a search engine. -->
+    <meta name="robots" content="noindex" />
+    <!-- The icons, the manifest and the theme script are added by the brand plugin, the same for every site. -->
+    <style>
+      admin-app:not(:defined) { visibility: hidden; }
+    </style>
+  </head>
+  <body>
+    <admin-app></admin-app>
+    <noscript>
+      <main>
+        <h1>Open Pool admin</h1>
+        <p>This site needs JavaScript: it runs in your browser and talks to the pool's regions directly.</p>
+      </main>
+    </noscript>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

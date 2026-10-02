@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Open Pool members</title>
+    <meta name="description" content="Sign in with your wallet to apply to Open Pool, connect your machines, and follow your runners, earnings and payouts." />
+    <!-- Everything here is behind a sign-in: there is nothing for a search engine to index. -->
+    <meta name="robots" content="noindex" />
+    <!-- The icons, the manifest and the theme script are added by the brand plugin, the same for every site. -->
+    <style>
+      /* Hides the app only until its own code has defined it. */
+      member-app:not(:defined) { visibility: hidden; }
+    </style>
+  </head>
+  <body>
+    <member-app></member-app>
+    <noscript>
+      <main>
+        <h1>Open Pool members</h1>
+        <p>This site needs JavaScript: it runs in your browser and talks to the pool's regions directly.</p>
+      </main>
+    </noscript>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

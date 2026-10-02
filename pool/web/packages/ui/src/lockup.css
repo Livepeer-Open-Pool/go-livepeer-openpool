@@ -1,0 +1,27 @@
+/*
+ * The logo beside the site's name. One set of rules for every site: the
+ * public site reads them from global.css, and the members' and operator's
+ * sites, whose markup is in shadow roots, from the shell's styles.
+ */
+.brand {
+  display: inline-flex; align-items: center; gap: 0.6em;
+  color: var(--text); text-decoration: none; white-space: nowrap;
+  font-family: var(--font-display); font-weight: 800; font-size: var(--step-0);
+  letter-spacing: 0.03em; line-height: 1;
+}
+.brand:hover { color: var(--text); }
+.brand .word { text-transform: uppercase; }
+.brand .name { display: grid; gap: 0.38em; }
+.brand small {
+  font-family: var(--font-mono); font-weight: 500; font-size: 0.6em;
+  letter-spacing: 0.22em; text-transform: uppercase; color: var(--brand);
+}
+
+/* The mark is its shape filled with the theme's gradient. The glow is on
+   the wrapper, because a mask would cut it off. */
+.mark { display: inline-grid; flex: none; filter: drop-shadow(0 0 0.55em var(--glow)); }
+.mark::before {
+  content: ""; inline-size: 1.95em; aspect-ratio: 1;
+  background: var(--mark-fill);
+  mask: var(--mark-shape) center / contain no-repeat;
+}

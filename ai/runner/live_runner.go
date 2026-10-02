@@ -139,6 +139,9 @@ type LiveRunnerHeartbeatRequest struct {
 	Capacity   int                 `json:"capacity"`
 	PriceInfo  LiveRunnerPriceInfo `json:"price_info"`
 	SessionIDs []string            `json:"session_ids,omitempty"`
+	// Tunnel registers a runner the orchestrator reaches through a tunnel the
+	// runner opens (GET /runners/{id}/tunnel) instead of a runner_url.
+	Tunnel bool `json:"tunnel,omitempty"`
 }
 
 type StaticLiveRunnerConfig struct {
@@ -159,6 +162,8 @@ type StaticLiveRunnerConfigEntry struct {
 	PriceInfo         LiveRunnerPriceInfo `json:"price_info"`
 	HealthURL         string              `json:"health_url"`
 	HealthyStatusCode int                 `json:"healthy_status_code,omitempty"`
+	// Tunnel is accepted only so that it can be rejected: static runners are dialed.
+	Tunnel bool `json:"tunnel,omitempty"`
 }
 
 type StaticLiveRunnerRegistration struct {
@@ -185,6 +190,9 @@ type LiveRunnerHeartbeatResponse struct {
 	HeartbeatSecret   string                    `json:"heartbeat_secret,omitempty"`
 	O2R               *LiveRunnerTrickleChannel `json:"o2r,omitempty"`
 	SessionIDs        []string                  `json:"session_ids"`
+	// PriceInfo is the price the runner is offered at, set when the operator
+	// prices the runner's app and so overrides what the runner asked for.
+	PriceInfo *LiveRunnerPriceInfo `json:"price_info,omitempty"`
 }
 
 type LiveRunnerDiscoveryRunner struct {
@@ -228,6 +236,10 @@ type liveRunner struct {
 	static          bool
 	offchain        bool
 	o2r             *liveRunnerTrickleChannel
+	member          *liveRunnerMember // set for a runner admitted in pool mode
+	remoteAddr      string
+	registeredAt    time.Time
+	registry        *LiveRunnerRegistry // where the runner's events go
 
 	// all fields below are mutable and need to be protected by mu
 	mu sync.Mutex
@@ -240,6 +252,12 @@ type liveRunner struct {
 	sessions      map[string]*liveRunnerSession
 	priceSource   LiveRunnerPriceInfo
 	converter     *core.AutoConvertedPrice
+	tunnel        *LiveRunnerTunnel // connected tunnel of a Tunnel runner, nil while disconnected
+	state         string            // pool state; empty means active
+	// registeredCapacity is the capacity a pool runner was admitted with, the
+	// most its later heartbeats may report.
+	registeredCapacity int
+	evictReason        string // why the operator evicted the runner, for its removal event
 }
 
 type liveRunnerSession struct {
@@ -248,6 +266,11 @@ type liveRunnerSession struct {
 	priceInfo LiveRunnerPriceInfo
 	channels  map[string]*liveRunnerTrickleChannel
 	proxies   map[string]proxyTarget
+	probe     bool     // an unpaid session the pool service opened to test the runner
+	sender    string   // the payer's address, empty for an unpaid session
+	via       string   // how the customer reached the runner
+	units     int64    // units debited so far
+	fee       *big.Rat // wei debited so far
 }
 
 type proxyTarget struct {
@@ -273,6 +296,17 @@ type LiveRunnerRegistry struct {
 	o2rInterval       time.Duration
 	stopRegistry      chan struct{}
 	stopRegistryOnce  sync.Once
+	admitter          LiveRunnerAdmitter // non-nil in pool mode
+	orchAddress       string
+	eventSink         LiveRunnerEventSink
+	events            chan liveRunnerEvent // nil when events are off
+	round             func() int64
+
+	refusalsMu sync.Mutex
+	refusals   map[string]int // requests refused for lack of capacity, per app, since the last report
+
+	pricesMu sync.RWMutex
+	prices   map[string]LiveRunnerPriceInfo // the operator's price per app
 
 	staticRegistrationMu sync.Mutex // serializes static runner config upserts
 
@@ -296,6 +330,20 @@ type LiveRunnerRegistryConfig struct {
 	Onchain          bool
 	ProxyURLTemplate string
 	O2RInterval      time.Duration
+	// Admitter turns on pool mode: it decides every dynamic registration, and
+	// the host's registration secret registers nothing.
+	Admitter LiveRunnerAdmitter
+	// OrchAddress is the orchestrator's on-chain address, reported to the admitter.
+	OrchAddress string
+	// Prices is the operator's price per app; it must already be normalized
+	// (ParseLiveRunnerPrices).
+	Prices LiveRunnerPriceTable
+	// Events publishes the registry's events: registrations, state changes,
+	// sessions and fees. Nil turns them off.
+	Events LiveRunnerEventSink
+	// Round reports the current Livepeer round, which every event is stamped
+	// with. Nil, or a round of zero, leaves the stamp out.
+	Round func() int64
 }
 
 var liveRunnerChannelNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
@@ -334,6 +382,17 @@ func NewLiveRunnerRegistry(config LiveRunnerRegistryConfig) *LiveRunnerRegistry 
 		o2rInterval:       o2rInterval,
 		stopRegistry:      make(chan struct{}),
 		proxyTemplate:     proxyTemplate,
+		admitter:          config.Admitter,
+		orchAddress:       config.OrchAddress,
+		prices:            config.Prices.Apps,
+	}
+	if config.Events != nil {
+		r.eventSink = config.Events
+		r.round = config.Round
+		r.events = make(chan liveRunnerEvent, liveRunnerEventQueueSize)
+		r.refusals = make(map[string]int)
+		go r.eventLoop()
+		go r.refusalLoop()
 	}
 	go r.healthLoop()
 	go r.expiryLoop()
@@ -370,14 +429,41 @@ func (r *LiveRunnerRegistry) Stop() {
 }
 
 func (r *LiveRunnerRegistry) Heartbeat(req LiveRunnerHeartbeatRequest, auth string) (*LiveRunnerHeartbeatResponse, error) {
+	return r.HeartbeatFrom(req, auth, "")
+}
+
+// HeartbeatFrom is Heartbeat with the network address the heartbeat came
+// from, which pool admission reports to the admitter.
+func (r *LiveRunnerRegistry) HeartbeatFrom(req LiveRunnerHeartbeatRequest, auth, remoteAddr string) (*LiveRunnerHeartbeatResponse, error) {
 	req.RunnerID = strings.TrimSpace(req.RunnerID)
+	// In pool mode a heartbeat without an id is a registration and the
+	// registry picks the id; a heartbeat with an id is never one.
+	poolRegistration := r.poolMode() && req.RunnerID == ""
+	if poolRegistration {
+		req.RunnerID = r.newPoolRunnerID()
+	}
 	if req.RunnerID == "" {
 		req.RunnerID = "runner_" + randomStr(liveRunnerIDRandomBytes)
 	}
 
-	req, err := r.normalizeHeartbeat(req.RunnerID, req)
+	req, err := r.normalizeRunnerHeartbeat(req.RunnerID, req, r.poolMode())
 	if err != nil {
 		return nil, &RunnerError{StatusCode: http.StatusBadRequest, Message: err.Error()}
+	}
+	configuredPrice, appOffered := r.configuredPrice(req.App)
+	var member *liveRunnerMember
+	if poolRegistration {
+		if member, err = r.admit(req, auth, remoteAddr); err != nil {
+			return nil, err
+		}
+		// After admission, so the pool service sees the attempt.
+		if !appOffered {
+			return nil, &RunnerError{StatusCode: http.StatusBadRequest, Message: "app not offered"}
+		}
+	}
+	var responsePriceInfo *LiveRunnerPriceInfo
+	if appOffered && !r.offchain {
+		responsePriceInfo = &configuredPrice
 	}
 
 	// For now, only return the heartbeat secret on first registration.
@@ -394,14 +480,25 @@ func (r *LiveRunnerRegistry) Heartbeat(req LiveRunnerHeartbeatRequest, auth stri
 		trickleSrv := r.trickleSrv
 		trickleBaseURL := r.internalTrickleBaseURL
 		// registering a new runner
-		registrationSecret := r.host.RegistrationSecret()
-		if registrationSecret == "" {
-			r.mu.Unlock()
-			return nil, &RunnerError{StatusCode: http.StatusNotFound, Message: "dynamic live runner registration is disabled"}
-		}
-		if !validSecret(auth, registrationSecret) {
-			r.mu.Unlock()
-			return nil, &RunnerError{StatusCode: http.StatusUnauthorized, Message: "invalid registration authorization"}
+		if r.poolMode() {
+			if member == nil {
+				r.mu.Unlock()
+				return nil, &RunnerError{StatusCode: http.StatusNotFound, Message: "runner not found"}
+			}
+			if err := r.memberWithinLimitLocked(member); err != nil {
+				r.mu.Unlock()
+				return nil, err
+			}
+		} else {
+			registrationSecret := r.host.RegistrationSecret()
+			if registrationSecret == "" {
+				r.mu.Unlock()
+				return nil, &RunnerError{StatusCode: http.StatusNotFound, Message: "dynamic live runner registration is disabled"}
+			}
+			if !validSecret(auth, registrationSecret) {
+				r.mu.Unlock()
+				return nil, &RunnerError{StatusCode: http.StatusUnauthorized, Message: "invalid registration authorization"}
+			}
 		}
 		seed := newRunnerSeed()
 		heartbeatSecret := deriveSecret(seed, "heartbeat")
@@ -409,6 +506,10 @@ func (r *LiveRunnerRegistry) Heartbeat(req LiveRunnerHeartbeatRequest, auth stri
 			seed:            seed,
 			heartbeatSecret: heartbeatSecret,
 			offchain:        r.offchain,
+			member:          member,
+			remoteAddr:      remoteAddr,
+			registeredAt:    time.Now(),
+			registry:        r,
 			route:           req.RunnerID, // No label-based routing for now
 			sessions:        make(map[string]*liveRunnerSession),
 		}
@@ -426,8 +527,14 @@ func (r *LiveRunnerRegistry) Heartbeat(req LiveRunnerHeartbeatRequest, auth stri
 		runner.LiveRunnerHeartbeatRequest = req
 		runner.LastHeartbeat = time.Now()
 		runner.route = runner.RunnerID // not doing label based routing here for now
+		runner.registeredCapacity = req.Capacity
+		if member != nil {
+			runner.state = member.state
+			slog.Info("live runner admitted", "runner_id", runner.RunnerID, "app", runner.App, "member_id", member.id, "state", runner.state, "remote_addr", remoteAddr)
+		}
 		slog.Info("live runner registered", "runner_id", runner.RunnerID, "app", runner.App, "runner_url", runner.RunnerURL)
 		runner.updatePriceConverterLocked()
+		runner.emitRegisteredLocked()
 
 		// SessionIDs in the response come from the orchestrator's authoritative
 		// active sessions and may differ from session_ids reported in the request.
@@ -439,6 +546,7 @@ func (r *LiveRunnerRegistry) Heartbeat(req LiveRunnerHeartbeatRequest, auth stri
 			HeartbeatSecret:   responseHeartbeatSecret,
 			O2R:               &runner.o2r.channel,
 			SessionIDs:        runner.sessionIDsLocked(),
+			PriceInfo:         responsePriceInfo,
 		}, nil
 	} else {
 		r.mu.Unlock()
@@ -456,6 +564,18 @@ func (r *LiveRunnerRegistry) Heartbeat(req LiveRunnerHeartbeatRequest, auth stri
 	if runner.static {
 		return nil, &RunnerError{StatusCode: http.StatusBadRequest, Message: "static runner cannot heartbeat"}
 	}
+	if runner.Tunnel != req.Tunnel {
+		return nil, &RunnerError{StatusCode: http.StatusBadRequest, Message: "tunnel cannot change after registration"}
+	}
+	if runner.member != nil {
+		if err := runner.frozenFieldsLocked(req); err != nil {
+			return nil, err
+		}
+		if !appOffered {
+			// The app left the price table: the runner keeps the price it has.
+			req.PriceInfo = runner.PriceInfo
+		}
+	}
 	runner.LiveRunnerHeartbeatRequest = req
 	runner.LastHeartbeat = time.Now()
 	runner.route = runner.RunnerID // not doing label based routing here for now
@@ -470,6 +590,7 @@ func (r *LiveRunnerRegistry) Heartbeat(req LiveRunnerHeartbeatRequest, auth stri
 		HeartbeatTTL:      heartbeatTTL.String(),
 		HeartbeatSecret:   responseHeartbeatSecret,
 		SessionIDs:        runner.sessionIDsLocked(),
+		PriceInfo:         responsePriceInfo,
 	}, nil
 }
 
@@ -491,6 +612,9 @@ func (r *LiveRunnerRegistry) RegisterStaticRunnersJSON(data []byte) (*StaticLive
 
 func normalizeStaticLiveRunnerConfig(cfg StaticLiveRunnerConfig) (StaticLiveRunnerConfig, error) {
 	for i := range cfg.Runners {
+		if cfg.Runners[i].Tunnel {
+			return StaticLiveRunnerConfig{}, fmt.Errorf("runners[%d]: tunnel is not supported for static runners", i)
+		}
 		cfg.Runners[i].Routing = strings.TrimSpace(cfg.Runners[i].Routing)
 		if cfg.Runners[i].Routing == "" {
 			cfg.Runners[i].Routing = LiveRunnerRoutingRunnerID
@@ -763,6 +887,7 @@ func (r *LiveRunnerRegistry) RegisterStaticRunners(cfg StaticLiveRunnerConfig) (
 				seed:     newRunnerSeed(),
 				static:   true,
 				offchain: r.offchain,
+				registry: r,
 				sessions: make(map[string]*liveRunnerSession),
 			}
 			staticRunner.RunnerID = "runner_" + randomStr(liveRunnerIDRandomBytes)
@@ -788,7 +913,7 @@ func (r *LiveRunnerRegistry) RegisterStaticRunners(cfg StaticLiveRunnerConfig) (
 		} else {
 			req.Status = "unavailable"
 			for sessionID := range staticRunner.sessions {
-				staticRunner.releaseSessionLocked(sessionID)
+				staticRunner.releaseSessionForLocked(sessionID, LiveRunnerReleaseUnhealthy)
 			}
 		}
 		staticRunner.removed = false
@@ -809,6 +934,7 @@ func (r *LiveRunnerRegistry) RegisterStaticRunners(cfg StaticLiveRunnerConfig) (
 
 		if existingStatic[entry.Label] == nil {
 			slog.Info("static live runner registered", "runner_id", staticRunner.RunnerID, "app", req.App, "runner_url", req.RunnerURL, "healthy", health[i])
+			staticRunner.emitRegisteredLocked()
 		}
 
 		registrations = append(registrations, StaticLiveRunnerRegistration{
@@ -857,9 +983,23 @@ func (r *LiveRunnerRegistry) buildStaticRunner(entry StaticLiveRunnerConfigEntry
 }
 
 func (r *LiveRunnerRegistry) normalizeHeartbeat(runnerID string, req LiveRunnerHeartbeatRequest) (LiveRunnerHeartbeatRequest, error) {
-	u, err := url.ParseRequestURI(req.RunnerURL)
-	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		return LiveRunnerHeartbeatRequest{}, fmt.Errorf("invalid runner_url")
+	return r.normalizeRunnerHeartbeat(runnerID, req, false)
+}
+
+// normalizeRunnerHeartbeat validates a heartbeat. poolRunner says the runner
+// does not set its own price: the operator's price for its app is the only
+// one it can have.
+func (r *LiveRunnerRegistry) normalizeRunnerHeartbeat(runnerID string, req LiveRunnerHeartbeatRequest, poolRunner bool) (LiveRunnerHeartbeatRequest, error) {
+	if req.Tunnel {
+		if strings.TrimSpace(req.RunnerURL) != "" {
+			return LiveRunnerHeartbeatRequest{}, fmt.Errorf("runner_url and tunnel are exclusive")
+		}
+		req.RunnerURL = LiveRunnerTunnelScheme + "://" + runnerID
+	} else {
+		u, err := url.ParseRequestURI(req.RunnerURL)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return LiveRunnerHeartbeatRequest{}, fmt.Errorf("invalid runner_url")
+		}
 	}
 
 	if req.App == "" || req.App != strings.TrimSpace(req.App) {
@@ -890,6 +1030,15 @@ func (r *LiveRunnerRegistry) normalizeHeartbeat(runnerID string, req LiveRunnerH
 	req.GPU = cloneLiveRunnerGPU(req.GPU)
 
 	if r.offchain {
+		return req, nil
+	}
+
+	if price, ok := r.configuredPrice(req.App); ok {
+		req.PriceInfo = price
+	} else if poolRunner {
+		// Whatever the runner sent is not its price. The caller refuses the
+		// registration, or keeps the price of a runner already registered.
+		req.PriceInfo = LiveRunnerPriceInfo{}
 		return req, nil
 	}
 
@@ -952,13 +1101,25 @@ func (r *LiveRunnerRegistry) Unregister(runnerID, auth string) error {
 // a public app URL, while single-shot reservations return the runner endpoint
 // for internal forwarding.
 func (r *LiveRunnerRegistry) ReserveSession(runnerID string, optSessionID ...string) (string, string, error) {
+	sessionID, appURL, err := r.reserveSession(runnerID, liveRunnerSessionOptions{}, optSessionID...)
+	r.noteRunnerRefusal(runnerID, err)
+	return sessionID, appURL, err
+}
+
+func (r *LiveRunnerRegistry) reserveSession(runnerID string, opts liveRunnerSessionOptions, optSessionID ...string) (string, string, error) {
+	probe := opts.probe
 	runner, unlock, err := r.lockLiveRunner(runnerID)
 	if err != nil {
 		return "", "", err
 	}
 	defer unlock()
-	if !isReadyStatus(runner.Status) {
+	if !runner.readyLocked() {
 		return "", "", &RunnerError{StatusCode: http.StatusNotFound, Message: "runner not found"}
+	}
+	if !probe {
+		if err := runner.newWorkAllowedLocked(); err != nil {
+			return "", "", err
+		}
 	}
 	id := ""
 	if len(optSessionID) > 0 {
@@ -988,6 +1149,12 @@ func (r *LiveRunnerRegistry) ReserveSession(runnerID string, optSessionID ...str
 		priceInfo: runner.PriceInfo,
 		channels:  make(map[string]*liveRunnerTrickleChannel),
 		proxies:   make(map[string]proxyTarget),
+		probe:     probe,
+		sender:    opts.sender,
+		via:       opts.via,
+	}
+	if session.via == "" {
+		session.via = LiveRunnerViaRunner
 	}
 	appURL := r.host.ServiceURI().JoinPath("apps", runner.route, "session", id, "app").String()
 	if runner.Mode == LiveRunnerModeSingleShot {
@@ -1003,6 +1170,7 @@ func (r *LiveRunnerRegistry) ReserveSession(runnerID string, optSessionID ...str
 	}
 	runner.sessions[id] = session
 	runner.sendSessionEvent("reserved", id)
+	runner.emitSessionReservedLocked(id, session)
 	slog.Info("live runner session reserved", "runner_id", runner.RunnerID, "session_id", id, "app", runner.App)
 	return id, appURL, nil
 }
@@ -1013,8 +1181,11 @@ func (r *LiveRunnerRegistry) PaymentInfo(runnerID string) (*LiveRunnerPriceInfo,
 		return nil, err
 	}
 	defer unlock()
-	if !isReadyStatus(runner.Status) {
+	if !runner.readyLocked() {
 		return nil, &RunnerError{StatusCode: http.StatusNotFound, Message: "runner not found"}
+	}
+	if err := runner.newWorkAllowedLocked(); err != nil {
+		return nil, err
 	}
 	if runner.offchain {
 		return nil, nil
@@ -1043,23 +1214,38 @@ func (r *LiveRunnerRegistry) SessionPriceInfo(runnerID, sessionID string) (LiveR
 }
 
 func (r *LiveRunnerRegistry) ReleaseSession(runnerID, sessionID string) error {
+	return r.ReleaseSessionWithReason(runnerID, sessionID, LiveRunnerReleaseStopped)
+}
+
+// ReleaseSessionWithReason is ReleaseSession with the reason the session's
+// released event reports.
+func (r *LiveRunnerRegistry) ReleaseSessionWithReason(runnerID, sessionID, reason string) error {
 	runner, unlock, err := r.lockLiveRunner(runnerID)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	runner.releaseSessionLocked(sessionID)
+	runner.releaseSessionForLocked(sessionID, reason)
 	return nil
 }
 
 func (r *LiveRunnerRegistry) RunnerMode(runnerID string) (string, error) {
+	return r.runnerMode(runnerID, false)
+}
+
+func (r *LiveRunnerRegistry) runnerMode(runnerID string, probe bool) (string, error) {
 	runner, unlock, err := r.lockLiveRunner(runnerID)
 	if err != nil {
 		return "", err
 	}
 	defer unlock()
-	if !isReadyStatus(runner.Status) {
+	if !runner.readyLocked() {
 		return "", &RunnerError{StatusCode: http.StatusNotFound, Message: "runner not found"}
+	}
+	if !probe {
+		if err := runner.newWorkAllowedLocked(); err != nil {
+			return "", err
+		}
 	}
 	if runner.Mode == "" {
 		return LiveRunnerModePersistent, nil
@@ -1073,7 +1259,7 @@ func (r *LiveRunnerRegistry) RunnerEndpointForSession(runnerID, sessionID string
 		return "", err
 	}
 	defer unlock()
-	if !isReadyStatus(runner.Status) {
+	if !runner.readyLocked() {
 		return "", &RunnerError{StatusCode: http.StatusNotFound, Message: "runner not found"}
 	}
 	if _, exists := runner.sessions[sessionID]; !exists {
@@ -1088,7 +1274,7 @@ func (r *LiveRunnerRegistry) SessionTokenForSession(runnerID, sessionID string) 
 		return "", err
 	}
 	defer unlock()
-	if !isReadyStatus(runner.Status) {
+	if !runner.readyLocked() {
 		return "", &RunnerError{StatusCode: http.StatusNotFound, Message: "runner not found"}
 	}
 	if _, exists := runner.sessions[sessionID]; !exists {
@@ -1103,7 +1289,7 @@ func (r *LiveRunnerRegistry) ValidSessionToken(runnerID, sessionID, token string
 		return err
 	}
 	defer unlock()
-	if !isReadyStatus(runner.Status) {
+	if !runner.readyLocked() {
 		return &RunnerError{StatusCode: http.StatusNotFound, Message: "runner not found"}
 	}
 	if _, exists := runner.sessions[sessionID]; !exists {
@@ -1280,7 +1466,7 @@ func (r *LiveRunnerRegistry) ResolveSessionProxy(host, path string) (LiveRunnerP
 
 	for _, runner := range snapshot {
 		runner.mu.Lock()
-		if runner.removed || liveRunnerExpiredLocked(runner, time.Now(), heartbeatTTL) || !isReadyStatus(runner.Status) {
+		if runner.removed || liveRunnerExpiredLocked(runner, time.Now(), heartbeatTTL) || !runner.readyLocked() {
 			runner.mu.Unlock()
 			continue
 		}
@@ -1331,7 +1517,7 @@ func (r *LiveRunnerRegistry) Runners() []LiveRunnerDiscoveryRunner {
 	runners := make([]LiveRunnerDiscoveryRunner, 0, len(snapshot))
 	for _, runner := range snapshot {
 		runner.mu.Lock()
-		if runner.removed || liveRunnerExpiredLocked(runner, time.Now(), heartbeatTTL) || !isReadyStatus(runner.Status) {
+		if runner.removed || liveRunnerExpiredLocked(runner, time.Now(), heartbeatTTL) || !runner.readyLocked() || runner.stateLocked() != LiveRunnerStateActive {
 			runner.mu.Unlock()
 			continue
 		}
@@ -1389,6 +1575,7 @@ func (r *LiveRunnerRegistry) expiryLoop() {
 		select {
 		case <-ticker.C:
 			r.removeExpiredRunners(time.Now())
+			r.releaseExpiredProbeSessions(time.Now())
 		case <-r.stopRegistry:
 			return
 		}
@@ -1473,7 +1660,7 @@ func (r *LiveRunnerRegistry) checkStaticRunnerHealth() {
 			} else {
 				c.runner.Status = "unavailable"
 				for sessionID := range c.runner.sessions {
-					c.runner.releaseSessionLocked(sessionID)
+					c.runner.releaseSessionForLocked(sessionID, LiveRunnerReleaseUnhealthy)
 				}
 			}
 			if c.runner.Status != prevStatus {
@@ -1501,20 +1688,23 @@ func (r *LiveRunnerRegistry) removeRunnerWithRunnerLocked(runnerID string, runne
 	// copied the runner pointer can reject it after acquiring runner.mu.
 	runner.removed = true
 	slog.Info("live runner deregistered", "runner_id", runnerID, "app", runner.App, "reason", reason)
+	runner.closeTunnelLocked("removed")
 	runner.closeChannelsLocked()
 	for sessionID := range runner.sessions {
-		runner.releaseSessionLocked(sessionID)
+		runner.releaseSessionForLocked(sessionID, LiveRunnerReleaseRunnerRemoved)
 	}
+	runner.emitRemovedLocked(reason)
 	runner.stopPriceConverterLocked()
 	if r.runners[runnerID] == runner {
 		delete(r.runners, runnerID)
 	}
 }
 
-func (runner *liveRunner) releaseSessionLocked(sessionID string) {
-	// releaseSessionLocked requires runner.mu.
+func (runner *liveRunner) releaseSessionForLocked(sessionID, reason string) {
+	// releaseSessionForLocked requires runner.mu.
 	if session := runner.sessions[sessionID]; session != nil {
 		runner.sendSessionEvent("released", sessionID)
+		runner.emitSessionReleasedLocked(sessionID, session, reason)
 		session.closeChannelsLocked()
 		slog.Info("live runner session released", "runner_id", runner.RunnerID, "session_id", sessionID, "app", runner.App, "duration", time.Since(session.createdAt))
 	}
@@ -1552,7 +1742,7 @@ func (runner *liveRunner) closeChannelsLocked() {
 
 func (runner *liveRunner) liveRunnerSessionLocked(sessionID string) (*liveRunnerSession, error) {
 	// liveRunnerSessionLocked requires runner.mu.
-	if runner.removed || !isReadyStatus(runner.Status) {
+	if runner.removed || !runner.readyLocked() {
 		return nil, &RunnerError{StatusCode: http.StatusNotFound, Message: "runner not found"}
 	}
 	session := runner.sessions[sessionID]

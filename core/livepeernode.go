@@ -129,6 +129,9 @@ type LivepeerNode struct {
 	AIProcesssingRetryTimeout time.Duration
 
 	LiveRunnerManager any // NB: kludge to avoid ai/runner circular dependency
+	// LiveRunnerPoolSecret is shared with the pool service: sent to its
+	// admission webhook, and accepted from it for unpaid probe sessions.
+	LiveRunnerPoolSecret string
 
 	// Transcoder public fields
 	SegmentChans         map[ManifestID]SegmentChan
@@ -160,6 +163,8 @@ type LivepeerNode struct {
 	RemoteEthAddr              ethcommon.Address // eth address of the remote signer
 	InfoSig                    []byte            // sig over eth address for the OrchestratorInfo request
 	RemoteDiscovery            bool              // expose remote discovery endpoint when enabled
+	KafkaRequireDelivery       bool              // refuse to sign remote payments when the accounting event cannot be enqueued
+	KafkaEnqueueTimeout        time.Duration     // how long GenerateLivePayment waits for event queue space when KafkaRequireDelivery is set
 
 	USDToWei *AutoConvertedPrice // Wei value of one USD; set before serving, nil if unavailable.
 
