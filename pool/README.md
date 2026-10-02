@@ -25,6 +25,15 @@ OPENPOOL_DOCKER_TEST=1 OPENPOOL_TEST_AGENT_IMAGE=<agent image> OPENPOOL_TEST_TUN
 
 `server/ai_http_openpool_test.go` in go-livepeer runs this service as a process beside a real orchestrator and takes a member from application to serving work. Run it from the repository root with `go test ./server/ -run OpenPoolServiceAndOrchestratorAgree`.
 
+### The whole pool on one machine
+
+```bash
+pool/e2e.sh              # about three minutes
+pool/e2e.sh keep-logs    # the same, keeping every process's log in pool/.e2e/
+```
+
+This runs everything for real and takes one member from signing up to being paid: a Livepeer devnet, an on-chain orchestrator in pool mode, Kafka, this service with a funded payout wallet, the member agent's image starting an app and its tunnel, and a customer paying with tickets. It builds the agent and tunnel images itself. It needs Go, Docker with the compose plugin, and network access to pull the devnet, Kafka, registry and echo images. `test/e2e/openpool_test.go` says what each step shows.
+
 ## Run
 
 Configuration comes from `OPENPOOL_*` environment variables. Any of them can be given as `<NAME>_FILE`, naming a file that holds the value.

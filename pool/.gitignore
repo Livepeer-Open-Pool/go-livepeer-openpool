@@ -3,3 +3,7 @@
 *.db
 *.db-shm
 *.db-wal
+# The key that signs compose files: a secret, made on first start.
+openpool-compose.key
+# Logs of pool/e2e.sh keep-logs.
+.e2e/
